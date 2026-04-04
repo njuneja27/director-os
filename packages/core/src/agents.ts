@@ -216,14 +216,16 @@ export async function runCodexAgent(
 
   args.push(input.prompt);
 
+  let rawModelOutput: string | null = null;
+
   try {
     await runCodexExec(args, {
       cwd: input.cwd,
       timeoutMs: input.timeoutMs
     });
 
-    const raw = await fs.readFile(outputPath, "utf8");
-    const parsed = JSON.parse(raw) as AgentResultEnvelope;
+    rawModelOutput = await fs.readFile(outputPath, "utf8");
+    const parsed = JSON.parse(rawModelOutput) as AgentResultEnvelope;
 
     return {
       status: parsed.status,
@@ -231,11 +233,23 @@ export async function runCodexAgent(
       recommended_next_action: parsed.recommended_next_action,
       artifact_refs: Array.isArray(parsed.artifact_refs) ? parsed.artifact_refs : [],
       blocking_questions: Array.isArray(parsed.blocking_questions) ? parsed.blocking_questions : [],
-      data: parsed.data ?? {}
+      data: parsed.data ?? {},
+      raw_model_output: rawModelOutput
     };
   } catch (error) {
+    if (!rawModelOutput) {
+      try {
+        rawModelOutput = await fs.readFile(outputPath, "utf8");
+      } catch {
+        rawModelOutput = null;
+      }
+    }
+
     if (fallback) {
-      return fallback;
+      return {
+        ...fallback,
+        raw_model_output: rawModelOutput
+      };
     }
 
     const message = error instanceof Error ? error.message : String(error);
@@ -245,7 +259,8 @@ export async function runCodexAgent(
       summary: `Codex agent failed for ${input.role}: ${message}`,
       recommended_next_action: "Review the prompt, model, or workspace permissions and retry.",
       artifact_refs: [],
-      blocking_questions: []
+      blocking_questions: [],
+      raw_model_output: rawModelOutput
     };
   } finally {
     await Promise.allSettled([

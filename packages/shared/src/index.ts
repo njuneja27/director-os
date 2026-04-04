@@ -173,6 +173,7 @@ export interface RunRecord {
   artifacts: string[];
   blockingQuestions: string[];
   outputJson: Record<string, unknown> | null;
+  rawModelOutput: string | null;
   worktreePath: string | null;
   createdAt: string;
   updatedAt: string;
@@ -265,6 +266,7 @@ export interface AgentResultEnvelope {
   artifact_refs: string[];
   blocking_questions: string[];
   data?: Record<string, unknown>;
+  raw_model_output?: string | null;
 }
 
 export interface SetupCheck {
@@ -318,6 +320,7 @@ export interface ConversationResponse {
   thread: ConversationThreadRecord | null;
   messages: ConversationMessageRecord[];
   openQuestion: ConversationMessageRecord | null;
+  openQuestionRun: RunRecord | null;
   latestSummary: string | null;
 }
 

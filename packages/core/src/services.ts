@@ -95,6 +95,10 @@ import {
   selectActiveWorkItems,
   selectQueuedWorkItems
 } from "./work-items.js";
+import {
+  COS_TASK_APPENDICES,
+  buildChiefOfStaffPrompt
+} from "./cos.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -277,6 +281,7 @@ function mapRunRow(row: typeof runsTable.$inferSelect): RunRecord {
     artifacts: fromJson(row.artifacts as string[]),
     blockingQuestions: fromJson(row.blockingQuestions as string[]),
     outputJson: row.outputJson ? fromJson(row.outputJson as Record<string, unknown>) : null,
+    rawModelOutput: row.rawModelOutput ?? null,
     worktreePath: row.worktreePath ?? null,
     createdAt: row.createdAt,
     updatedAt: row.updatedAt
@@ -784,6 +789,27 @@ function summarizeText(value: string, maxLength = 280): string {
   return trimmed.length > maxLength ? `${trimmed.slice(0, maxLength - 1)}…` : trimmed;
 }
 
+function truncatePromptSection(value: string | null | undefined, maxLength = 8_000): string | null {
+  const trimmed = value?.trim();
+  if (!trimmed) {
+    return null;
+  }
+
+  return trimmed.length > maxLength ? `${trimmed.slice(0, maxLength - 1)}…` : trimmed;
+}
+
+function formatHumanQuestionContent(question: string, summary: string, recommendation: string): string {
+  const sections = [
+    question.trim(),
+    summary.trim()
+      ? ["Why this matters", summary.trim()].join("\n")
+      : null,
+    ["Recommendation", (recommendation.trim() || "Reply with the direction you want me to take.")].join("\n")
+  ].filter((value): value is string => Boolean(value && value.trim().length > 0));
+
+  return sections.join("\n\n");
+}
+
 function labelFor(suffix: string): string {
   return `${DIRECTOR_LABEL_PREFIX}${suffix}`;
 }
@@ -1122,6 +1148,7 @@ async function insertRun(
     artifacts: asJson(input.artifacts),
     blockingQuestions: asJson(input.blockingQuestions),
     outputJson: input.outputJson ? asJson(input.outputJson) : null,
+    rawModelOutput: input.rawModelOutput,
     worktreePath: input.worktreePath,
     createdAt: timestamp,
     updatedAt: timestamp
@@ -1156,6 +1183,8 @@ async function updateRun(
       artifacts: patch.artifacts ? asJson(patch.artifacts) : undefined,
       blockingQuestions: patch.blockingQuestions ? asJson(patch.blockingQuestions) : undefined,
       outputJson: patch.outputJson ? asJson(patch.outputJson) : patch.outputJson === null ? null : undefined,
+      rawModelOutput:
+        patch.rawModelOutput !== undefined ? patch.rawModelOutput : undefined,
       worktreePath: patch.worktreePath,
       updatedAt: nowIso()
     })
@@ -1320,16 +1349,8 @@ function formatQuestionContentFromDecision(decision: DecisionRecord): string {
     decision.issueNumber !== null
       ? `I need your direction on issue #${decision.issueNumber} before I resume the work.`
       : decision.title.trim() || "I need your direction before I can continue.";
-  const whyItMatters = decision.summary.trim()
-    ? `Why this matters: ${decision.summary.trim()}`
-    : null;
-  const recommendation = `Recommendation: ${
-    decision.recommendation.trim() || "Reply with the direction you want me to take."
-  }`;
 
-  return [prompt, whyItMatters, recommendation]
-    .filter((value): value is string => Boolean(value && value.trim().length > 0))
-    .join("\n\n");
+  return formatHumanQuestionContent(prompt, decision.summary, decision.recommendation);
 }
 
 async function backfillOpenDecisionQuestions(session: ProjectSession): Promise<void> {
@@ -1351,7 +1372,7 @@ async function backfillOpenDecisionQuestions(session: ProjectSession): Promise<v
       role: "chief_of_staff",
       kind: "cos_question",
       content,
-      summary: summarizeText(content),
+      summary: summarizeText(content.split("\n\n")[0] ?? content),
       linkedIssueNumber: decision.issueNumber ?? null,
       linkedPrNumber: decision.prNumber ?? null,
       isOpenQuestion: true,
@@ -1406,11 +1427,22 @@ async function getConversationResponse(session: ProjectSession): Promise<Convers
     (await getConversationQuestionMessage(session, openDecision)) ??
     messages.find((message) => message.isOpenQuestion && message.kind === "cos_question") ??
     null;
+  let openQuestionRun: RunRecord | null = null;
+
+  if (openDecision?.requestedByRunId) {
+    const runRows = await session.db
+      .select()
+      .from(runsTable)
+      .where(eq(runsTable.id, openDecision.requestedByRunId))
+      .limit(1);
+    openQuestionRun = runRows[0] ? mapRunRow(runRows[0]) : null;
+  }
 
   return {
     thread,
     messages,
     openQuestion,
+    openQuestionRun,
     latestSummary: messages.at(-1)?.summary ?? null
   };
 }
@@ -1885,17 +1917,16 @@ async function createHumanQuestionDecision(
     rationale: string;
   }
 ): Promise<DecisionRecord> {
-  const questionContent = [
-    input.question.trim(),
-    "",
-    `Why this matters: ${input.summary.trim()}`,
-    `Recommendation: ${input.recommendation.trim() || "Reply with the direction you want me to take."}`
-  ].join("\n");
+  const questionContent = formatHumanQuestionContent(
+    input.question,
+    input.summary,
+    input.recommendation
+  );
   const questionMessage = await appendConversationMessage(session, {
     role: "chief_of_staff",
     kind: "cos_question",
     content: questionContent,
-    summary: summarizeText(questionContent),
+    summary: summarizeText(input.question),
     linkedIssueNumber: input.workItem?.issueNumber ?? null,
     linkedPrNumber: input.prNumber,
     isOpenQuestion: true,
@@ -1942,23 +1973,27 @@ async function mediateAgentBlock(
     summary: string;
     recommendedNextAction: string;
     blockingQuestions: string[];
+    artifacts: string[];
+    outputJson: Record<string, unknown> | null;
+    rawModelOutput: string | null;
     allowInternalResolution: boolean;
   }
 ): Promise<
   | { kind: "resume"; guidance: string; transcript: string }
   | { kind: "ask_human"; decision: DecisionRecord }
 > {
+  const fallbackQuestion =
+    input.blockingQuestions[0] ??
+    `What decision should I take to keep issue #${input.workItem.issueNumber} moving?`;
+
   if (!input.allowInternalResolution) {
-    const firstQuestion =
-      input.blockingQuestions[0] ??
-      "There is a blocking product decision that the Chief of Staff could not safely infer.";
     const decision = await createHumanQuestionDecision(session, {
       workItem: input.workItem,
       prNumber: input.prNumber,
       runId: input.runId,
       title: `Chief of Staff question for #${input.workItem.issueNumber}`,
       summary: input.summary,
-      question: firstQuestion,
+      question: fallbackQuestion,
       recommendation: input.recommendedNextAction || "Reply with the direction you want me to take.",
       rationale:
         input.blockingQuestions.join("\n") ||
@@ -1976,22 +2011,42 @@ async function mediateAgentBlock(
       cwd: session.project.repoPath,
       model: session.project.model,
       allowWrite: false,
-      prompt: [
-        `A ${input.source.replace("_", " ")} is blocked on issue #${input.workItem.issueNumber}: ${input.workItem.title}.`,
-        "Decide whether you can answer the blocker yourself or need to ask the human director.",
-        "Return `data.outcome` as `answer_worker` or `ask_human`.",
-        "If you can answer, return `data.guidance` and `data.transcript_reply`.",
-        "If you need the human, return `data.question`, `data.why_it_matters`, and `data.recommendation`.",
-        "",
-        "Current summary:",
-        input.summary,
-        "",
-        "Blocking questions:",
-        input.blockingQuestions.length ? input.blockingQuestions.map((question) => `- ${question}`).join("\n") : "- No explicit question was returned.",
-        "",
-        "Recent project conversation:",
-        await recentConversationPrompt(session)
-      ].join("\n")
+      prompt: buildChiefOfStaffPrompt(COS_TASK_APPENDICES.mediateBlocker, [
+        {
+          title: "Blocked run",
+          content: `A ${input.source.replace("_", " ")} is blocked on issue #${input.workItem.issueNumber}: ${input.workItem.title}.`
+        },
+        {
+          title: "Run summary",
+          content: input.summary
+        },
+        {
+          title: "Recommended next action",
+          content: input.recommendedNextAction
+        },
+        {
+          title: "Blocking questions",
+          content: input.blockingQuestions.length
+            ? input.blockingQuestions.map((question) => `- ${question}`).join("\n")
+            : "- No explicit blocking question was returned. Infer the real question from the run output."
+        },
+        {
+          title: "Structured run output",
+          content: input.outputJson ? JSON.stringify(input.outputJson, null, 2) : "No structured payload was stored."
+        },
+        {
+          title: "Raw Codex output",
+          content: truncatePromptSection(input.rawModelOutput, 12_000) ?? "No raw Codex output was stored."
+        },
+        {
+          title: "Artifacts",
+          content: input.artifacts.length ? input.artifacts.map((artifact) => `- ${artifact}`).join("\n") : "No artifacts were recorded."
+        },
+        {
+          title: "Recent project conversation",
+          content: await recentConversationPrompt(session)
+        }
+      ])
     },
     {
       status: "ok",
@@ -2001,12 +2056,11 @@ async function mediateAgentBlock(
       blocking_questions: [],
       data: {
         outcome: "ask_human",
-        question:
-          input.blockingQuestions[0] ??
-          `What product decision should I take for issue #${input.workItem.issueNumber}?`,
+        question: fallbackQuestion,
         why_it_matters: input.summary,
         recommendation: input.recommendedNextAction
-      }
+      },
+      raw_model_output: input.rawModelOutput
     }
   );
 
@@ -2023,6 +2077,21 @@ async function mediateAgentBlock(
     };
   }
 
+  if (outcome === "reroute") {
+    const guidance =
+      parseDataString(result.data?.guidance) ??
+      parseDataString(result.data?.recommendation) ??
+      input.recommendedNextAction;
+
+    return {
+      kind: "resume",
+      guidance,
+      transcript:
+        parseDataString(result.data?.transcript_reply) ??
+        `I re-scoped issue #${input.workItem.issueNumber} and sent the run back out with narrower guidance.`
+    };
+  }
+
   const decision = await createHumanQuestionDecision(session, {
     workItem: input.workItem,
     prNumber: input.prNumber,
@@ -2031,8 +2100,7 @@ async function mediateAgentBlock(
     summary: parseDataString(result.data?.why_it_matters) ?? input.summary,
     question:
       parseDataString(result.data?.question) ??
-      input.blockingQuestions[0] ??
-      `What direction should I take for issue #${input.workItem.issueNumber}?`,
+      fallbackQuestion,
     recommendation:
       parseDataString(result.data?.recommendation) ??
       (input.recommendedNextAction || "Reply with the direction you want me to take."),
@@ -2103,17 +2171,26 @@ async function chooseNextWorkItem(session: ProjectSession): Promise<WorkItemReco
     return fallbackWorkItem;
   }
 
-  const prompt = [
-    "You are the Chief of Staff for Director OS.",
-    "Choose the next GitHub issue to execute, classify it as lane or worker, and decide whether it is a workstream or task.",
-    "Prefer locally ready work first, then choose the highest-leverage remaining bounded slice.",
-    "Return the machine-readable selection in `data` using keys `selected_issue_number`, `execution_mode`, `kind`, and `rationale`.",
-    "",
-    "Candidates:",
-    ...workItems.slice(0, 8).map((workItem) =>
-      `- #${workItem.issueNumber} (${workItem.status}, ${workItem.kind}, ${workItem.executionMode}): ${workItem.title}\n  Summary: ${workItem.summary}`
-    )
-  ].join("\n");
+  const prompt = buildChiefOfStaffPrompt(COS_TASK_APPENDICES.chooseNextIssue, [
+    {
+      title: "Selection guidance",
+      content:
+        "Prefer explicitly ready issues first. Pick the smallest high-leverage slice that can move cleanly toward a real PR."
+    },
+    {
+      title: "Recent project conversation",
+      content: await recentConversationPrompt(session)
+    },
+    {
+      title: "Candidates",
+      content: workItems
+        .slice(0, 8)
+        .map((workItem) =>
+          `- #${workItem.issueNumber} (${workItem.status}): ${workItem.title}\n  Summary: ${workItem.summary}`
+        )
+        .join("\n")
+    }
+  ]);
 
   const result = await runCodexAgent(
     {
@@ -2131,8 +2208,7 @@ async function chooseNextWorkItem(session: ProjectSession): Promise<WorkItemReco
       blocking_questions: [],
       data: {
         selected_issue_number: fallbackWorkItem.issueNumber,
-        execution_mode: fallbackWorkItem.executionMode,
-        kind: fallbackWorkItem.kind,
+        execution_intent: fallbackWorkItem.executionMode === "lane" ? "plan" : "implement",
         rationale: "Fallback ordering selected the first available issue."
       }
     }
@@ -2140,19 +2216,21 @@ async function chooseNextWorkItem(session: ProjectSession): Promise<WorkItemReco
 
   const selection = parseDataNumber(result.data?.selected_issue_number) ?? fallbackWorkItem.issueNumber;
   const chosen = workItems.find((candidate) => candidate.issueNumber === selection) ?? fallbackWorkItem;
-  const executionMode = parseDataString(result.data?.execution_mode) as ExecutionMode | null;
-  const kind = parseDataString(result.data?.kind) as WorkItemKind | null;
+  const executionIntent = parseDataString(result.data?.execution_intent);
   const rationale = parseDataString(result.data?.rationale) ?? result.summary;
-
-  const nextStatus = executionMode === "lane" ? "planning" : "ready";
+  const shouldPlan =
+    executionIntent === "plan" ||
+    chosen.executionMode === "lane" ||
+    chosen.kind === "workstream";
+  const nextStatus = shouldPlan ? "planning" : "ready";
   return upsertWorkItem(session.db, session.project.id, {
     issueNumber: chosen.issueNumber,
     parentIssueNumber: chosen.parentIssueNumber,
     title: chosen.title,
     summary: chosen.summary,
-    kind: kind ?? chosen.kind,
-    executionMode: executionMode ?? chosen.executionMode,
-    ownerRole: (executionMode ?? chosen.executionMode) === "lane" ? "lane_owner" : "worker",
+    kind: shouldPlan ? "workstream" : chosen.kind,
+    executionMode: shouldPlan ? "lane" : "worker",
+    ownerRole: shouldPlan ? "lane_owner" : "worker",
     status: nextStatus,
     priorityBucket: inferPriorityBucket(nextStatus),
     activeRunId: chosen.activeRunId,
@@ -2218,15 +2296,22 @@ async function maybeExpandNotesIntoIssues(session: ProjectSession): Promise<bool
 
   const primaryNote = assertPresent(notes[0], "At least one active director note is required.");
 
-  const prompt = [
-    "You are the Chief of Staff for Director OS.",
-    "The backlog is empty. Turn the director's most recent note into 1 to 3 concrete GitHub issues.",
-    "Return them in `data.new_issues` as objects with `title`, `body`, `kind`, and `execution_mode`.",
-    "Only create issues that are bounded enough to enter the queue immediately.",
-    "",
-    "Active notes:",
-    ...notes.slice(0, 3).map((note) => `- ${note.content}`)
-  ].join("\n");
+  const prompt = buildChiefOfStaffPrompt(
+    [
+      "Task: the backlog is empty. Turn the director's most recent note into 1 to 3 concrete GitHub issues.",
+      "Return them in `data.new_issues` as objects with `title`, `body`, `kind`, and `execution_mode`.",
+      "Only create issues that are bounded enough to enter the queue immediately."
+    ].join("\n"),
+    [
+      {
+        title: "Active notes",
+        content: notes
+          .slice(0, 3)
+          .map((note) => `- ${note.content}`)
+          .join("\n")
+      }
+    ]
+  );
 
   const result = await runCodexAgent(
     {
@@ -2316,6 +2401,7 @@ async function planLaneWork(session: ProjectSession, workItem: WorkItemRecord): 
     artifacts: [],
     blockingQuestions: [],
     outputJson: null,
+    rawModelOutput: null,
     worktreePath: null
   });
 
@@ -2340,17 +2426,31 @@ async function planLaneWork(session: ProjectSession, workItem: WorkItemRecord): 
       cwd: session.project.repoPath,
       model: session.project.model,
       allowWrite: false,
-      prompt: [
-        `You own GitHub issue #${liveIssue.number}: ${liveIssue.title}.`,
-        "Plan the slice end to end before any write-enabled execution begins.",
-        "If this should split into child issues, return them in `data.child_tasks` as objects with `title` and `body`.",
-        "Only raise blocking questions when genuine product judgment is required.",
-        "",
-        liveIssue.body,
-        guidancePromptSuffix(workItem.lastSummary)
-          ? `\nExisting guidance:\n${guidancePromptSuffix(workItem.lastSummary)}`
-          : ""
-      ].join("\n")
+      prompt: buildChiefOfStaffPrompt(
+        [
+          "Task: run a planning pass for a larger GitHub issue before any write-enabled execution begins.",
+          "Return optional child issues in `data.child_tasks` as objects with `title` and `body`.",
+          "Only raise blocking questions when genuine product or taste judgment is required."
+        ].join("\n"),
+        [
+          {
+            title: "Issue",
+            content: `#${liveIssue.number}: ${liveIssue.title}`
+          },
+          {
+            title: "Issue body",
+            content: liveIssue.body
+          },
+          {
+            title: "Existing guidance",
+            content: guidancePromptSuffix(workItem.lastSummary)
+          },
+          {
+            title: "Recent project conversation",
+            content: await recentConversationPrompt(session)
+          }
+        ]
+      )
     },
     {
       status: "ok",
@@ -2370,7 +2470,8 @@ async function planLaneWork(session: ProjectSession, workItem: WorkItemRecord): 
     recommendedNextAction: laneResult.recommended_next_action,
     artifacts: laneResult.artifact_refs,
     blockingQuestions: laneResult.blocking_questions,
-    outputJson: laneResult.data ?? null
+    outputJson: laneResult.data ?? null,
+    rawModelOutput: laneResult.raw_model_output ?? null
   });
 
   if (laneResult.blocking_questions.length > 0) {
@@ -2382,6 +2483,9 @@ async function planLaneWork(session: ProjectSession, workItem: WorkItemRecord): 
       summary: laneResult.summary,
       recommendedNextAction: laneResult.recommended_next_action,
       blockingQuestions: laneResult.blocking_questions,
+      artifacts: laneResult.artifact_refs,
+      outputJson: laneResult.data ?? null,
+      rawModelOutput: laneResult.raw_model_output ?? null,
       allowInternalResolution: !guidancePromptSuffix(workItem.lastSummary)
     });
 
@@ -2529,6 +2633,7 @@ async function executeWorkerRun(
     artifacts: [worktreePath],
     blockingQuestions: [],
     outputJson: null,
+    rawModelOutput: null,
     worktreePath
   });
 
@@ -2555,8 +2660,8 @@ async function executeWorkerRun(
       allowWrite: true,
       prompt: [
         `Implement GitHub issue #${options.issue.number}: ${options.issue.title}.`,
-        "Use your built-in planning discipline before editing, then make the bounded code changes needed to satisfy the issue.",
-        "If product judgment is required, do not guess; explain the blocking question.",
+        "Use Codex's built-in planning discipline before editing, then make the bounded code changes needed to satisfy the issue.",
+        "If product judgment is required, do not guess; explain the blocking question clearly for the Chief of Staff.",
         "Leave the repository ready for commit.",
         "",
         options.issue.body,
@@ -2581,7 +2686,8 @@ async function executeWorkerRun(
       recommendedNextAction: workerResult.recommended_next_action,
       artifacts: workerResult.artifact_refs,
       blockingQuestions: workerResult.blocking_questions,
-      outputJson: workerResult.data ?? null
+      outputJson: workerResult.data ?? null,
+      rawModelOutput: workerResult.raw_model_output ?? null
     });
 
     const mediated = await mediateAgentBlock(session, {
@@ -2592,6 +2698,9 @@ async function executeWorkerRun(
       summary: workerResult.summary,
       recommendedNextAction: workerResult.recommended_next_action,
       blockingQuestions: workerResult.blocking_questions,
+      artifacts: workerResult.artifact_refs,
+      outputJson: workerResult.data ?? null,
+      rawModelOutput: workerResult.raw_model_output ?? null,
       allowInternalResolution:
         !options.promptSuffix && !guidancePromptSuffix(workItem.lastSummary)
     });
@@ -2658,7 +2767,8 @@ async function executeWorkerRun(
       recommendedNextAction: "Inspect the failing command output and retry.",
       artifacts: [worktreePath],
       blockingQuestions: [],
-      outputJson: workerResult.data ?? null
+      outputJson: workerResult.data ?? null,
+      rawModelOutput: workerResult.raw_model_output ?? null
     });
     await upsertWorkItem(session.db, session.project.id, {
       issueNumber: workItem.issueNumber,
@@ -2685,7 +2795,8 @@ async function executeWorkerRun(
       recommendedNextAction: "Inspect the repository and decide whether the issue needs a different prompt.",
       artifacts: [worktreePath],
       blockingQuestions: [],
-      outputJson: workerResult.data ?? null
+      outputJson: workerResult.data ?? null,
+      rawModelOutput: workerResult.raw_model_output ?? null
     });
     await upsertWorkItem(session.db, session.project.id, {
       issueNumber: workItem.issueNumber,
@@ -2761,7 +2872,8 @@ async function executeWorkerRun(
     recommendedNextAction: "Wait through the automated review window, then continue the PR cycle.",
     artifacts: workerResult.artifact_refs.length ? workerResult.artifact_refs : [livePullRequest.url],
     blockingQuestions: workerResult.blocking_questions,
-    outputJson: workerResult.data ?? null
+    outputJson: workerResult.data ?? null,
+    rawModelOutput: workerResult.raw_model_output ?? null
   });
 
   await upsertWorkItem(session.db, session.project.id, {
@@ -2826,26 +2938,26 @@ async function runCosReviewOnPr(
       cwd: session.project.repoPath,
       model: session.project.model,
       allowWrite: false,
-      prompt: [
-        `You are the Chief of Staff reviewing PR #${pr.number} for issue #${workItem.issueNumber}.`,
-        "Decide whether to merge, request changes, or escalate to the human director.",
-        "Return the verdict in `data.decision` as `merge`, `changes`, or `escalate`.",
-        "If you choose `changes`, provide concise `data.feedback` that a worker can act on.",
-        "If you choose `escalate`, provide `data.question`, `data.why_it_matters`, and `data.recommendation`.",
-        "",
-        `Issue: ${workItem.title}`,
-        "",
-        "Checks:",
-        JSON.stringify(checks, null, 2),
-        "",
-        "Recent comments:",
-        comments.length
-          ? comments.map((comment) => `- ${comment.author}: ${comment.body}`).join("\n")
-          : "No recent PR comments.",
-        "",
-        "Diff:",
-        diff.slice(0, 24_000)
-      ].join("\n")
+      prompt: buildChiefOfStaffPrompt(COS_TASK_APPENDICES.reviewPr, [
+        {
+          title: "Pull request",
+          content: `PR #${pr.number} for issue #${workItem.issueNumber}: ${workItem.title}`
+        },
+        {
+          title: "Checks",
+          content: JSON.stringify(checks, null, 2)
+        },
+        {
+          title: "Recent comments",
+          content: comments.length
+            ? comments.map((comment) => `- ${comment.author}: ${comment.body}`).join("\n")
+            : "No recent PR comments."
+        },
+        {
+          title: "Diff",
+          content: diff.slice(0, 24_000)
+        }
+      ])
     },
     {
       status: "ok",
@@ -2874,6 +2986,7 @@ async function runCosReviewOnPr(
     artifacts: result.artifact_refs,
     blockingQuestions: result.blocking_questions,
     outputJson: result.data ?? null,
+    rawModelOutput: result.raw_model_output ?? null,
     worktreePath: null
   });
 
@@ -3152,13 +3265,20 @@ async function processPrCycles(session: ProjectSession): Promise<boolean> {
 }
 
 async function processNextQueueItem(session: ProjectSession): Promise<boolean> {
+  const openDecision = await getOpenHumanDecision(session);
+  if (openDecision) {
+    await setOrchestratorState(session, "running", {
+      lastLoopAt: nowIso(),
+      lastSummary:
+        openDecision.issueNumber !== null
+          ? `Waiting for your reply on issue #${openDecision.issueNumber}.`
+          : "Waiting for your reply before claiming more work."
+    });
+    return false;
+  }
+
   const next = await chooseNextWorkItem(session);
   if (!next) {
-    const expanded = await maybeExpandNotesIntoIssues(session);
-    if (expanded) {
-      return true;
-    }
-
     const openDecisions = (
       await session.db
         .select()
@@ -3213,12 +3333,24 @@ async function runOrchestratorIteration(): Promise<boolean> {
 
     try {
       await syncProjectInternal(session);
+      const openDecision = await getOpenHumanDecision(session);
       const handledPrCycle = await processPrCycles(session);
-      const handledQueue = handledPrCycle ? true : await processNextQueueItem(session);
+      const handledQueue =
+        handledPrCycle || openDecision ? false : await processNextQueueItem(session);
+      const pendingQuestion = await getOpenHumanDecision(session);
+      const currentOrchestrator = await ensureOrchestratorRow(session);
+      if (currentOrchestrator.status !== "running") {
+        return false;
+      }
+
       await setOrchestratorState(session, "running", {
         lastLoopAt: nowIso(),
         lastSummary: handledPrCycle
           ? "Processed an active PR cycle."
+          : pendingQuestion
+            ? pendingQuestion.issueNumber !== null
+              ? `Waiting for your reply on issue #${pendingQuestion.issueNumber}.`
+              : "Waiting for your reply before claiming more work."
           : handledQueue
             ? "Processed the next queued work item."
             : "No autonomous work was available this cycle."
@@ -3475,9 +3607,6 @@ export async function syncProject(): Promise<DirectorOperationResponse> {
 export async function getDirectorStatus(): Promise<DirectorStatusResponse> {
   return withProject(async (session) => {
     const orchestrator = await ensureOrchestratorRow(session);
-    if (orchestrator.status === "running" && !orchestratorTimer && !orchestratorRunning) {
-      scheduleOrchestratorLoop(0);
-    }
 
     const [workItemRows, decisionRows, prCycleRows, runRows, noteRows, prRows] = await Promise.all([
       session.db.select().from(workItemsTable).where(eq(workItemsTable.projectId, session.project.id)),
@@ -3574,20 +3703,24 @@ async function runCoSChatReply(
       cwd: session.project.repoPath,
       model: session.project.model,
       allowWrite: false,
-      prompt: [
-        "You are the Chief of Staff for Director OS.",
-        "Reply to the director's latest chat message in 1 to 3 concise sentences.",
-        "If the message is ambiguous, ask one short follow-up question.",
-        "Otherwise acknowledge the direction and say what you will do next.",
-        "Return `data.kind` as `cos_reply` or `cos_question`.",
-        "Return the human-facing reply in `data.reply`.",
-        "If you ask a question, also return `data.question` and `data.recommendation`.",
-        "",
-        "Recent conversation:",
-        await recentConversationPrompt(session),
-        "",
-        `Latest director message: ${content}`
-      ].join("\n")
+      prompt: buildChiefOfStaffPrompt(COS_TASK_APPENDICES.replyInChat, [
+        {
+          title: "Recent conversation",
+          content: await recentConversationPrompt(session)
+        },
+        {
+          title: "Latest director message",
+          content
+        },
+        {
+          title: "Output contract",
+          content: [
+            "Return `data.kind` as `cos_reply` or `cos_question`.",
+            "Return the human-facing reply in `data.reply`.",
+            "If you ask a question, also return `data.question`, `data.recommendation`, and optional `data.rationale`."
+          ].join("\n")
+        }
+      ])
     },
     {
       status: "ok",
@@ -3726,24 +3859,24 @@ export async function sendConversationMessage(
   return withProject(async (session) => {
     await backfillOpenDecisionQuestions(session);
     const openDecision = await getOpenHumanDecision(session);
+    await appendConversationMessage(session, {
+      role: "director",
+      kind: "human_message",
+      content: trimmed,
+      summary: summarizeText(trimmed),
+      linkedIssueNumber: openDecision?.issueNumber ?? null,
+      linkedPrNumber: openDecision?.prNumber ?? null,
+      isOpenQuestion: false,
+      workItemId: openDecision?.workItemId ?? null,
+      issueNumber: openDecision?.issueNumber ?? null,
+      prNumber: openDecision?.prNumber ?? null,
+      decisionId: openDecision?.id ?? null,
+      runId: null
+    });
+
     if (openDecision) {
-      await appendConversationMessage(session, {
-        role: "director",
-        kind: "human_message",
-        content: trimmed,
-        summary: summarizeText(trimmed),
-        linkedIssueNumber: openDecision.issueNumber ?? null,
-        linkedPrNumber: openDecision.prNumber ?? null,
-        isOpenQuestion: false,
-        workItemId: openDecision.workItemId ?? null,
-        issueNumber: openDecision.issueNumber ?? null,
-        prNumber: openDecision.prNumber ?? null,
-        decisionId: openDecision.id,
-        runId: null
-      });
       await resolveDecisionInternal(session, openDecision.id, trimmed);
     } else {
-      await insertDirectorNoteRecord(session, trimmed);
       const reply = await runCoSChatReply(session, trimmed);
 
       if (reply.kind === "cos_question") {

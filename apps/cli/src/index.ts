@@ -112,7 +112,7 @@ program
 
 program
   .command("submit-note")
-  .description("Alias for `message`")
+  .description("Debug alias for `message`")
   .argument("<content...>", "The note or product direction")
   .action(async (contentParts) => {
     const result = await sendConversationMessage(contentParts.join(" "));
@@ -121,14 +121,14 @@ program
 
 program
   .command("list-decisions")
-  .description("List open escalation decisions")
+  .description("Debug view of open escalation decisions")
   .action(async () => {
     console.log(JSON.stringify(await listDecisions(), null, 2));
   });
 
 program
   .command("resolve-decision")
-  .description("Resolve an escalation decision and resume the associated work when appropriate")
+  .description("Debug path to resolve an escalation decision and resume work when appropriate")
   .argument("<decisionId>", "Local decision id")
   .argument("<resolution...>", "Resolution text")
   .action(async (decisionId, resolutionParts) => {
