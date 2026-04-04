@@ -1,56 +1,56 @@
-export const WORKFLOW_STATES = [
-  "draft",
-  "ready",
-  "in_progress",
-  "in_review",
-  "blocked",
-  "done"
-] as const;
-
-export const BRIEF_STATUSES = [
-  "draft",
-  "awaiting_approval",
-  "approved",
-  "rejected",
-  "superseded"
-] as const;
-
-export const DIRECTOR_TASK_STATUSES = [
+export const WORK_ITEM_KINDS = ["workstream", "task"] as const;
+export const WORK_ITEM_STATUSES = [
   "queued",
-  "ready_for_director",
-  "resolved"
+  "planning",
+  "ready",
+  "running",
+  "waiting_review",
+  "waiting_decision",
+  "completed",
+  "blocked"
 ] as const;
-
-export const DIRECTOR_TASK_KINDS = [
-  "approve_brief",
-  "answer_question",
-  "test_flow",
-  "approve_merge",
-  "advise"
+export const EXECUTION_MODES = ["lane", "worker"] as const;
+export const RUN_ROLES = [
+  "chief_of_staff",
+  "lane_owner",
+  "worker",
+  "reviewer",
+  "validator",
+  "pr_watcher"
 ] as const;
-
-export const AGENT_RUN_STATUSES = [
+export const RUN_STATUSES = [
   "queued",
   "running",
   "succeeded",
   "failed",
   "needs_input"
 ] as const;
-
+export const DECISION_TARGETS = ["chief_of_staff", "human_director"] as const;
+export const DECISION_STATUSES = ["open", "resolved", "dismissed"] as const;
+export const ORCHESTRATOR_STATUSES = ["idle", "running", "paused", "blocked"] as const;
+export const NOTE_STATUSES = ["active", "archived"] as const;
+export const PR_CYCLE_STATUSES = [
+  "opened",
+  "waiting_automation",
+  "changes_requested",
+  "revalidating",
+  "cos_review",
+  "merge_ready",
+  "merged",
+  "blocked"
+] as const;
 export const SETUP_CHECK_KINDS = [
   "repository",
   "github",
   "codex",
   "workspace"
 ] as const;
-
 export const SETUP_CHECK_STATUSES = [
   "ready",
   "needs_action",
   "blocked",
   "waiting"
 ] as const;
-
 export const SETUP_PROBLEM_CODES = [
   "repo_missing",
   "repo_not_absolute",
@@ -68,17 +68,19 @@ export const SETUP_PROBLEM_CODES = [
   "workspace_probe_failed"
 ] as const;
 
-export type WorkflowState = (typeof WORKFLOW_STATES)[number];
-export type BriefStatus = (typeof BRIEF_STATUSES)[number];
-export type DirectorTaskStatus = (typeof DIRECTOR_TASK_STATUSES)[number];
-export type DirectorTaskKind = (typeof DIRECTOR_TASK_KINDS)[number];
-export type AgentRunStatus = (typeof AGENT_RUN_STATUSES)[number];
+export type WorkItemKind = (typeof WORK_ITEM_KINDS)[number];
+export type WorkItemStatus = (typeof WORK_ITEM_STATUSES)[number];
+export type ExecutionMode = (typeof EXECUTION_MODES)[number];
+export type RunRole = (typeof RUN_ROLES)[number];
+export type RunStatus = (typeof RUN_STATUSES)[number];
+export type DecisionTarget = (typeof DECISION_TARGETS)[number];
+export type DecisionStatus = (typeof DECISION_STATUSES)[number];
+export type OrchestratorStatus = (typeof ORCHESTRATOR_STATUSES)[number];
+export type NoteStatus = (typeof NOTE_STATUSES)[number];
+export type PrCycleStatus = (typeof PR_CYCLE_STATUSES)[number];
 export type SetupCheckKind = (typeof SETUP_CHECK_KINDS)[number];
 export type SetupCheckStatus = (typeof SETUP_CHECK_STATUSES)[number];
 export type SetupProblemCode = (typeof SETUP_PROBLEM_CODES)[number];
-
-export type BriefAction = "approve" | "revise" | "reject";
-export type DirectorTaskAction = "approve" | "reject" | "resolve";
 
 export const DIRECTOR_LABEL_PREFIX = "director:";
 
@@ -96,62 +98,6 @@ export interface ProjectRecord {
   updatedAt: string;
 }
 
-export interface IntakeMessage {
-  role: "director" | "chief_of_staff";
-  content: string;
-  createdAt: string;
-}
-
-export interface BriefDraft {
-  title: string;
-  problem: string;
-  targetUser: string;
-  desiredOutcome: string;
-  constraints: string[];
-  nonGoals: string[];
-  successMetrics: string[];
-}
-
-export interface BriefRecord {
-  id: number;
-  projectId: number;
-  title: string;
-  status: BriefStatus;
-  summary: string;
-  draft: BriefDraft;
-  transcript: IntakeMessage[];
-  githubEpicNumber: number | null;
-  createdAt: string;
-  updatedAt: string;
-}
-
-export interface EpicRecord {
-  id: number;
-  projectId: number;
-  briefId: number;
-  title: string;
-  summary: string;
-  status: string;
-  githubIssueNumber: number | null;
-  childIssueNumbers: number[];
-  createdAt: string;
-  updatedAt: string;
-}
-
-export interface DirectorTaskRecord {
-  id: number;
-  projectId: number;
-  briefId: number | null;
-  kind: DirectorTaskKind;
-  title: string;
-  description: string;
-  recommendation: string;
-  status: DirectorTaskStatus;
-  payload: Record<string, unknown>;
-  createdAt: string;
-  updatedAt: string;
-}
-
 export interface GitHubIssueRecord {
   id: number;
   projectId: number;
@@ -159,7 +105,7 @@ export interface GitHubIssueRecord {
   title: string;
   body: string;
   state: string;
-  workflowState: WorkflowState;
+  workflowState: string;
   labels: string[];
   url: string;
   updatedAt: string;
@@ -184,17 +130,93 @@ export interface GitHubPullRequestRecord {
   syncedAt: string;
 }
 
-export interface AgentRunRecord {
+export interface WorkItemRecord {
   id: number;
   projectId: number;
-  role: string;
-  targetType: string;
-  targetId: string;
-  status: AgentRunStatus;
-  inputSummary: string;
-  outputSummary: string;
+  issueNumber: number;
+  parentIssueNumber: number | null;
+  title: string;
+  summary: string;
+  kind: WorkItemKind;
+  executionMode: ExecutionMode;
+  ownerRole: string;
+  status: WorkItemStatus;
+  priorityBucket: number;
+  activeRunId: number | null;
+  activePrNumber: number | null;
+  lastSummary: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface RunRecord {
+  id: number;
+  projectId: number;
+  workItemId: number | null;
+  issueNumber: number | null;
+  prNumber: number | null;
+  role: RunRole;
+  status: RunStatus;
+  phase: string;
+  summary: string;
+  recommendedNextAction: string | null;
+  artifacts: string[];
+  blockingQuestions: string[];
   outputJson: Record<string, unknown> | null;
-  workingDirectory: string | null;
+  worktreePath: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface DecisionRecord {
+  id: number;
+  projectId: number;
+  workItemId: number | null;
+  issueNumber: number | null;
+  prNumber: number | null;
+  target: DecisionTarget;
+  title: string;
+  summary: string;
+  recommendation: string;
+  rationale: string;
+  status: DecisionStatus;
+  resolution: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface DirectorNoteRecord {
+  id: number;
+  projectId: number;
+  content: string;
+  status: NoteStatus;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface PrCycleRecord {
+  id: number;
+  projectId: number;
+  issueNumber: number;
+  prNumber: number;
+  status: PrCycleStatus;
+  summary: string;
+  automationWindowEndsAt: string | null;
+  lastCheckedAt: string | null;
+  lastHandledCommentAt: string | null;
+  mergedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface OrchestratorStatusRecord {
+  id: number;
+  projectId: number;
+  status: OrchestratorStatus;
+  pauseReason: string | null;
+  activeRunIds: number[];
+  lastLoopAt: string | null;
+  lastSummary: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -243,33 +265,25 @@ export interface SetupStatusResponse {
   completed: boolean;
 }
 
-export interface HomeOverview {
+export interface DirectorStatusResponse {
   project: ProjectRecord | null;
-  counts: {
-    pendingDirectorTasks: number;
-    activeBriefs: number;
-    readyIssues: number;
-    inReviewIssues: number;
-    openPullRequests: number;
-  };
-  pendingTasks: DirectorTaskRecord[];
-  activeIssues: GitHubIssueRecord[];
+  orchestrator: OrchestratorStatusRecord | null;
+  queue: WorkItemRecord[];
+  activeWork: WorkItemRecord[];
+  decisions: DecisionRecord[];
+  prCycles: PrCycleRecord[];
+  recentRuns: RunRecord[];
+  notes: DirectorNoteRecord[];
   openPullRequests: GitHubPullRequestRecord[];
-  recentRuns: AgentRunRecord[];
-  latestBrief: BriefRecord | null;
 }
 
-export interface InboxResponse {
-  tasks: DirectorTaskRecord[];
-}
-
-export interface IntakeResponse {
-  project: ProjectRecord | null;
-  brief: BriefRecord | null;
+export interface DecisionsResponse {
+  decisions: DecisionRecord[];
 }
 
 export interface DirectorOperationResponse {
   ok: boolean;
+  message?: string;
   [key: string]: unknown;
 }
 
@@ -278,16 +292,13 @@ export interface DirectorClient {
   probeRepository(input: SetupProbeRepositoryInput): Promise<SetupStatusResponse>;
   runWorkspaceTest(repositoryDraft: SetupRepositoryDraft): Promise<SetupStatusResponse>;
   completeSetup(repositoryDraft: SetupRepositoryDraft): Promise<SetupStatusResponse>;
-  getOverview(): Promise<HomeOverview>;
-  getInbox(): Promise<InboxResponse>;
-  getIntake(): Promise<IntakeResponse>;
-  submitIntakeMessage(content: string): Promise<BriefRecord>;
-  actOnBrief(briefId: number, action: BriefAction): Promise<BriefRecord>;
-  actOnTask(taskId: number, action: DirectorTaskAction): Promise<DirectorTaskRecord>;
+  getStatus(): Promise<DirectorStatusResponse>;
+  start(): Promise<DirectorOperationResponse>;
+  pause(reason?: string): Promise<DirectorOperationResponse>;
   sync(): Promise<DirectorOperationResponse>;
-  runIssue(issueNumber: number): Promise<DirectorOperationResponse>;
-  reviewPr(prNumber: number): Promise<DirectorOperationResponse>;
-  mergePr(prNumber: number): Promise<DirectorOperationResponse>;
+  submitNote(content: string): Promise<DirectorNoteRecord>;
+  listDecisions(): Promise<DecisionsResponse>;
+  resolveDecision(decisionId: number, resolution: string): Promise<DecisionRecord>;
 }
 
 export interface DirectorDesktopBridge {
@@ -298,16 +309,13 @@ export interface DirectorDesktopBridge {
     complete(repositoryDraft: SetupRepositoryDraft): Promise<SetupStatusResponse>;
   };
   director: {
-    getOverview(): Promise<HomeOverview>;
-    getInbox(): Promise<InboxResponse>;
-    getIntake(): Promise<IntakeResponse>;
-    submitIntakeMessage(content: string): Promise<BriefRecord>;
-    actOnBrief(briefId: number, action: BriefAction): Promise<BriefRecord>;
-    actOnTask(taskId: number, action: DirectorTaskAction): Promise<DirectorTaskRecord>;
+    getStatus(): Promise<DirectorStatusResponse>;
+    start(): Promise<DirectorOperationResponse>;
+    pause(reason?: string): Promise<DirectorOperationResponse>;
     sync(): Promise<DirectorOperationResponse>;
-    runIssue(issueNumber: number): Promise<DirectorOperationResponse>;
-    reviewPr(prNumber: number): Promise<DirectorOperationResponse>;
-    mergePr(prNumber: number): Promise<DirectorOperationResponse>;
+    submitNote(content: string): Promise<DirectorNoteRecord>;
+    listDecisions(): Promise<DecisionsResponse>;
+    resolveDecision(decisionId: number, resolution: string): Promise<DecisionRecord>;
   };
 }
 

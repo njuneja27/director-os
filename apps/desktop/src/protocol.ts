@@ -6,15 +6,12 @@ export const IPC_CHANNELS = {
     complete: "director:setup:complete"
   },
   director: {
-    getOverview: "director:get-overview",
-    getInbox: "director:get-inbox",
-    getIntake: "director:get-intake",
-    submitIntakeMessage: "director:submit-intake-message",
-    actOnBrief: "director:act-on-brief",
-    actOnTask: "director:act-on-task",
+    getStatus: "director:get-status",
+    start: "director:start",
+    pause: "director:pause",
     sync: "director:sync",
-    runIssue: "director:run-issue",
-    reviewPr: "director:review-pr",
-    mergePr: "director:merge-pr"
+    submitNote: "director:submit-note",
+    listDecisions: "director:list-decisions",
+    resolveDecision: "director:resolve-decision"
   }
 } as const;

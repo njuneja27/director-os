@@ -2,166 +2,123 @@
 
 ## What We Want To Do
 
-Director OS is a product for running a software effort with a human at the level of direction, taste, and approval while AI agents handle most of the operating loop.
+Director OS is a local-first orchestration engine for running a software product with AI agents while the human stays at the level of direction, taste, and exception handling.
 
-The goal is not "full autonomy." The goal is a human-directed agent organization where:
+The product goal is not "full autonomy." The goal is a continuous operating loop where:
 
-- the human director sets product direction, priorities, and high-stakes decisions
-- a chief of staff agent turns messy intent into clear briefs and queues of work
-- specialized agents decompose, plan, implement, review, and audit changes
-- the system only interrupts the human when their judgment creates real leverage
+- the human director gives direction, constraints, and non-obvious product judgment
+- the Chief of Staff owns prioritization, scoping, sequencing, merge judgment, and escalation
+- lane owners take larger cross-cutting slices end to end
+- focused workers handle bounded implementation, validation, and review tasks
+- GitHub remains the durable artifact layer for issues and pull requests
 
-In practice, the product should let a human say something like "onboarding feels weak" and have the system:
+The desired outcome is that the human mostly interacts through:
 
-1. clarify the goal
-2. turn it into a product brief
-3. break that brief into issues
-4. route work to execution agents
-5. open real, non-draft PRs linked to numbered issues
-6. review the work
-7. return to the human only for approval, testing, or strategic guidance
+- `Start` / `Pause`
+- director notes
+- rare escalation decisions
 
-### Desired Outcome
-
-The human director should be able to steer a product in a small amount of time each day without managing implementation details.
-
-### Success Criteria
-
-- the director mostly interacts through approvals, testing, and advice requests
-- agents move approved work from brief to merged PR with minimal human intervention
-- work is tracked through durable artifacts instead of fragile chat history
-- the executive inbox stays small, clear, and recommendation-first
-- the system can run for long periods without product direction drifting
+not through manually triggering every issue, review, or merge step.
 
 ## How We Want To Do It
 
-### Product Shape
+### Core Model
 
-Director OS should feel like an executive cockpit, not a task board. The primary user experience is:
+Director OS now treats the local app as an orchestration layer on top of GitHub and Codex CLI.
 
-- `Home`: a calm summary of what needs judgment, what shipped, what is blocked, and what agents are doing
-- `Inbox`: decision-shaped requests such as approve, test, choose, advise
-- `Intake`: a conversation between the human director and chief of staff that produces an approvable brief
-- `Validation`: a guided place for the human to test important changes
-- `Strategy`: a periodic review surface for priorities, risks, and proposed next work
+The core local objects are:
 
-### Operating Model
+- `WorkItem`: a local record for a numbered GitHub issue, including kind, ownership mode, queue state, and active PR linkage
+- `Run`: a Chief of Staff, lane, worker, review, validation, or PR-watch execution with logs and summaries
+- `Decision`: a real escalation, targeted either to the Chief of Staff or the human director
+- `PR cycle`: the local state machine around an open PR while it waits for automation, comments, revalidation, CoS review, and merge
+- `Director note`: freeform direction from the human, used when the org needs more work to pull
 
-The system should be artifact-centered, not chat-centered. Agents may converse, but the real handoffs should be durable objects:
+### Operating Loop
 
-- `brief`
-- `epic`
-- `issue`
-- `plan`
-- `pr`
-- `review`
-- `director_task`
+1. The director adds a note or leaves existing GitHub issues as the durable backlog.
+2. The Chief of Staff syncs GitHub and chooses the next best ready slice.
+3. Larger or cross-cutting work is classified into a lane owner flow.
+4. Lane planning happens in a read-only Codex pass before any write-enabled execution starts.
+5. Bounded tasks go straight to worker execution.
+6. Workers implement code, validate locally, and open real non-draft PRs linked to numbered issues.
+7. PR cycles wait through automated review, address comments, rerun validation, and return to the Chief of Staff for independent merge judgment.
+8. Only non-obvious product calls, contradictory review outcomes, or "no work left" states escalate back to the human director.
 
-These objects should drive the workflow from intake through merge.
+### UX Shape
 
-### Core Roles
+Director OS should feel like a calm control room rather than a ticket board.
 
-- `Human director`: owns intent, priorities, taste, and irreversible decisions
-- `Chief of staff`: owns intake, triage, issue readiness, assignment, escalation, and merge recommendation
-- `Spec agent`: turns approved briefs into epics and child issues
-- `Execution agents`: implement bounded work in code
-- `Review agents`: review PRs for correctness, regressions, and missing tests
-- `Audit agents`: periodically inspect UX, functionality, performance, and reliability to propose follow-up work
+The primary desktop experience is:
 
-### Interaction Principles
+- setup and repair for repository, GitHub CLI, Codex CLI, and local workspace readiness
+- one control room with orchestrator state, queued work, active slices, PR cycles, escalations, recent runs, and director notes
+- explicit `Start`, `Pause`, and `Sync` controls instead of manual per-issue execution buttons
 
-- recommend actions instead of asking open-ended questions
-- escalate ambiguity instead of bluffing through it
-- keep the director out of routine operations
-- show momentum and risk, not agent chatter
-- make every director-facing item short, structured, and decision-ready
+### Technical Direction
 
-### Workflow
-
-1. The human director and chief of staff discuss a product goal in Intake.
-2. The chief of staff writes a `brief`.
-3. The human director approves, revises, or rejects the brief.
-4. The spec agent turns the approved brief into an `epic` and a set of `issues`.
-5. The chief of staff sequences the work and moves issues into `ready`.
-6. An execution agent creates a `plan`, gets approval if needed, implements the issue, and opens a real, non-draft PR linked to the numbered issue.
-7. Review and audit agents inspect the PR and either pass it, request changes, or escalate to the director.
-8. If human validation is needed, the system creates a `director_task` such as test this flow or choose between options.
-9. After review passes, the chief of staff merges the PR.
-10. After a PR is opened, the system should wait for automated review feedback before considering the work fully complete.
-
-### Initial Technical Direction
-
-The first implementation should bias toward simplicity:
-
-- GitHub is the control plane for issues, PRs, and linked work items
-- Director OS is the orchestration and UI layer on top
-- a small set of structured templates define briefs, issues, plans, reviews, and director tasks
-- agent runs should be inspectable and replayable
-- product memory should live in durable docs and policies, not only prompt history
+- local desktop-first shell
+- one embedded local backend process
+- GitHub for live issue and PR state
+- SQLite for orchestration state, runs, decisions, notes, and PR-cycle tracking
+- Codex CLI as the local coding engine, with no separate API-key UX in Director OS
 
 ## Scope
 
 ### MVP
 
-The MVP should prove that the product is useful for one human director and one software project.
+The MVP should prove that Director OS can dogfood itself on one repo with one human director.
 
 MVP includes:
 
-- a single-project workspace
-- `Home`, `Inbox`, and `Intake` as the first three screens
-- brief creation and approval
-- epic and issue decomposition from an approved brief
-- issue states such as `ready`, `in_progress`, `in_review`, `blocked`, and `done`
-- GitHub sync for issues and PRs
-- real, non-draft PR creation linked to numbered issues
-- review summaries and merge recommendations
-- a director inbox with at least these task types:
-  - approve brief
-  - answer product question
-  - test flow
-  - approve release or merge
+- local setup and readiness checks
+- GitHub issue and PR mirroring
+- a local orchestration schema built around work items, runs, decisions, notes, and orchestrator state
+- a continuous Chief of Staff loop with `Start` and `Pause`
+- lane planning via read-only Codex runs
+- worker execution via write-enabled Codex runs
+- real non-draft PR creation linked to numbered issues
+- PR-cycle waiting, review follow-up, revalidation, and merge readiness
+- a thin desktop control room for visibility and intervention
 
 MVP does not need:
 
-- full autonomous deployment
-- deep analytics integration
-- multi-repo orchestration
-- sophisticated budgeting or capacity planning
-- many agent specialties beyond the core operating loop
+- deploy orchestration
+- multi-repo support
+- cloud-hosted execution
+- long-lived shared session memory between agents
+- rich analytics or roadmap views
 
 ### V1
 
-V1 should make the system feel dependable enough to use as a real operating layer for an active product.
+V1 should make the system dependable enough to operate a live product backlog day to day.
 
 V1 includes:
 
-- `Validation` and `Strategy` screens
-- reusable templates for briefs, issues, plans, reviews, and director tasks
-- stronger routing between frontend, backend, and review agents
-- dependency-aware issue sequencing
-- periodic audit digests for UX, functionality, performance, and reliability
-- merge gating based on reviews, checks, and policy
-- lightweight shared memory for product context, architecture context, and decisions
-- better visibility into why agents made specific recommendations
+- stronger CoS sequencing and ranking
+- better autonomous handling of review comments and failing checks
+- richer lane ownership across parent/child issue slices
+- more informative human escalation cards
+- improved activity history and replayability
+- a more expressive director note to issue-expansion loop
 
 ### Vx
 
-Vx is the long-range vision where Director OS becomes a real operating system for an agent-run software organization.
+The long-range version becomes a true operating system for an agent-run software organization.
 
 Vx may include:
 
-- multiple products or repositories under one director view
-- richer planning across roadmap, capacity, and release windows
-- experiment loops tied to usage data and outcomes
-- deployment orchestration with rollback awareness
-- automatic backlog pruning and priority maintenance
-- long-lived agent memory with explicit decision lineage
-- support for different org shapes, such as multiple chiefs of staff or dedicated release managers
+- multiple repos or products
+- release orchestration and rollback awareness
+- richer capacity and roadmap planning
+- stronger memory and decision lineage
+- more persistent lane agents
+- better integration between product signals and backlog maintenance
 
 ## Product Boundaries
 
-Director OS is not trying to replace human product judgment. It is trying to compress execution overhead so the human can stay focused on the decisions that matter most.
+Director OS should automate bounded execution, not replace human product judgment.
 
-If a decision is reversible and bounded, the system should usually make it.
+If the decision is reversible and local, the system should usually make it.
 
-If a decision is strategic, ambiguous, or costly to undo, the system should escalate it to the human director.
+If the decision is strategic, taste-sensitive, or costly to undo, the system should escalate it.

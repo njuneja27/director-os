@@ -12,7 +12,13 @@ import {
 } from "./commands.js";
 
 export interface RunAgentOptions {
-  role: "chief_of_staff" | "spec" | "executor" | "reviewer";
+  role:
+    | "chief_of_staff"
+    | "lane_owner"
+    | "worker"
+    | "reviewer"
+    | "validator"
+    | "pr_watcher";
   prompt: string;
   cwd: string;
   model: string;

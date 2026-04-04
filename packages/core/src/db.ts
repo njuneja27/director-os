@@ -6,6 +6,7 @@ import { integer, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core
 
 import { ensureRuntimeDirectories, resolveRuntimePaths, type RuntimePaths } from "./config.js";
 
+const CURRENT_SCHEMA_VERSION = 2;
 const jsonText = (name: string) => text(name, { mode: "json" });
 
 export const projectsTable = sqliteTable(
@@ -28,60 +29,114 @@ export const projectsTable = sqliteTable(
   })
 );
 
-export const briefsTable = sqliteTable("briefs", {
+export const orchestratorStateTable = sqliteTable(
+  "orchestrator_state",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    projectId: integer("project_id").notNull(),
+    status: text("status").notNull(),
+    pauseReason: text("pause_reason"),
+    activeRunIds: jsonText("active_run_ids").notNull(),
+    lastLoopAt: text("last_loop_at"),
+    lastSummary: text("last_summary"),
+    createdAt: text("created_at").notNull(),
+    updatedAt: text("updated_at").notNull()
+  },
+  (table) => ({
+    orchestratorProjectIdx: uniqueIndex("orchestrator_state_project_idx").on(table.projectId)
+  })
+);
+
+export const directorNotesTable = sqliteTable("director_notes", {
   id: integer("id").primaryKey({ autoIncrement: true }),
   projectId: integer("project_id").notNull(),
-  title: text("title").notNull(),
+  content: text("content").notNull(),
   status: text("status").notNull(),
-  summary: text("summary").notNull(),
-  draft: jsonText("draft").notNull(),
-  transcript: jsonText("transcript").notNull(),
-  githubEpicNumber: integer("github_epic_number"),
   createdAt: text("created_at").notNull(),
   updatedAt: text("updated_at").notNull()
 });
 
-export const epicsTable = sqliteTable("epics", {
-  id: integer("id").primaryKey({ autoIncrement: true }),
-  projectId: integer("project_id").notNull(),
-  briefId: integer("brief_id").notNull(),
-  title: text("title").notNull(),
-  summary: text("summary").notNull(),
-  status: text("status").notNull(),
-  githubIssueNumber: integer("github_issue_number"),
-  childIssueNumbers: jsonText("child_issue_numbers").notNull(),
-  createdAt: text("created_at").notNull(),
-  updatedAt: text("updated_at").notNull()
-});
+export const workItemsTable = sqliteTable(
+  "work_items",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    projectId: integer("project_id").notNull(),
+    issueNumber: integer("issue_number").notNull(),
+    parentIssueNumber: integer("parent_issue_number"),
+    title: text("title").notNull(),
+    summary: text("summary").notNull(),
+    kind: text("kind").notNull(),
+    executionMode: text("execution_mode").notNull(),
+    ownerRole: text("owner_role").notNull(),
+    status: text("status").notNull(),
+    priorityBucket: integer("priority_bucket").notNull(),
+    activeRunId: integer("active_run_id"),
+    activePrNumber: integer("active_pr_number"),
+    lastSummary: text("last_summary"),
+    createdAt: text("created_at").notNull(),
+    updatedAt: text("updated_at").notNull()
+  },
+  (table) => ({
+    workItemIssueIdx: uniqueIndex("work_items_project_issue_idx").on(table.projectId, table.issueNumber)
+  })
+);
 
-export const directorTasksTable = sqliteTable("director_tasks", {
+export const runsTable = sqliteTable("runs", {
   id: integer("id").primaryKey({ autoIncrement: true }),
   projectId: integer("project_id").notNull(),
-  briefId: integer("brief_id"),
-  kind: text("kind").notNull(),
-  title: text("title").notNull(),
-  description: text("description").notNull(),
-  recommendation: text("recommendation").notNull(),
-  status: text("status").notNull(),
-  payload: jsonText("payload").notNull(),
-  createdAt: text("created_at").notNull(),
-  updatedAt: text("updated_at").notNull()
-});
-
-export const agentRunsTable = sqliteTable("agent_runs", {
-  id: integer("id").primaryKey({ autoIncrement: true }),
-  projectId: integer("project_id").notNull(),
+  workItemId: integer("work_item_id"),
+  issueNumber: integer("issue_number"),
+  prNumber: integer("pr_number"),
   role: text("role").notNull(),
-  targetType: text("target_type").notNull(),
-  targetId: text("target_id").notNull(),
   status: text("status").notNull(),
-  inputSummary: text("input_summary").notNull(),
-  outputSummary: text("output_summary").notNull(),
+  phase: text("phase").notNull(),
+  summary: text("summary").notNull(),
+  recommendedNextAction: text("recommended_next_action"),
+  artifacts: jsonText("artifacts").notNull(),
+  blockingQuestions: jsonText("blocking_questions").notNull(),
   outputJson: jsonText("output_json"),
-  workingDirectory: text("working_directory"),
+  worktreePath: text("worktree_path"),
   createdAt: text("created_at").notNull(),
   updatedAt: text("updated_at").notNull()
 });
+
+export const decisionsTable = sqliteTable("decisions", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  projectId: integer("project_id").notNull(),
+  workItemId: integer("work_item_id"),
+  issueNumber: integer("issue_number"),
+  prNumber: integer("pr_number"),
+  target: text("target").notNull(),
+  title: text("title").notNull(),
+  summary: text("summary").notNull(),
+  recommendation: text("recommendation").notNull(),
+  rationale: text("rationale").notNull(),
+  status: text("status").notNull(),
+  resolution: text("resolution"),
+  createdAt: text("created_at").notNull(),
+  updatedAt: text("updated_at").notNull()
+});
+
+export const prCyclesTable = sqliteTable(
+  "pr_cycles",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    projectId: integer("project_id").notNull(),
+    issueNumber: integer("issue_number").notNull(),
+    prNumber: integer("pr_number").notNull(),
+    status: text("status").notNull(),
+    summary: text("summary").notNull(),
+    automationWindowEndsAt: text("automation_window_ends_at"),
+    lastCheckedAt: text("last_checked_at"),
+    lastHandledCommentAt: text("last_handled_comment_at"),
+    mergedAt: text("merged_at"),
+    createdAt: text("created_at").notNull(),
+    updatedAt: text("updated_at").notNull()
+  },
+  (table) => ({
+    prCycleIdx: uniqueIndex("pr_cycles_project_pr_idx").on(table.projectId, table.prNumber)
+  })
+);
 
 export const eventsTable = sqliteTable("events", {
   id: integer("id").primaryKey({ autoIncrement: true }),
@@ -174,10 +229,12 @@ export const githubCommentsTable = sqliteTable(
 
 export const schema = {
   projectsTable,
-  briefsTable,
-  epicsTable,
-  directorTasksTable,
-  agentRunsTable,
+  orchestratorStateTable,
+  directorNotesTable,
+  workItemsTable,
+  runsTable,
+  decisionsTable,
+  prCyclesTable,
   eventsTable,
   worktreesTable,
   githubIssuesTable,
@@ -207,57 +264,94 @@ create table if not exists projects (
   created_at text not null,
   updated_at text not null
 );
-create table if not exists briefs (
+create table if not exists orchestrator_state (
   id integer primary key autoincrement,
   project_id integer not null,
-  title text not null,
   status text not null,
-  summary text not null,
-  draft text not null,
-  transcript text not null,
-  github_epic_number integer,
+  pause_reason text,
+  active_run_ids text not null,
+  last_loop_at text,
+  last_summary text,
   created_at text not null,
   updated_at text not null
 );
-create table if not exists epics (
+create unique index if not exists orchestrator_state_project_idx on orchestrator_state(project_id);
+create table if not exists director_notes (
   id integer primary key autoincrement,
   project_id integer not null,
-  brief_id integer not null,
-  title text not null,
-  summary text not null,
+  content text not null,
   status text not null,
-  github_issue_number integer,
-  child_issue_numbers text not null,
   created_at text not null,
   updated_at text not null
 );
-create table if not exists director_tasks (
+create table if not exists work_items (
   id integer primary key autoincrement,
   project_id integer not null,
-  brief_id integer,
+  issue_number integer not null,
+  parent_issue_number integer,
+  title text not null,
+  summary text not null,
   kind text not null,
-  title text not null,
-  description text not null,
-  recommendation text not null,
+  execution_mode text not null,
+  owner_role text not null,
   status text not null,
-  payload text not null,
+  priority_bucket integer not null,
+  active_run_id integer,
+  active_pr_number integer,
+  last_summary text,
   created_at text not null,
   updated_at text not null
 );
-create table if not exists agent_runs (
+create unique index if not exists work_items_project_issue_idx on work_items(project_id, issue_number);
+create table if not exists runs (
   id integer primary key autoincrement,
   project_id integer not null,
+  work_item_id integer,
+  issue_number integer,
+  pr_number integer,
   role text not null,
-  target_type text not null,
-  target_id text not null,
   status text not null,
-  input_summary text not null,
-  output_summary text not null,
+  phase text not null,
+  summary text not null,
+  recommended_next_action text,
+  artifacts text not null,
+  blocking_questions text not null,
   output_json text,
-  working_directory text,
+  worktree_path text,
   created_at text not null,
   updated_at text not null
 );
+create table if not exists decisions (
+  id integer primary key autoincrement,
+  project_id integer not null,
+  work_item_id integer,
+  issue_number integer,
+  pr_number integer,
+  target text not null,
+  title text not null,
+  summary text not null,
+  recommendation text not null,
+  rationale text not null,
+  status text not null,
+  resolution text,
+  created_at text not null,
+  updated_at text not null
+);
+create table if not exists pr_cycles (
+  id integer primary key autoincrement,
+  project_id integer not null,
+  issue_number integer not null,
+  pr_number integer not null,
+  status text not null,
+  summary text not null,
+  automation_window_ends_at text,
+  last_checked_at text,
+  last_handled_comment_at text,
+  merged_at text,
+  created_at text not null,
+  updated_at text not null
+);
+create unique index if not exists pr_cycles_project_pr_idx on pr_cycles(project_id, pr_number);
 create table if not exists events (
   id integer primary key autoincrement,
   project_id integer not null,
@@ -338,7 +432,19 @@ export async function openDatabase(paths = resolveRuntimePaths()): Promise<OpenD
 }
 
 export function migrateDatabase(sqlite: Database.Database): void {
+  const version = Number(sqlite.pragma("user_version", { simple: true }) ?? 0);
+
+  if (version < CURRENT_SCHEMA_VERSION) {
+    sqlite.exec(`
+      drop table if exists briefs;
+      drop table if exists epics;
+      drop table if exists director_tasks;
+      drop table if exists agent_runs;
+    `);
+  }
+
   sqlite.exec(bootstrapSql);
+  sqlite.pragma(`user_version = ${CURRENT_SCHEMA_VERSION}`);
 }
 
 export function asJson<TValue>(value: TValue): TValue {
