@@ -6,7 +6,7 @@ import { integer, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core
 
 import { ensureRuntimeDirectories, resolveRuntimePaths, type RuntimePaths } from "./config.js";
 
-const CURRENT_SCHEMA_VERSION = 2;
+const CURRENT_SCHEMA_VERSION = 4;
 const jsonText = (name: string) => text(name, { mode: "json" });
 
 export const projectsTable = sqliteTable(
@@ -52,6 +52,41 @@ export const directorNotesTable = sqliteTable("director_notes", {
   projectId: integer("project_id").notNull(),
   content: text("content").notNull(),
   status: text("status").notNull(),
+  createdAt: text("created_at").notNull(),
+  updatedAt: text("updated_at").notNull()
+});
+
+export const conversationThreadsTable = sqliteTable(
+  "conversation_threads",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    projectId: integer("project_id").notNull(),
+    title: text("title").notNull(),
+    status: text("status").notNull(),
+    createdAt: text("created_at").notNull(),
+    updatedAt: text("updated_at").notNull()
+  },
+  (table) => ({
+    conversationProjectIdx: uniqueIndex("conversation_threads_project_idx").on(table.projectId)
+  })
+);
+
+export const conversationMessagesTable = sqliteTable("conversation_messages", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  threadId: integer("thread_id").notNull(),
+  projectId: integer("project_id").notNull(),
+  role: text("role").notNull(),
+  kind: text("kind").notNull(),
+  content: text("content").notNull(),
+  summary: text("summary"),
+  linkedIssueNumber: integer("linked_issue_number"),
+  linkedPrNumber: integer("linked_pr_number"),
+  isOpenQuestion: integer("is_open_question", { mode: "boolean" }).notNull().default(false),
+  workItemId: integer("work_item_id"),
+  issueNumber: integer("issue_number"),
+  prNumber: integer("pr_number"),
+  decisionId: integer("decision_id"),
+  runId: integer("run_id"),
   createdAt: text("created_at").notNull(),
   updatedAt: text("updated_at").notNull()
 });
@@ -106,6 +141,9 @@ export const decisionsTable = sqliteTable("decisions", {
   workItemId: integer("work_item_id"),
   issueNumber: integer("issue_number"),
   prNumber: integer("pr_number"),
+  requestedByRunId: integer("requested_by_run_id"),
+  questionMessageId: integer("question_message_id"),
+  resolutionMessageId: integer("resolution_message_id"),
   target: text("target").notNull(),
   title: text("title").notNull(),
   summary: text("summary").notNull(),
@@ -231,6 +269,8 @@ export const schema = {
   projectsTable,
   orchestratorStateTable,
   directorNotesTable,
+  conversationThreadsTable,
+  conversationMessagesTable,
   workItemsTable,
   runsTable,
   decisionsTable,
@@ -284,6 +324,34 @@ create table if not exists director_notes (
   created_at text not null,
   updated_at text not null
 );
+create table if not exists conversation_threads (
+  id integer primary key autoincrement,
+  project_id integer not null,
+  title text not null,
+  status text not null,
+  created_at text not null,
+  updated_at text not null
+);
+create unique index if not exists conversation_threads_project_idx on conversation_threads(project_id);
+create table if not exists conversation_messages (
+  id integer primary key autoincrement,
+  thread_id integer not null,
+  project_id integer not null,
+  role text not null,
+  kind text not null,
+  content text not null,
+  summary text,
+  linked_issue_number integer,
+  linked_pr_number integer,
+  is_open_question integer not null default 0,
+  work_item_id integer,
+  issue_number integer,
+  pr_number integer,
+  decision_id integer,
+  run_id integer,
+  created_at text not null,
+  updated_at text not null
+);
 create table if not exists work_items (
   id integer primary key autoincrement,
   project_id integer not null,
@@ -327,6 +395,9 @@ create table if not exists decisions (
   work_item_id integer,
   issue_number integer,
   pr_number integer,
+  requested_by_run_id integer,
+  question_message_id integer,
+  resolution_message_id integer,
   target text not null,
   title text not null,
   summary text not null,
@@ -431,6 +502,11 @@ export async function openDatabase(paths = resolveRuntimePaths()): Promise<OpenD
   };
 }
 
+function columnExists(sqlite: Database.Database, tableName: string, columnName: string): boolean {
+  const rows = sqlite.pragma(`table_info(${tableName})`) as Array<{ name?: string }>;
+  return rows.some((row) => row.name === columnName);
+}
+
 export function migrateDatabase(sqlite: Database.Database): void {
   const version = Number(sqlite.pragma("user_version", { simple: true }) ?? 0);
 
@@ -444,6 +520,31 @@ export function migrateDatabase(sqlite: Database.Database): void {
   }
 
   sqlite.exec(bootstrapSql);
+
+  if (!columnExists(sqlite, "conversation_threads", "status")) {
+    sqlite.exec("alter table conversation_threads add column status text not null default 'active';");
+  }
+  if (!columnExists(sqlite, "conversation_messages", "summary")) {
+    sqlite.exec("alter table conversation_messages add column summary text;");
+  }
+  if (!columnExists(sqlite, "conversation_messages", "linked_issue_number")) {
+    sqlite.exec("alter table conversation_messages add column linked_issue_number integer;");
+  }
+  if (!columnExists(sqlite, "conversation_messages", "linked_pr_number")) {
+    sqlite.exec("alter table conversation_messages add column linked_pr_number integer;");
+  }
+  if (!columnExists(sqlite, "conversation_messages", "is_open_question")) {
+    sqlite.exec("alter table conversation_messages add column is_open_question integer not null default 0;");
+  }
+  if (!columnExists(sqlite, "decisions", "requested_by_run_id")) {
+    sqlite.exec("alter table decisions add column requested_by_run_id integer;");
+  }
+  if (!columnExists(sqlite, "decisions", "question_message_id")) {
+    sqlite.exec("alter table decisions add column question_message_id integer;");
+  }
+  if (!columnExists(sqlite, "decisions", "resolution_message_id")) {
+    sqlite.exec("alter table decisions add column resolution_message_id integer;");
+  }
   sqlite.pragma(`user_version = ${CURRENT_SCHEMA_VERSION}`);
 }
 

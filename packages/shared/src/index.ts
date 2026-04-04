@@ -29,6 +29,14 @@ export const DECISION_TARGETS = ["chief_of_staff", "human_director"] as const;
 export const DECISION_STATUSES = ["open", "resolved", "dismissed"] as const;
 export const ORCHESTRATOR_STATUSES = ["idle", "running", "paused", "blocked"] as const;
 export const NOTE_STATUSES = ["active", "archived"] as const;
+export const CONVERSATION_MESSAGE_ROLES = ["director", "chief_of_staff", "system"] as const;
+export const CONVERSATION_MESSAGE_KINDS = [
+  "human_message",
+  "cos_reply",
+  "cos_question",
+  "status_update",
+  "resolution"
+] as const;
 export const PR_CYCLE_STATUSES = [
   "opened",
   "waiting_automation",
@@ -77,6 +85,8 @@ export type DecisionTarget = (typeof DECISION_TARGETS)[number];
 export type DecisionStatus = (typeof DECISION_STATUSES)[number];
 export type OrchestratorStatus = (typeof ORCHESTRATOR_STATUSES)[number];
 export type NoteStatus = (typeof NOTE_STATUSES)[number];
+export type ConversationMessageRole = (typeof CONVERSATION_MESSAGE_ROLES)[number];
+export type ConversationMessageKind = (typeof CONVERSATION_MESSAGE_KINDS)[number];
 export type PrCycleStatus = (typeof PR_CYCLE_STATUSES)[number];
 export type SetupCheckKind = (typeof SETUP_CHECK_KINDS)[number];
 export type SetupCheckStatus = (typeof SETUP_CHECK_STATUSES)[number];
@@ -174,6 +184,9 @@ export interface DecisionRecord {
   workItemId: number | null;
   issueNumber: number | null;
   prNumber: number | null;
+  requestedByRunId: number | null;
+  questionMessageId: number | null;
+  resolutionMessageId: number | null;
   target: DecisionTarget;
   title: string;
   summary: string;
@@ -190,6 +203,30 @@ export interface DirectorNoteRecord {
   projectId: number;
   content: string;
   status: NoteStatus;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ConversationThreadRecord {
+  id: number;
+  projectId: number;
+  title: string;
+  status: "active" | "archived";
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ConversationMessageRecord {
+  id: number;
+  projectId: number;
+  threadId: number;
+  role: ConversationMessageRole;
+  kind: ConversationMessageKind;
+  content: string;
+  summary: string | null;
+  linkedIssueNumber: number | null;
+  linkedPrNumber: number | null;
+  isOpenQuestion: boolean;
   createdAt: string;
   updatedAt: string;
 }
@@ -277,6 +314,13 @@ export interface DirectorStatusResponse {
   openPullRequests: GitHubPullRequestRecord[];
 }
 
+export interface ConversationResponse {
+  thread: ConversationThreadRecord | null;
+  messages: ConversationMessageRecord[];
+  openQuestion: ConversationMessageRecord | null;
+  latestSummary: string | null;
+}
+
 export interface DecisionsResponse {
   decisions: DecisionRecord[];
 }
@@ -292,6 +336,8 @@ export interface DirectorClient {
   probeRepository(input: SetupProbeRepositoryInput): Promise<SetupStatusResponse>;
   runWorkspaceTest(repositoryDraft: SetupRepositoryDraft): Promise<SetupStatusResponse>;
   completeSetup(repositoryDraft: SetupRepositoryDraft): Promise<SetupStatusResponse>;
+  getConversation(): Promise<ConversationResponse>;
+  sendMessage(content: string): Promise<ConversationResponse>;
   getStatus(): Promise<DirectorStatusResponse>;
   start(): Promise<DirectorOperationResponse>;
   pause(reason?: string): Promise<DirectorOperationResponse>;
@@ -302,6 +348,10 @@ export interface DirectorClient {
 }
 
 export interface DirectorDesktopBridge {
+  conversation: {
+    getConversation(): Promise<ConversationResponse>;
+    sendMessage(content: string): Promise<ConversationResponse>;
+  };
   setup: {
     getStatus(): Promise<SetupStatusResponse>;
     probeRepository(input: SetupProbeRepositoryInput): Promise<SetupStatusResponse>;

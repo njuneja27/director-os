@@ -4,13 +4,14 @@ import open from "open";
 
 import {
   createDirectorServer,
+  getConversation,
   getDirectorStatus,
   initDirector,
   listDecisions,
   pauseOrchestrator,
   resolveDecision,
   startOrchestrator,
-  submitDirectorNote,
+  sendConversationMessage,
   syncProject
 } from "@director-os/core";
 
@@ -94,11 +95,27 @@ program
   });
 
 program
+  .command("conversation")
+  .description("Print the current Chief of Staff conversation thread")
+  .action(async () => {
+    console.log(JSON.stringify(await getConversation(), null, 2));
+  });
+
+program
+  .command("message")
+  .description("Send a message to the Chief of Staff chat")
+  .argument("<content...>", "The message to send")
+  .action(async (contentParts) => {
+    const result = await sendConversationMessage(contentParts.join(" "));
+    console.log(JSON.stringify(result, null, 2));
+  });
+
+program
   .command("submit-note")
-  .description("Submit a freeform director note for the Chief of Staff")
+  .description("Alias for `message`")
   .argument("<content...>", "The note or product direction")
   .action(async (contentParts) => {
-    const result = await submitDirectorNote(contentParts.join(" "));
+    const result = await sendConversationMessage(contentParts.join(" "));
     console.log(JSON.stringify(result, null, 2));
   });
 

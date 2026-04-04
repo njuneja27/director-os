@@ -1,4 +1,8 @@
 export const IPC_CHANNELS = {
+  conversation: {
+    get: "director:conversation:get",
+    send: "director:conversation:send"
+  },
   setup: {
     getStatus: "director:setup:get-status",
     probeRepository: "director:setup:probe-repository",
