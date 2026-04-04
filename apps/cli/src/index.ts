@@ -3,16 +3,14 @@ import { program } from "commander";
 import open from "open";
 
 import {
-  actOnBrief,
   createDirectorServer,
-  getHomeOverview,
-  getInbox,
-  getIntakeState,
+  getDirectorStatus,
   initDirector,
-  mergePullRequestWorkflow,
-  reviewPullRequestWorkflow,
-  runIssueWorkflow,
-  submitIntakeMessage,
+  listDecisions,
+  pauseOrchestrator,
+  resolveDecision,
+  startOrchestrator,
+  submitDirectorNote,
   syncProject
 } from "@director-os/core";
 
@@ -66,6 +64,28 @@ program
   });
 
 program
+  .command("start")
+  .description("Start the Chief of Staff loop")
+  .action(async () => {
+    console.log(JSON.stringify(await startOrchestrator(), null, 2));
+  });
+
+program
+  .command("pause")
+  .description("Pause the Chief of Staff loop")
+  .option("--reason <reason>", "Optional pause reason")
+  .action(async (options) => {
+    console.log(JSON.stringify(await pauseOrchestrator(options.reason), null, 2));
+  });
+
+program
+  .command("status")
+  .description("Print the current control-room status payload")
+  .action(async () => {
+    console.log(JSON.stringify(await getDirectorStatus(), null, 2));
+  });
+
+program
   .command("sync")
   .description("Sync GitHub issues, PRs, comments, and checks into the local mirror")
   .action(async () => {
@@ -74,69 +94,29 @@ program
   });
 
 program
-  .command("intake")
-  .description("Submit a product goal to the chief of staff intake flow")
-  .argument("<message...>", "The product direction or problem statement")
-  .action(async (messageParts) => {
-    const result = await submitIntakeMessage(messageParts.join(" "));
+  .command("submit-note")
+  .description("Submit a freeform director note for the Chief of Staff")
+  .argument("<content...>", "The note or product direction")
+  .action(async (contentParts) => {
+    const result = await submitDirectorNote(contentParts.join(" "));
     console.log(JSON.stringify(result, null, 2));
   });
 
 program
-  .command("approve-brief")
-  .description("Approve a brief and decompose it into a GitHub epic and child issues")
-  .argument("<briefId>", "Local brief id")
-  .action(async (briefId) => {
-    const result = await actOnBrief(Number(briefId), "approve");
-    console.log(JSON.stringify(result, null, 2));
-  });
-
-program
-  .command("run-issue")
-  .description("Execute a ready issue inside a local git worktree")
-  .argument("<issueNumber>", "GitHub issue number")
-  .action(async (issueNumber) => {
-    const result = await runIssueWorkflow(Number(issueNumber));
-    console.log(JSON.stringify(result, null, 2));
-  });
-
-program
-  .command("review-pr")
-  .description("Run the independent review agent on a GitHub pull request")
-  .argument("<prNumber>", "GitHub pull request number")
-  .action(async (prNumber) => {
-    const result = await reviewPullRequestWorkflow(Number(prNumber));
-    console.log(JSON.stringify(result, null, 2));
-  });
-
-program
-  .command("merge-pr")
-  .description("Merge a pull request after review and passing checks")
-  .argument("<prNumber>", "GitHub pull request number")
-  .action(async (prNumber) => {
-    await mergePullRequestWorkflow(Number(prNumber));
-    console.log(JSON.stringify({ ok: true, prNumber: Number(prNumber) }, null, 2));
-  });
-
-program
-  .command("overview")
-  .description("Print the home overview payload")
+  .command("list-decisions")
+  .description("List open escalation decisions")
   .action(async () => {
-    console.log(JSON.stringify(await getHomeOverview(), null, 2));
+    console.log(JSON.stringify(await listDecisions(), null, 2));
   });
 
 program
-  .command("inbox")
-  .description("Print the inbox payload")
-  .action(async () => {
-    console.log(JSON.stringify(await getInbox(), null, 2));
-  });
-
-program
-  .command("intake-state")
-  .description("Print the latest intake state")
-  .action(async () => {
-    console.log(JSON.stringify(await getIntakeState(), null, 2));
+  .command("resolve-decision")
+  .description("Resolve an escalation decision and resume the associated work when appropriate")
+  .argument("<decisionId>", "Local decision id")
+  .argument("<resolution...>", "Resolution text")
+  .action(async (decisionId, resolutionParts) => {
+    const result = await resolveDecision(Number(decisionId), resolutionParts.join(" "));
+    console.log(JSON.stringify(result, null, 2));
   });
 
 program.parseAsync().catch((error) => {

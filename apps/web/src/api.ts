@@ -1,24 +1,31 @@
 import type {
-  BriefAction,
-  BriefRecord,
+  DecisionRecord,
+  DecisionsResponse,
   DirectorClient,
+  DirectorNoteRecord,
   DirectorOperationResponse,
-  DirectorTaskAction,
-  DirectorTaskRecord,
-  HomeOverview,
-  InboxResponse,
-  IntakeResponse,
+  DirectorStatusResponse,
+  PrCycleRecord,
+  RunRecord,
   SetupCheck,
   SetupProbeRepositoryInput,
   SetupRepositoryDraft,
-  SetupStatusResponse
+  SetupStatusResponse,
+  WorkItemRecord
 } from "@director-os/shared";
 
 export type {
+  DecisionRecord,
+  DecisionsResponse,
+  DirectorNoteRecord,
+  DirectorStatusResponse,
+  PrCycleRecord,
+  RunRecord,
   SetupCheck,
   SetupProbeRepositoryInput,
   SetupRepositoryDraft,
-  SetupStatusResponse
+  SetupStatusResponse,
+  WorkItemRecord
 } from "@director-os/shared";
 
 declare global {
@@ -35,16 +42,13 @@ interface ElectronDirectorBridge {
     complete(repositoryDraft: SetupRepositoryDraft): Promise<SetupStatusResponse>;
   };
   director: {
-    getOverview(): Promise<HomeOverview>;
-    getInbox(): Promise<InboxResponse>;
-    getIntake(): Promise<IntakeResponse>;
-    submitIntakeMessage(content: string): Promise<BriefRecord>;
-    actOnBrief(briefId: number, action: BriefAction): Promise<BriefRecord>;
-    actOnTask(taskId: number, action: DirectorTaskAction): Promise<DirectorTaskRecord>;
+    getStatus(): Promise<DirectorStatusResponse>;
+    start(): Promise<DirectorOperationResponse>;
+    pause(reason?: string): Promise<DirectorOperationResponse>;
     sync(): Promise<DirectorOperationResponse>;
-    runIssue(issueNumber: number): Promise<DirectorOperationResponse>;
-    reviewPr(prNumber: number): Promise<DirectorOperationResponse>;
-    mergePr(prNumber: number): Promise<DirectorOperationResponse>;
+    submitNote(content: string): Promise<DirectorNoteRecord>;
+    listDecisions(): Promise<DecisionsResponse>;
+    resolveDecision(decisionId: number, resolution: string): Promise<DecisionRecord>;
   };
 }
 
@@ -94,39 +98,30 @@ function createHttpDirectorClient(): DirectorClient {
         method: "POST",
         body: JSON.stringify({ repositoryDraft })
       }),
-    getOverview: () => requestJson<HomeOverview>("/api/overview"),
-    getInbox: () => requestJson<InboxResponse>("/api/inbox"),
-    getIntake: () => requestJson<IntakeResponse>("/api/intake"),
-    submitIntakeMessage: (content: string) =>
-      requestJson<BriefRecord>("/api/intake/messages", {
-        method: "POST",
-        body: JSON.stringify({ content })
+    getStatus: () => requestJson<DirectorStatusResponse>("/api/status"),
+    start: () =>
+      requestJson<DirectorOperationResponse>("/api/start", {
+        method: "POST"
       }),
-    actOnBrief: (briefId: number, action: BriefAction) =>
-      requestJson<BriefRecord>(`/api/briefs/${briefId}/actions`, {
+    pause: (reason?: string) =>
+      requestJson<DirectorOperationResponse>("/api/pause", {
         method: "POST",
-        body: JSON.stringify({ action })
-      }),
-    actOnTask: (taskId: number, action: DirectorTaskAction) =>
-      requestJson<DirectorTaskRecord>(`/api/tasks/${taskId}/actions`, {
-        method: "POST",
-        body: JSON.stringify({ action })
+        body: JSON.stringify(reason ? { reason } : {})
       }),
     sync: () =>
       requestJson<DirectorOperationResponse>("/api/sync", {
         method: "POST"
       }),
-    runIssue: (issueNumber: number) =>
-      requestJson<DirectorOperationResponse>(`/api/issues/${issueNumber}/run`, {
-        method: "POST"
+    submitNote: (content: string) =>
+      requestJson<DirectorNoteRecord>("/api/notes", {
+        method: "POST",
+        body: JSON.stringify({ content })
       }),
-    reviewPr: (prNumber: number) =>
-      requestJson<DirectorOperationResponse>(`/api/prs/${prNumber}/review`, {
-        method: "POST"
-      }),
-    mergePr: (prNumber: number) =>
-      requestJson<DirectorOperationResponse>(`/api/prs/${prNumber}/merge`, {
-        method: "POST"
+    listDecisions: () => requestJson<DecisionsResponse>("/api/decisions"),
+    resolveDecision: (decisionId: number, resolution: string) =>
+      requestJson<DecisionRecord>(`/api/decisions/${decisionId}/resolve`, {
+        method: "POST",
+        body: JSON.stringify({ resolution })
       })
   };
 }
@@ -137,18 +132,15 @@ function createIpcDirectorClient(bridge: ElectronDirectorBridge): DirectorClient
     probeRepository: (input: SetupProbeRepositoryInput) => bridge.setup.probeRepository(input),
     runWorkspaceTest: (repositoryDraft: SetupRepositoryDraft) =>
       bridge.setup.runWorkspaceTest(repositoryDraft),
-    completeSetup: (repositoryDraft: SetupRepositoryDraft) =>
-      bridge.setup.complete(repositoryDraft),
-    getOverview: () => bridge.director.getOverview(),
-    getInbox: () => bridge.director.getInbox(),
-    getIntake: () => bridge.director.getIntake(),
-    submitIntakeMessage: (content: string) => bridge.director.submitIntakeMessage(content),
-    actOnBrief: (briefId: number, action: BriefAction) => bridge.director.actOnBrief(briefId, action),
-    actOnTask: (taskId: number, action: DirectorTaskAction) => bridge.director.actOnTask(taskId, action),
+    completeSetup: (repositoryDraft: SetupRepositoryDraft) => bridge.setup.complete(repositoryDraft),
+    getStatus: () => bridge.director.getStatus(),
+    start: () => bridge.director.start(),
+    pause: (reason?: string) => bridge.director.pause(reason),
     sync: () => bridge.director.sync(),
-    runIssue: (issueNumber: number) => bridge.director.runIssue(issueNumber),
-    reviewPr: (prNumber: number) => bridge.director.reviewPr(prNumber),
-    mergePr: (prNumber: number) => bridge.director.mergePr(prNumber)
+    submitNote: (content: string) => bridge.director.submitNote(content),
+    listDecisions: () => bridge.director.listDecisions(),
+    resolveDecision: (decisionId: number, resolution: string) =>
+      bridge.director.resolveDecision(decisionId, resolution)
   };
 }
 
@@ -188,42 +180,33 @@ export async function completeSetup(
   return getDirectorClient().completeSetup(input);
 }
 
-export async function fetchOverview(): Promise<HomeOverview> {
-  return getDirectorClient().getOverview();
+export async function fetchStatus(): Promise<DirectorStatusResponse> {
+  return getDirectorClient().getStatus();
 }
 
-export async function fetchInbox(): Promise<InboxResponse> {
-  return getDirectorClient().getInbox();
+export async function startDirector(): Promise<DirectorOperationResponse> {
+  return getDirectorClient().start();
 }
 
-export async function fetchIntake(): Promise<IntakeResponse> {
-  return getDirectorClient().getIntake();
+export async function pauseDirector(reason?: string): Promise<DirectorOperationResponse> {
+  return getDirectorClient().pause(reason);
 }
 
 export async function syncNow(): Promise<DirectorOperationResponse> {
   return getDirectorClient().sync();
 }
 
-export async function sendIntakeMessage(content: string): Promise<BriefRecord> {
-  return getDirectorClient().submitIntakeMessage(content);
+export async function submitNote(content: string): Promise<DirectorNoteRecord> {
+  return getDirectorClient().submitNote(content);
 }
 
-export async function actOnBrief(briefId: number, action: BriefAction) {
-  return getDirectorClient().actOnBrief(briefId, action);
+export async function fetchDecisions(): Promise<DecisionsResponse> {
+  return getDirectorClient().listDecisions();
 }
 
-export async function actOnTask(taskId: number, action: DirectorTaskAction) {
-  return getDirectorClient().actOnTask(taskId, action);
-}
-
-export async function runIssue(issueNumber: number) {
-  return getDirectorClient().runIssue(issueNumber);
-}
-
-export async function reviewPr(prNumber: number) {
-  return getDirectorClient().reviewPr(prNumber);
-}
-
-export async function mergePr(prNumber: number) {
-  return getDirectorClient().mergePr(prNumber);
+export async function resolveEscalation(
+  decisionId: number,
+  resolution: string
+): Promise<DecisionRecord> {
+  return getDirectorClient().resolveDecision(decisionId, resolution);
 }

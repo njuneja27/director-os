@@ -6,19 +6,16 @@ import fastifyStatic from "@fastify/static";
 import Fastify from "fastify";
 
 import {
-  actOnBrief,
-  actOnTask,
   completeSetup,
+  getDirectorStatus,
   getSetupStatus,
-  getHomeOverview,
-  getInbox,
-  getIntakeState,
-  mergePullRequestWorkflow,
+  listDecisions,
+  pauseOrchestrator,
   probeRepositorySetup,
-  reviewPullRequestWorkflow,
-  runIssueWorkflow,
+  resolveDecision,
   runWorkspaceSetupTest,
-  submitIntakeMessage,
+  startOrchestrator,
+  submitDirectorNote,
   syncProject
 } from "./services.js";
 
@@ -84,38 +81,20 @@ export async function createDirectorServer() {
     };
   }>("/api/setup/complete", async (request) => completeSetup(request.body.repositoryDraft));
 
-  app.get("/api/overview", async () => getHomeOverview());
+  app.get("/api/status", async () => getDirectorStatus());
+  app.get("/api/decisions", async () => listDecisions());
 
-  app.get("/api/inbox", async () => getInbox());
-
-  app.get("/api/intake", async () => getIntakeState());
-
-  app.post<{ Body: { content: string } }>("/api/intake/messages", async (request) =>
-    submitIntakeMessage(request.body.content)
+  app.post("/api/start", async () => startOrchestrator());
+  app.post<{ Body: { reason?: string } }>("/api/pause", async (request) =>
+    pauseOrchestrator(request.body?.reason)
   );
-
-  app.post<{ Params: { id: string }; Body: { action: "approve" | "revise" | "reject" } }>(
-    "/api/briefs/:id/actions",
-    async (request) => actOnBrief(Number(request.params.id), request.body.action)
-  );
-
-  app.post<{ Params: { id: string }; Body: { action: "approve" | "reject" | "resolve" } }>(
-    "/api/tasks/:id/actions",
-    async (request) => actOnTask(Number(request.params.id), request.body.action)
-  );
-
   app.post("/api/sync", async () => syncProject());
-
-  app.post<{ Params: { number: string } }>("/api/issues/:number/run", async (request) =>
-    runIssueWorkflow(Number(request.params.number))
+  app.post<{ Body: { content: string } }>("/api/notes", async (request) =>
+    submitDirectorNote(request.body.content)
   );
-
-  app.post<{ Params: { number: string } }>("/api/prs/:number/review", async (request) =>
-    reviewPullRequestWorkflow(Number(request.params.number))
-  );
-
-  app.post<{ Params: { number: string } }>("/api/prs/:number/merge", async (request) =>
-    mergePullRequestWorkflow(Number(request.params.number))
+  app.post<{ Params: { id: string }; Body: { resolution: string } }>(
+    "/api/decisions/:id/resolve",
+    async (request) => resolveDecision(Number(request.params.id), request.body.resolution)
   );
 
   app.setNotFoundHandler(async (request, reply) => {

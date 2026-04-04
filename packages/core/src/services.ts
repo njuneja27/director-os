@@ -4,33 +4,35 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
 import type Database from "better-sqlite3";
-import { and, desc, eq } from "drizzle-orm";
+import { desc, eq } from "drizzle-orm";
 
 import {
   DIRECTOR_LABEL_PREFIX,
   type AgentResultEnvelope,
-  type AgentRunRecord,
-  type BriefAction,
-  type BriefDraft,
-  type BriefRecord,
+  type DecisionRecord,
+  type DecisionsResponse,
+  type DirectorNoteRecord,
   type DirectorOperationResponse,
-  type DirectorTaskAction,
-  type DirectorTaskRecord,
+  type DirectorStatusResponse,
+  type ExecutionMode,
   type GitHubIssueRecord,
   type GitHubPullRequestRecord,
-  type HomeOverview,
-  type InboxResponse,
-  type IntakeMessage,
-  type IntakeResponse,
   type InitCommandOptions,
+  type OrchestratorStatus,
+  type OrchestratorStatusRecord,
+  type PrCycleRecord,
   type ProjectRecord,
+  type RunRecord,
+  type RunRole,
   type SetupCheck,
   type SetupCheckKind,
   type SetupProblemCode,
   type SetupProbeRepositoryInput,
   type SetupRepositoryDraft,
   type SetupStatusResponse,
-  type WorkflowState
+  type WorkItemKind,
+  type WorkItemRecord,
+  type WorkItemStatus
 } from "@director-os/shared";
 
 import { probeCodexCli, runCodexAgent } from "./agents.js";
@@ -49,9 +51,8 @@ import {
 } from "./config.js";
 import {
   asJson,
-  briefsTable,
-  directorTasksTable,
-  epicsTable,
+  decisionsTable,
+  directorNotesTable,
   eventsTable,
   fromJson,
   githubCommentsTable,
@@ -59,14 +60,15 @@ import {
   githubPullRequestsTable,
   migrateDatabase,
   openDatabase,
+  orchestratorStateTable,
+  prCyclesTable,
   projectsTable,
-  worktreesTable,
-  agentRunsTable,
-  type DirectorDatabase
+  runsTable,
+  type DirectorDatabase,
+  workItemsTable,
+  worktreesTable
 } from "./db.js";
 import {
-  addIssueLabels,
-  commentOnPr,
   createIssue,
   createPullRequest,
   detectRepoFromPath,
@@ -80,21 +82,17 @@ import {
   probeRepositoryPath,
   pullRequestChecks,
   pullRequestDiff,
-  removeIssueLabels,
   resolveRepoPath,
   viewPullRequest
 } from "./github.js";
 
 const execFileAsync = promisify(execFile);
 
-const WORKFLOW_LABELS: WorkflowState[] = [
-  "draft",
-  "ready",
-  "in_progress",
-  "in_review",
-  "blocked",
-  "done"
-];
+const AUTOMATION_WAIT_MS = 10 * 60 * 1000;
+const LOOP_INTERVAL_MS = 5 * 1000;
+
+let orchestratorTimer: NodeJS.Timeout | null = null;
+let orchestratorRunning = false;
 
 type RuntimeSession = {
   paths: RuntimePaths;
@@ -106,13 +104,6 @@ type RuntimeSession = {
 type ProjectSession = RuntimeSession & {
   project: ProjectRecord;
   projectConfig: StoredProjectConfig;
-};
-
-type IssuePlan = {
-  title: string;
-  body: string;
-  acceptance: string[];
-  workflowState: WorkflowState;
 };
 
 function assertPresent<TValue>(value: TValue | null | undefined, message: string): TValue {
@@ -202,38 +193,7 @@ function mapProjectRow(row: typeof projectsTable.$inferSelect): ProjectRecord {
   };
 }
 
-function mapBriefRow(row: typeof briefsTable.$inferSelect): BriefRecord {
-  return {
-    id: row.id,
-    projectId: row.projectId,
-    title: row.title,
-    status: row.status as BriefRecord["status"],
-    summary: row.summary,
-    draft: fromJson(row.draft as BriefDraft),
-    transcript: fromJson(row.transcript as IntakeMessage[]),
-    githubEpicNumber: row.githubEpicNumber ?? null,
-    createdAt: row.createdAt,
-    updatedAt: row.updatedAt
-  };
-}
-
-function mapTaskRow(row: typeof directorTasksTable.$inferSelect): DirectorTaskRecord {
-  return {
-    id: row.id,
-    projectId: row.projectId,
-    briefId: row.briefId ?? null,
-    kind: row.kind as DirectorTaskRecord["kind"],
-    title: row.title,
-    description: row.description,
-    recommendation: row.recommendation,
-    status: row.status as DirectorTaskRecord["status"],
-    payload: fromJson(row.payload as Record<string, unknown>),
-    createdAt: row.createdAt,
-    updatedAt: row.updatedAt
-  };
-}
-
-function mapIssueRow(row: typeof githubIssuesTable.$inferSelect): GitHubIssueRecord {
+function mapGitHubIssueRow(row: typeof githubIssuesTable.$inferSelect): GitHubIssueRecord {
   return {
     id: row.id,
     projectId: row.projectId,
@@ -241,7 +201,7 @@ function mapIssueRow(row: typeof githubIssuesTable.$inferSelect): GitHubIssueRec
     title: row.title,
     body: row.body,
     state: row.state,
-    workflowState: row.workflowState as WorkflowState,
+    workflowState: row.workflowState,
     labels: fromJson(row.labels as string[]),
     url: row.url,
     updatedAt: row.updatedAt,
@@ -249,7 +209,7 @@ function mapIssueRow(row: typeof githubIssuesTable.$inferSelect): GitHubIssueRec
   };
 }
 
-function mapPullRequestRow(
+function mapGitHubPullRequestRow(
   row: typeof githubPullRequestsTable.$inferSelect
 ): GitHubPullRequestRecord {
   return {
@@ -271,62 +231,108 @@ function mapPullRequestRow(
   };
 }
 
-function mapAgentRunRow(row: typeof agentRunsTable.$inferSelect): AgentRunRecord {
+function mapWorkItemRow(row: typeof workItemsTable.$inferSelect): WorkItemRecord {
   return {
     id: row.id,
     projectId: row.projectId,
-    role: row.role,
-    targetType: row.targetType,
-    targetId: row.targetId,
-    status: row.status as AgentRunRecord["status"],
-    inputSummary: row.inputSummary,
-    outputSummary: row.outputSummary,
-    outputJson: row.outputJson ? fromJson(row.outputJson as Record<string, unknown>) : null,
-    workingDirectory: row.workingDirectory ?? null,
+    issueNumber: row.issueNumber,
+    parentIssueNumber: row.parentIssueNumber ?? null,
+    title: row.title,
+    summary: row.summary,
+    kind: row.kind as WorkItemKind,
+    executionMode: row.executionMode as ExecutionMode,
+    ownerRole: row.ownerRole,
+    status: row.status as WorkItemStatus,
+    priorityBucket: row.priorityBucket,
+    activeRunId: row.activeRunId ?? null,
+    activePrNumber: row.activePrNumber ?? null,
+    lastSummary: row.lastSummary ?? null,
     createdAt: row.createdAt,
     updatedAt: row.updatedAt
   };
 }
 
-function workflowLabel(state: WorkflowState): string {
-  return `${DIRECTOR_LABEL_PREFIX}${state}`;
-}
-
-function stripWorkflowLabels(labels: string[]): string[] {
-  return labels.filter((label) => !WORKFLOW_LABELS.some((state) => label === workflowLabel(state)));
-}
-
-function deriveWorkflowState(labels: string[], state: string): WorkflowState {
-  const normalizedState = state.toLowerCase();
-
-  if (normalizedState === "closed" || normalizedState === "merged") {
-    return "done";
-  }
-
-  for (const candidate of WORKFLOW_LABELS) {
-    if (labels.includes(workflowLabel(candidate))) {
-      return candidate;
-    }
-  }
-
-  return "draft";
-}
-
-function emptyOverview(): HomeOverview {
+function mapRunRow(row: typeof runsTable.$inferSelect): RunRecord {
   return {
-    project: null,
-    counts: {
-      pendingDirectorTasks: 0,
-      activeBriefs: 0,
-      readyIssues: 0,
-      inReviewIssues: 0,
-      openPullRequests: 0
-    },
-    pendingTasks: [],
-    activeIssues: [],
-    openPullRequests: [],
-    recentRuns: [],
-    latestBrief: null
+    id: row.id,
+    projectId: row.projectId,
+    workItemId: row.workItemId ?? null,
+    issueNumber: row.issueNumber ?? null,
+    prNumber: row.prNumber ?? null,
+    role: row.role as RunRole,
+    status: row.status as RunRecord["status"],
+    phase: row.phase,
+    summary: row.summary,
+    recommendedNextAction: row.recommendedNextAction ?? null,
+    artifacts: fromJson(row.artifacts as string[]),
+    blockingQuestions: fromJson(row.blockingQuestions as string[]),
+    outputJson: row.outputJson ? fromJson(row.outputJson as Record<string, unknown>) : null,
+    worktreePath: row.worktreePath ?? null,
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt
+  };
+}
+
+function mapDecisionRow(row: typeof decisionsTable.$inferSelect): DecisionRecord {
+  return {
+    id: row.id,
+    projectId: row.projectId,
+    workItemId: row.workItemId ?? null,
+    issueNumber: row.issueNumber ?? null,
+    prNumber: row.prNumber ?? null,
+    target: row.target as DecisionRecord["target"],
+    title: row.title,
+    summary: row.summary,
+    recommendation: row.recommendation,
+    rationale: row.rationale,
+    status: row.status as DecisionRecord["status"],
+    resolution: row.resolution ?? null,
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt
+  };
+}
+
+function mapNoteRow(row: typeof directorNotesTable.$inferSelect): DirectorNoteRecord {
+  return {
+    id: row.id,
+    projectId: row.projectId,
+    content: row.content,
+    status: row.status as DirectorNoteRecord["status"],
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt
+  };
+}
+
+function mapPrCycleRow(row: typeof prCyclesTable.$inferSelect): PrCycleRecord {
+  return {
+    id: row.id,
+    projectId: row.projectId,
+    issueNumber: row.issueNumber,
+    prNumber: row.prNumber,
+    status: row.status as PrCycleRecord["status"],
+    summary: row.summary,
+    automationWindowEndsAt: row.automationWindowEndsAt ?? null,
+    lastCheckedAt: row.lastCheckedAt ?? null,
+    lastHandledCommentAt: row.lastHandledCommentAt ?? null,
+    mergedAt: row.mergedAt ?? null,
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt
+  };
+}
+
+function mapOrchestratorRow(
+  row: typeof orchestratorStateTable.$inferSelect
+): OrchestratorStatusRecord {
+  return {
+    id: row.id,
+    projectId: row.projectId,
+    status: row.status as OrchestratorStatus,
+    pauseReason: row.pauseReason ?? null,
+    activeRunIds: fromJson(row.activeRunIds as number[]),
+    lastLoopAt: row.lastLoopAt ?? null,
+    lastSummary: row.lastSummary ?? null,
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt
   };
 }
 
@@ -421,10 +427,15 @@ async function buildRepositoryDraft(
   if (!rawPath) {
     return {
       draft: null,
-      check: makeSetupCheck("repository", "needs_action", "Choose the local repository Director OS should operate on.", {
-        code: "repo_missing",
-        recommendedAction: "Enter the absolute path to a local git checkout."
-      })
+      check: makeSetupCheck(
+        "repository",
+        "needs_action",
+        "Choose the local repository Director OS should operate on.",
+        {
+          code: "repo_missing",
+          recommendedAction: "Enter the absolute path to a local git checkout."
+        }
+      )
     };
   }
 
@@ -478,7 +489,8 @@ async function buildRepositoryDraft(
           "The repository is valid, but the default branch could not be inferred.",
           {
             code: "default_branch_missing",
-            recommendedAction: "Set the repo's default branch locally or fetch the remote HEAD, then re-check.",
+            recommendedAction:
+              "Set the repo's default branch locally or fetch the remote HEAD, then re-check.",
             advancedDetail: `Repository: ${draft.repoPath}`
           }
         )
@@ -524,197 +536,22 @@ async function buildRepositoryDraft(
 
     return {
       draft: null,
-      check: makeSetupCheck("repository", "needs_action", "That folder is not a valid git repository.", {
+      check: makeSetupCheck("repository", "needs_action", "That folder is not a git repository.", {
         code: "repo_not_git",
-        recommendedAction: "Choose a local git checkout with an `origin` remote.",
+        recommendedAction: "Choose a local git checkout with a GitHub remote.",
         advancedDetail: message
       })
     };
   }
 }
 
-async function createGitHubCheck(): Promise<SetupCheck> {
-  const probe = await probeGhCli();
-
-  if (probe.ok) {
-    return makeSetupCheck("github", "ready", probe.detail, {
-      recommendedAction: "GitHub is ready."
-    });
-  }
-
-  if (probe.reason === "missing") {
-    return makeSetupCheck("github", "needs_action", probe.detail, {
-      code: "gh_missing",
-      recommendedAction: "Install GitHub CLI and try again.",
-      advancedDetail: probe.advancedDetail ?? null
-    });
-  }
-
-  if (probe.reason === "auth_required") {
-    return makeSetupCheck("github", "needs_action", probe.detail, {
-      code: "gh_auth_required",
-      recommendedAction: "Run `gh auth login`, then re-check.",
-      advancedDetail: probe.advancedDetail ?? null
-    });
-  }
-
-  return makeSetupCheck("github", "blocked", probe.detail, {
-    code: "gh_probe_failed",
-    recommendedAction: "Review the GitHub CLI output and try again.",
-    advancedDetail: probe.advancedDetail ?? null
-  });
-}
-
-async function createCodexCheck(model = "gpt-5.4"): Promise<SetupCheck> {
-  const probe = await probeCodexCli(model);
-
-  if (probe.ok) {
-    return makeSetupCheck("codex", "ready", probe.detail, {
-      recommendedAction: "Codex is ready."
-    });
-  }
-
-  if (probe.reason === "missing") {
-    return makeSetupCheck("codex", "needs_action", probe.detail, {
-      code: "codex_missing",
-      recommendedAction: "Install Codex on this machine, then re-check.",
-      advancedDetail: probe.advancedDetail ?? null
-    });
-  }
-
-  if (probe.reason === "auth_required") {
-    return makeSetupCheck("codex", "needs_action", probe.detail, {
-      code: "codex_sign_in_required",
-      recommendedAction: "Sign in to Codex, then re-check.",
-      advancedDetail: probe.advancedDetail ?? null
-    });
-  }
-
-  return makeSetupCheck("codex", "blocked", probe.detail, {
-    code: "codex_probe_failed",
-    recommendedAction: "Review the Codex output and try the local test again.",
-    advancedDetail: probe.advancedDetail ?? null
-  });
-}
-
-async function createWorkspaceCheck(
-  session: RuntimeSession,
-  repositoryDraft: SetupRepositoryDraft | null,
-  prerequisites: {
-    repositoryReady: boolean;
-    githubReady: boolean;
-    codexReady: boolean;
-  },
-  runWorkspace: boolean
-): Promise<SetupCheck> {
-  if (!repositoryDraft) {
-    return waitingSetupCheck(
-      "workspace",
-      "Workspace verification starts after a repository has been selected."
-    );
-  }
-
-  if (!runWorkspace) {
-    return waitingSetupCheck(
-      "workspace",
-      "Run the local test to verify runtime directories, SQLite, and the coding engine."
-    );
-  }
-
-  if (!prerequisites.repositoryReady || !prerequisites.githubReady || !prerequisites.codexReady) {
-    return makeSetupCheck(
-      "workspace",
-      "blocked",
-      "Workspace verification is waiting on the repository, GitHub CLI, and Codex checks.",
-      {
-        code: "workspace_probe_failed",
-        recommendedAction: "Resolve the blocking checks above, then run the local test again."
-      }
-    );
-  }
-
-  try {
-    await ensureRuntimeDirectories(session.paths);
-    await fs.mkdir(repositoryDraft.worktreeRoot, { recursive: true });
-    await fs.access(repositoryDraft.repoPath);
-
-    const probeFile = path.join(session.paths.tmpDir, `workspace-${Date.now()}.tmp`);
-    await fs.writeFile(probeFile, "director-os\n", "utf8");
-    await fs.rm(probeFile, { force: true });
-
-    const verificationStore = await openDatabase(session.paths);
-    try {
-      migrateDatabase(verificationStore.sqlite);
-    } finally {
-      verificationStore.sqlite.close();
-    }
-
-    return makeSetupCheck(
-      "workspace",
-      "ready",
-      "Runtime state, SQLite, repository access, and worktree storage are ready.",
-      {
-        recommendedAction: "Finish setup and open Director Home."
-      }
-    );
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    const errno = error as NodeJS.ErrnoException;
-
-    return makeSetupCheck(
-      "workspace",
-      "blocked",
-      errno.code === "EACCES"
-        ? "Director OS could not write to its local runtime directories."
-        : "Director OS could not complete the local workspace test.",
-      {
-        code: errno.code === "EACCES" ? "workspace_unwritable" : "workspace_probe_failed",
-        recommendedAction:
-          errno.code === "EACCES"
-            ? "Update local directory permissions, then run the test again."
-            : "Review the advanced details and retry the local test.",
-        advancedDetail: message
-      }
-    );
-  }
-}
-
-function buildSetupStatusResponse(input: {
-  activeProject: ProjectRecord | null;
-  repositoryDraft: SetupRepositoryDraft | null;
-  repositoryCheck: SetupCheck;
-  githubCheck: SetupCheck;
-  codexCheck: SetupCheck;
-  workspaceCheck: SetupCheck;
-}): SetupStatusResponse {
-  const checks = [
-    input.repositoryCheck,
-    input.githubCheck,
-    input.codexCheck,
-    input.workspaceCheck
-  ];
-
-  return {
-    activeProject: input.activeProject,
-    repositoryDraft: input.repositoryDraft,
-    checks,
-    canComplete: checks.every((check) => check.status === "ready"),
-    completed:
-      input.activeProject !== null &&
-      input.repositoryCheck.status === "ready" &&
-      input.githubCheck.status === "ready" &&
-      input.codexCheck.status === "ready" &&
-      input.workspaceCheck.status === "ready"
-  };
-}
-
 async function evaluateSetupState(
   session: RuntimeSession,
   options: {
-    repositoryDraft: SetupRepositoryDraft | null;
     activeProject: ProjectRecord | null;
+    repositoryDraft: SetupRepositoryDraft | null;
     repositoryCheck?: SetupCheck;
-    runWorkspace?: boolean;
+    runWorkspace: boolean;
   }
 ): Promise<SetupStatusResponse> {
   const repositoryCheck =
@@ -725,189 +562,272 @@ async function evaluateSetupState(
           "ready",
           `${options.repositoryDraft.repoSlug} on ${options.repositoryDraft.defaultBranch} is ready for setup.`
         )
-      : waitingSetupCheck(
-          "repository",
-          "Choose the local repository Director OS should operate on."
-        ));
-  const githubCheck = await createGitHubCheck();
-  const codexCheck = await createCodexCheck(options.repositoryDraft?.model ?? "gpt-5.4");
-  const workspaceCheck = await createWorkspaceCheck(
-    session,
-    options.repositoryDraft,
-    {
-      repositoryReady: repositoryCheck.status === "ready",
-      githubReady: githubCheck.status === "ready",
-      codexReady: codexCheck.status === "ready"
-    },
-    options.runWorkspace ?? false
+      : makeSetupCheck("repository", "needs_action", "Choose the repository Director OS should operate on.", {
+          code: "repo_missing",
+          recommendedAction: "Enter the absolute path to a local repository."
+        }));
+
+  const githubProbe = await probeGhCli();
+  const githubCheck =
+    repositoryCheck.status !== "ready"
+      ? waitingSetupCheck("github", "Repository details are required before GitHub can be verified.")
+      : githubProbe.ok
+        ? makeSetupCheck("github", "ready", githubProbe.detail)
+        : makeSetupCheck(
+            "github",
+            githubProbe.reason === "missing" || githubProbe.reason === "auth_required"
+              ? "needs_action"
+              : "blocked",
+            githubProbe.detail,
+            {
+              code:
+                githubProbe.reason === "missing"
+                  ? "gh_missing"
+                  : githubProbe.reason === "auth_required"
+                    ? "gh_auth_required"
+                    : "gh_probe_failed",
+              recommendedAction:
+                githubProbe.reason === "missing"
+                  ? "Install GitHub CLI and sign in."
+                  : githubProbe.reason === "auth_required"
+                    ? "Run `gh auth login`, then re-check."
+                    : "Inspect the diagnostic details, then re-check.",
+              advancedDetail: githubProbe.advancedDetail
+            }
+          );
+
+  const codexProbe = await probeCodexCli(options.repositoryDraft?.model ?? "gpt-5.4");
+  const codexCheck = codexProbe.ok
+    ? makeSetupCheck("codex", "ready", codexProbe.detail)
+    : makeSetupCheck(
+        "codex",
+        codexProbe.reason === "missing" || codexProbe.reason === "auth_required"
+          ? "needs_action"
+          : "blocked",
+        codexProbe.detail,
+        {
+          code:
+            codexProbe.reason === "missing"
+              ? "codex_missing"
+              : codexProbe.reason === "auth_required"
+                ? "codex_sign_in_required"
+                : "codex_probe_failed",
+          recommendedAction:
+            codexProbe.reason === "missing"
+              ? "Install Codex, then re-check."
+              : codexProbe.reason === "auth_required"
+                ? "Sign in to Codex, then re-check."
+                : "Inspect the diagnostic details, then re-check.",
+          advancedDetail: codexProbe.advancedDetail
+        }
+      );
+
+  let workspaceCheck = waitingSetupCheck(
+    "workspace",
+    "Run the local workspace test after the repository and integrations are ready."
   );
 
-  return buildSetupStatusResponse({
+  if (
+    options.runWorkspace &&
+    options.repositoryDraft &&
+    repositoryCheck.status === "ready" &&
+    githubCheck.status === "ready" &&
+    codexCheck.status === "ready"
+  ) {
+    try {
+      await ensureRuntimeDirectories(session.paths);
+      await fs.mkdir(options.repositoryDraft.worktreeRoot, { recursive: true });
+      await fs.access(options.repositoryDraft.repoPath);
+      await fs.access(session.paths.databasePath).catch(async () => {
+        await fs.writeFile(session.paths.databasePath, "", "utf8");
+      });
+      workspaceCheck = makeSetupCheck(
+        "workspace",
+        "ready",
+        "Runtime storage, SQLite, repository access, and the local worktree root are ready."
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      workspaceCheck = makeSetupCheck(
+        "workspace",
+        "blocked",
+        "The local workspace test failed.",
+        {
+          code: "workspace_probe_failed",
+          recommendedAction: "Inspect the diagnostic details, fix the local environment, then re-check.",
+          advancedDetail: message
+        }
+      );
+    }
+  }
+
+  const checks = [repositoryCheck, githubCheck, codexCheck, workspaceCheck];
+
+  return {
     activeProject: options.activeProject,
+    checks,
     repositoryDraft: options.repositoryDraft,
-    repositoryCheck,
-    githubCheck,
-    codexCheck,
-    workspaceCheck
-  });
+    canComplete: checks.every((check) => check.status === "ready"),
+    completed:
+      Boolean(options.activeProject) && checks.every((check) => check.status === "ready")
+  };
 }
 
 async function persistProjectRegistration(
   session: RuntimeSession,
-  repositoryDraft: SetupRepositoryDraft
+  draft: SetupRepositoryDraft
 ): Promise<ProjectRecord> {
-  const projectConfig = draftToStoredProjectConfig(repositoryDraft);
-  const slug = projectConfig.slug;
+  const storedProject = draftToStoredProjectConfig(draft);
   const timestamp = nowIso();
-
-  await fs.mkdir(projectConfig.worktreeRoot, { recursive: true });
-
-  let nextConfig = upsertProjectConfig(session.config, {
-    ...projectConfig,
-    updatedAt: timestamp
-  });
-  nextConfig = {
-    ...nextConfig,
-    activeProjectSlug: slug
-  };
-  await saveConfig(nextConfig, session.paths);
-
   const existingRows = await session.db
     .select()
     .from(projectsTable)
-    .where(eq(projectsTable.slug, slug))
+    .where(eq(projectsTable.slug, storedProject.slug))
     .limit(1);
-  const existing = existingRows[0];
 
-  if (existing) {
+  if (existingRows[0]) {
     await session.db
       .update(projectsTable)
       .set({
-        name: projectConfig.name,
-        repoPath: projectConfig.repoPath,
-        repoSlug: projectConfig.repoSlug,
-        defaultBranch: projectConfig.defaultBranch,
-        worktreeRoot: projectConfig.worktreeRoot,
-        agentRunner: projectConfig.agentRunner,
-        model: projectConfig.model,
+        name: storedProject.name,
+        repoPath: storedProject.repoPath,
+        repoSlug: storedProject.repoSlug,
+        defaultBranch: storedProject.defaultBranch,
+        worktreeRoot: storedProject.worktreeRoot,
+        agentRunner: storedProject.agentRunner,
+        model: storedProject.model,
         updatedAt: timestamp
       })
-      .where(eq(projectsTable.id, existing.id));
+      .where(eq(projectsTable.id, existingRows[0].id));
   } else {
     await session.db.insert(projectsTable).values({
-      name: projectConfig.name,
-      slug,
-      repoPath: projectConfig.repoPath,
-      repoSlug: projectConfig.repoSlug,
-      defaultBranch: projectConfig.defaultBranch,
-      worktreeRoot: projectConfig.worktreeRoot,
-      agentRunner: projectConfig.agentRunner,
-      model: projectConfig.model,
+      name: storedProject.name,
+      slug: storedProject.slug,
+      repoPath: storedProject.repoPath,
+      repoSlug: storedProject.repoSlug,
+      defaultBranch: storedProject.defaultBranch,
+      worktreeRoot: storedProject.worktreeRoot,
+      agentRunner: storedProject.agentRunner,
+      model: storedProject.model,
       createdAt: timestamp,
       updatedAt: timestamp
     });
   }
 
-  const storedRows = await session.db
+  const nextConfig = upsertProjectConfig(session.config, storedProject);
+  nextConfig.activeProjectSlug = storedProject.slug;
+  await saveConfig(nextConfig, session.paths);
+
+  const rows = await session.db
     .select()
     .from(projectsTable)
-    .where(eq(projectsTable.slug, slug))
+    .where(eq(projectsTable.slug, storedProject.slug))
     .limit(1);
-  const storedProject = mapProjectRow(
-    assertPresent(storedRows[0], "Failed to persist the initialized project.")
-  );
+  const project = mapProjectRow(assertPresent(rows[0], "Registered project row is missing."));
 
-  await recordEvent(session.db, storedProject.id, "project.initialized", {
-    slug,
-    repoSlug: projectConfig.repoSlug
+  await ensureOrchestratorRow({
+    ...session,
+    project,
+    projectConfig: storedProject
   });
 
-  return storedProject;
+  return project;
 }
 
-async function getLatestBrief(
-  db: DirectorDatabase,
-  projectId: number
-): Promise<BriefRecord | null> {
-  const rows = await db
-    .select()
-    .from(briefsTable)
-    .where(eq(briefsTable.projectId, projectId))
-    .orderBy(desc(briefsTable.updatedAt))
-    .limit(1);
-
-  return rows[0] ? mapBriefRow(rows[0]) : null;
+function summarizeText(value: string, maxLength = 280): string {
+  const trimmed = value.replace(/\s+/g, " ").trim();
+  return trimmed.length > maxLength ? `${trimmed.slice(0, maxLength - 1)}…` : trimmed;
 }
 
-async function getBriefById(
-  db: DirectorDatabase,
-  projectId: number,
-  briefId: number
-): Promise<BriefRecord | null> {
-  const rows = await db
-    .select()
-    .from(briefsTable)
-    .where(and(eq(briefsTable.projectId, projectId), eq(briefsTable.id, briefId)))
-    .limit(1);
-
-  return rows[0] ? mapBriefRow(rows[0]) : null;
+function labelFor(suffix: string): string {
+  return `${DIRECTOR_LABEL_PREFIX}${suffix}`;
 }
 
-async function getIssueByNumber(
-  db: DirectorDatabase,
-  projectId: number,
-  issueNumber: number
-): Promise<GitHubIssueRecord | null> {
-  const rows = await db
-    .select()
-    .from(githubIssuesTable)
-    .where(and(eq(githubIssuesTable.projectId, projectId), eq(githubIssuesTable.number, issueNumber)))
-    .limit(1);
+function inferWorkflowState(labels: string[], state: string): string {
+  if (state.toLowerCase() !== "open") {
+    return "done";
+  }
 
-  return rows[0] ? mapIssueRow(rows[0]) : null;
+  if (labels.includes(labelFor("ready"))) {
+    return "ready";
+  }
+
+  if (labels.includes(labelFor("blocked"))) {
+    return "blocked";
+  }
+
+  if (labels.includes(labelFor("in-review"))) {
+    return "in_review";
+  }
+
+  return "queued";
 }
 
-async function getPullRequestByNumber(
-  db: DirectorDatabase,
-  projectId: number,
-  prNumber: number
-): Promise<GitHubPullRequestRecord | null> {
-  const rows = await db
-    .select()
-    .from(githubPullRequestsTable)
-    .where(
-      and(
-        eq(githubPullRequestsTable.projectId, projectId),
-        eq(githubPullRequestsTable.number, prNumber)
-      )
-    )
-    .limit(1);
-
-  return rows[0] ? mapPullRequestRow(rows[0]) : null;
+function inferWorkItemKind(issue: GitHubIssueRecord): WorkItemKind {
+  return issue.labels.includes(labelFor("workstream")) || /^epic:/i.test(issue.title)
+    ? "workstream"
+    : "task";
 }
 
-async function insertAgentRun(
-  db: DirectorDatabase,
-  input: Omit<AgentRunRecord, "id">
-): Promise<AgentRunRecord> {
-  const inserted = await db
-    .insert(agentRunsTable)
-    .values({
-      projectId: input.projectId,
-      role: input.role,
-      targetType: input.targetType,
-      targetId: input.targetId,
-      status: input.status,
-      inputSummary: input.inputSummary,
-      outputSummary: input.outputSummary,
-      outputJson: input.outputJson ? asJson(input.outputJson) : null,
-      workingDirectory: input.workingDirectory,
-      createdAt: input.createdAt,
-      updatedAt: input.updatedAt
-    })
-    .returning();
+function inferExecutionMode(kind: WorkItemKind, issue: GitHubIssueRecord): ExecutionMode {
+  if (issue.labels.includes(labelFor("lane"))) {
+    return "lane";
+  }
 
-  return mapAgentRunRow(assertPresent(inserted[0], "Failed to insert agent run."));
+  if (issue.labels.includes(labelFor("worker"))) {
+    return "worker";
+  }
+
+  return kind === "workstream" ? "lane" : "worker";
+}
+
+function inferPriorityBucket(status: WorkItemStatus): number {
+  switch (status) {
+    case "ready":
+      return 0;
+    case "planning":
+    case "running":
+      return 1;
+    case "queued":
+      return 2;
+    case "waiting_review":
+    case "waiting_decision":
+      return 3;
+    case "blocked":
+      return 4;
+    case "completed":
+      return 5;
+    default:
+      return 3;
+  }
+}
+
+function inferWorkItemStatus(
+  issue: GitHubIssueRecord,
+  existing: WorkItemRecord | null,
+  linkedPr: GitHubPullRequestRecord | null
+): WorkItemStatus {
+  if (issue.state.toLowerCase() !== "open") {
+    return "completed";
+  }
+
+  if (linkedPr && linkedPr.state.toLowerCase() === "open") {
+    return "waiting_review";
+  }
+
+  if (existing && ["running", "planning", "waiting_decision"].includes(existing.status)) {
+    return existing.status;
+  }
+
+  if (issue.workflowState === "ready") {
+    return "ready";
+  }
+
+  if (issue.workflowState === "blocked") {
+    return "blocked";
+  }
+
+  return "queued";
 }
 
 async function recordEvent(
@@ -921,446 +841,6 @@ async function recordEvent(
     kind,
     payload: asJson(payload),
     createdAt: nowIso()
-  });
-}
-
-async function upsertIssueMirror(
-  db: DirectorDatabase,
-  projectId: number,
-  input: Omit<GitHubIssueRecord, "id" | "projectId">
-): Promise<GitHubIssueRecord> {
-  const existing = await getIssueByNumber(db, projectId, input.number);
-  const values = {
-    projectId,
-    number: input.number,
-    title: input.title,
-    body: input.body,
-    state: input.state,
-    workflowState: input.workflowState,
-    labels: asJson(input.labels),
-    url: input.url,
-    updatedAt: input.updatedAt,
-    syncedAt: input.syncedAt
-  };
-
-  if (existing) {
-    await db
-      .update(githubIssuesTable)
-      .set(values)
-      .where(eq(githubIssuesTable.id, existing.id));
-  } else {
-    await db.insert(githubIssuesTable).values(values);
-  }
-
-  return assertPresent(
-    await getIssueByNumber(db, projectId, input.number),
-    `Issue #${input.number} was not persisted.`
-  );
-}
-
-async function upsertPullRequestMirror(
-  db: DirectorDatabase,
-  projectId: number,
-  input: Omit<GitHubPullRequestRecord, "id" | "projectId">
-): Promise<GitHubPullRequestRecord> {
-  const existing = await getPullRequestByNumber(db, projectId, input.number);
-  const values = {
-    projectId,
-    number: input.number,
-    title: input.title,
-    body: input.body,
-    state: input.state,
-    isDraft: input.isDraft,
-    reviewDecision: input.reviewDecision,
-    checksBucket: input.checksBucket,
-    headRefName: input.headRefName,
-    baseRefName: input.baseRefName,
-    url: input.url,
-    linkedIssueNumbers: asJson(input.linkedIssueNumbers),
-    updatedAt: input.updatedAt,
-    syncedAt: input.syncedAt
-  };
-
-  if (existing) {
-    await db
-      .update(githubPullRequestsTable)
-      .set(values)
-      .where(eq(githubPullRequestsTable.id, existing.id));
-  } else {
-    await db.insert(githubPullRequestsTable).values(values);
-  }
-
-  return assertPresent(
-    await getPullRequestByNumber(db, projectId, input.number),
-    `Pull request #${input.number} was not persisted.`
-  );
-}
-
-async function upsertCommentMirror(
-  db: DirectorDatabase,
-  projectId: number,
-  input: {
-    githubId: string;
-    parentType: "issue" | "pr";
-    parentNumber: number;
-    author: string;
-    body: string;
-    url: string;
-    createdAt: string;
-    updatedAt: string;
-    syncedAt: string;
-  }
-): Promise<void> {
-  const existing = await db
-    .select()
-    .from(githubCommentsTable)
-    .where(eq(githubCommentsTable.githubId, input.githubId))
-    .limit(1);
-
-  const values = {
-    projectId,
-    githubId: input.githubId,
-    parentType: input.parentType,
-    parentNumber: input.parentNumber,
-    author: input.author,
-    body: input.body,
-    url: input.url,
-    createdAt: input.createdAt,
-    updatedAt: input.updatedAt,
-    syncedAt: input.syncedAt
-  };
-
-  if (existing[0]) {
-    await db
-      .update(githubCommentsTable)
-      .set(values)
-      .where(eq(githubCommentsTable.id, existing[0].id));
-  } else {
-    await db.insert(githubCommentsTable).values(values);
-  }
-}
-
-async function ensureDirectorTask(
-  db: DirectorDatabase,
-  input: Omit<DirectorTaskRecord, "id" | "createdAt" | "updatedAt">
-): Promise<DirectorTaskRecord> {
-  const rows = await db
-    .select()
-    .from(directorTasksTable)
-    .where(
-      and(
-        eq(directorTasksTable.projectId, input.projectId),
-        eq(directorTasksTable.kind, input.kind),
-        eq(directorTasksTable.status, "ready_for_director")
-      )
-    )
-    .orderBy(desc(directorTasksTable.updatedAt))
-    .limit(1);
-
-  const existing = rows.find((row) => row.briefId === input.briefId);
-
-  if (existing) {
-    return mapTaskRow(existing);
-  }
-
-  const timestamp = nowIso();
-  const inserted = await db
-    .insert(directorTasksTable)
-    .values({
-      projectId: input.projectId,
-      briefId: input.briefId,
-      kind: input.kind,
-      title: input.title,
-      description: input.description,
-      recommendation: input.recommendation,
-      status: input.status,
-      payload: asJson(input.payload),
-      createdAt: timestamp,
-      updatedAt: timestamp
-    })
-    .returning();
-
-  return mapTaskRow(assertPresent(inserted[0], "Failed to create director task."));
-}
-
-async function resolveDirectorTasksForBrief(
-  db: DirectorDatabase,
-  projectId: number,
-  briefId: number
-): Promise<void> {
-  await db
-    .update(directorTasksTable)
-    .set({
-      status: "resolved",
-      updatedAt: nowIso()
-    })
-    .where(
-      and(
-        eq(directorTasksTable.projectId, projectId),
-        eq(directorTasksTable.briefId, briefId)
-      )
-    );
-}
-
-async function resolveDirectorTasksForPr(
-  db: DirectorDatabase,
-  projectId: number,
-  prNumber: number
-): Promise<void> {
-  const rows = await db
-    .select()
-    .from(directorTasksTable)
-    .where(and(eq(directorTasksTable.projectId, projectId), eq(directorTasksTable.kind, "approve_merge")));
-
-  const matching = rows.filter((row) => {
-    const payload = fromJson(row.payload as Record<string, unknown>);
-    return Number(payload.prNumber) === prNumber;
-  });
-
-  for (const row of matching) {
-    await db
-      .update(directorTasksTable)
-      .set({
-        status: "resolved",
-        updatedAt: nowIso()
-      })
-      .where(eq(directorTasksTable.id, row.id));
-  }
-}
-
-function titleFromPrompt(prompt: string): string {
-  const words = prompt
-    .replace(/\s+/g, " ")
-    .trim()
-    .split(" ")
-    .filter(Boolean)
-    .slice(0, 8);
-
-  if (!words.length) {
-    return "New Product Direction";
-  }
-
-  return words
-    .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
-    .join(" ");
-}
-
-function synthesizeBriefDraft(transcript: IntakeMessage[]): BriefDraft {
-  const latestDirectorMessage = [...transcript]
-    .reverse()
-    .find((entry) => entry.role === "director");
-  const seed = latestDirectorMessage?.content ?? "Define the next product improvement.";
-  const shortSeed = seed.length > 160 ? `${seed.slice(0, 157)}...` : seed;
-
-  return {
-    title: titleFromPrompt(seed),
-    problem: shortSeed,
-    targetUser: "The primary user affected by this product goal.",
-    desiredOutcome: "A clearer, higher-confidence experience tied to this product direction.",
-    constraints: [
-      "Keep scope inside an MVP-sized slice.",
-      "Preserve existing functionality unless the brief says otherwise."
-    ],
-    nonGoals: [
-      "No broad redesign outside the target flow.",
-      "No unrelated platform refactors."
-    ],
-    successMetrics: [
-      "The director can validate the improved flow directly.",
-      "The shipped change moves one user-facing outcome in the intended direction."
-    ]
-  };
-}
-
-function parseBriefDraftCandidate(
-  value: unknown,
-  fallback: BriefDraft
-): BriefDraft {
-  if (!value || typeof value !== "object") {
-    return fallback;
-  }
-
-  const candidate = value as Record<string, unknown>;
-
-  return {
-    title: typeof candidate.title === "string" ? candidate.title : fallback.title,
-    problem: typeof candidate.problem === "string" ? candidate.problem : fallback.problem,
-    targetUser:
-      typeof candidate.targetUser === "string" ? candidate.targetUser : fallback.targetUser,
-    desiredOutcome:
-      typeof candidate.desiredOutcome === "string"
-        ? candidate.desiredOutcome
-        : fallback.desiredOutcome,
-    constraints: Array.isArray(candidate.constraints)
-      ? candidate.constraints.filter((item): item is string => typeof item === "string")
-      : fallback.constraints,
-    nonGoals: Array.isArray(candidate.nonGoals)
-      ? candidate.nonGoals.filter((item): item is string => typeof item === "string")
-      : fallback.nonGoals,
-    successMetrics: Array.isArray(candidate.successMetrics)
-      ? candidate.successMetrics.filter((item): item is string => typeof item === "string")
-      : fallback.successMetrics
-  };
-}
-
-function summarizeBrief(brief: BriefDraft): string {
-  return `${brief.problem} Target user: ${brief.targetUser}. Desired outcome: ${brief.desiredOutcome}.`;
-}
-
-function fallbackIssuePlans(brief: BriefRecord): IssuePlan[] {
-  const titleStem = brief.draft.title;
-
-  return [
-    {
-      title: `Define success checks for ${titleStem}`,
-      body: `Translate the approved brief into explicit product acceptance checks and rollout guardrails.`,
-      acceptance: [
-        "Success criteria are written in the issue body.",
-        "Out-of-scope boundaries are captured.",
-        "A rollback note exists."
-      ],
-      workflowState: "ready"
-    },
-    {
-      title: `Implement the primary user-facing change for ${titleStem}`,
-      body: `Ship the core UI or workflow update that directly addresses the brief.`,
-      acceptance: [
-        "The main flow matches the approved brief.",
-        "User-facing copy is coherent and task-oriented.",
-        "The change is testable by the director."
-      ],
-      workflowState: "draft"
-    },
-    {
-      title: `Add supporting logic and error handling for ${titleStem}`,
-      body: `Cover the backend, state, validation, or integration work needed to make the primary change reliable.`,
-      acceptance: [
-        "Edge cases are handled.",
-        "Relevant data or state changes are wired end to end.",
-        "Errors fail in a user-safe way."
-      ],
-      workflowState: "draft"
-    },
-    {
-      title: `Validate and test ${titleStem}`,
-      body: `Add tests and a validation pass for the new behavior.`,
-      acceptance: [
-        "Automated tests cover the main path where practical.",
-        "Manual validation notes are captured.",
-        "Known risks are documented."
-      ],
-      workflowState: "draft"
-    }
-  ];
-}
-
-function parseIssuePlans(value: unknown, brief: BriefRecord): IssuePlan[] {
-  if (!Array.isArray(value)) {
-    return fallbackIssuePlans(brief);
-  }
-
-  const parsed = value
-    .map((item) => {
-      if (!item || typeof item !== "object") {
-        return null;
-      }
-
-      const candidate = item as Record<string, unknown>;
-      const workflowState = WORKFLOW_LABELS.includes(candidate.workflowState as WorkflowState)
-        ? (candidate.workflowState as WorkflowState)
-        : "draft";
-
-      return {
-        title:
-          typeof candidate.title === "string"
-            ? candidate.title
-            : `Task for ${brief.draft.title}`,
-        body:
-          typeof candidate.body === "string"
-            ? candidate.body
-            : "Implement the next approved piece of the brief.",
-        acceptance: Array.isArray(candidate.acceptance)
-          ? candidate.acceptance.filter((entry): entry is string => typeof entry === "string")
-          : [],
-        workflowState
-      } satisfies IssuePlan;
-    })
-    .filter((item): item is IssuePlan => item !== null);
-
-  return parsed.length ? parsed : fallbackIssuePlans(brief);
-}
-
-function buildEpicBody(brief: BriefRecord): string {
-  return [
-    `# ${brief.draft.title}`,
-    "",
-    "## Summary",
-    brief.summary,
-    "",
-    "## Problem",
-    brief.draft.problem,
-    "",
-    "## Target User",
-    brief.draft.targetUser,
-    "",
-    "## Desired Outcome",
-    brief.draft.desiredOutcome,
-    "",
-    "## Constraints",
-    ...brief.draft.constraints.map((item) => `- ${item}`),
-    "",
-    "## Non-goals",
-    ...brief.draft.nonGoals.map((item) => `- ${item}`),
-    "",
-    "## Success Metrics",
-    ...brief.draft.successMetrics.map((item) => `- ${item}`)
-  ].join("\n");
-}
-
-function buildIssueBody(brief: BriefRecord, plan: IssuePlan): string {
-  return [
-    `# ${plan.title}`,
-    "",
-    plan.body,
-    "",
-    "## Context",
-    brief.summary,
-    "",
-    "## Acceptance Checks",
-    ...plan.acceptance.map((item) => `- ${item}`),
-    "",
-    "## Out Of Scope",
-    ...brief.draft.nonGoals.map((item) => `- ${item}`),
-    "",
-    "## Rollback Note",
-    "Revert the change and return the affected workflow to its prior behavior."
-  ].join("\n");
-}
-
-async function updateIssueWorkflow(
-  session: ProjectSession,
-  issue: GitHubIssueRecord,
-  nextState: WorkflowState
-): Promise<GitHubIssueRecord> {
-  const baseLabels = stripWorkflowLabels(issue.labels);
-  const nextLabels = [...baseLabels, workflowLabel(nextState)];
-  const workflowLabelsToRemove = issue.labels.filter((label) =>
-    WORKFLOW_LABELS.some((state) => label === workflowLabel(state))
-  );
-
-  await removeIssueLabels(session.project.repoSlug, issue.number, workflowLabelsToRemove);
-  await addIssueLabels(session.project.repoSlug, issue.number, [workflowLabel(nextState)]);
-
-  return upsertIssueMirror(session.db, session.project.id, {
-    number: issue.number,
-    title: issue.title,
-    body: issue.body,
-    state: issue.state,
-    workflowState: nextState,
-    labels: nextLabels,
-    url: issue.url,
-    updatedAt: nowIso(),
-    syncedAt: nowIso()
   });
 }
 
@@ -1391,6 +871,1803 @@ async function ensureWorktree(
       ["-C", project.repoPath, "worktree", "add", "-B", branchName, worktreePath, project.defaultBranch],
       project.repoPath
     );
+  }
+}
+
+async function upsertGitHubIssueMirror(
+  db: DirectorDatabase,
+  projectId: number,
+  input: Omit<GitHubIssueRecord, "id" | "projectId">
+): Promise<void> {
+  const existing = await db
+    .select()
+    .from(githubIssuesTable)
+    .where(eq(githubIssuesTable.projectId, projectId));
+  const row = existing.find((candidate) => candidate.number === input.number);
+
+  if (row) {
+    await db
+      .update(githubIssuesTable)
+      .set({
+        title: input.title,
+        body: input.body,
+        state: input.state,
+        workflowState: input.workflowState,
+        labels: asJson(input.labels),
+        url: input.url,
+        updatedAt: input.updatedAt,
+        syncedAt: input.syncedAt
+      })
+      .where(eq(githubIssuesTable.id, row.id));
+    return;
+  }
+
+  await db.insert(githubIssuesTable).values({
+    projectId,
+    number: input.number,
+    title: input.title,
+    body: input.body,
+    state: input.state,
+    workflowState: input.workflowState,
+    labels: asJson(input.labels),
+    url: input.url,
+    updatedAt: input.updatedAt,
+    syncedAt: input.syncedAt
+  });
+}
+
+async function upsertGitHubPullRequestMirror(
+  db: DirectorDatabase,
+  projectId: number,
+  input: Omit<GitHubPullRequestRecord, "id" | "projectId">
+): Promise<void> {
+  const existing = await db
+    .select()
+    .from(githubPullRequestsTable)
+    .where(eq(githubPullRequestsTable.projectId, projectId));
+  const row = existing.find((candidate) => candidate.number === input.number);
+
+  if (row) {
+    await db
+      .update(githubPullRequestsTable)
+      .set({
+        title: input.title,
+        body: input.body,
+        state: input.state,
+        isDraft: input.isDraft,
+        reviewDecision: input.reviewDecision,
+        checksBucket: input.checksBucket,
+        headRefName: input.headRefName,
+        baseRefName: input.baseRefName,
+        url: input.url,
+        linkedIssueNumbers: asJson(input.linkedIssueNumbers),
+        updatedAt: input.updatedAt,
+        syncedAt: input.syncedAt
+      })
+      .where(eq(githubPullRequestsTable.id, row.id));
+    return;
+  }
+
+  await db.insert(githubPullRequestsTable).values({
+    projectId,
+    number: input.number,
+    title: input.title,
+    body: input.body,
+    state: input.state,
+    isDraft: input.isDraft,
+    reviewDecision: input.reviewDecision,
+    checksBucket: input.checksBucket,
+    headRefName: input.headRefName,
+    baseRefName: input.baseRefName,
+    url: input.url,
+    linkedIssueNumbers: asJson(input.linkedIssueNumbers),
+    updatedAt: input.updatedAt,
+    syncedAt: input.syncedAt
+  });
+}
+
+async function upsertGitHubCommentMirror(
+  db: DirectorDatabase,
+  projectId: number,
+  input: {
+    githubId: string;
+    parentType: "issue" | "pr";
+    parentNumber: number;
+    author: string;
+    body: string;
+    url: string;
+    createdAt: string;
+    updatedAt: string;
+    syncedAt: string;
+  }
+): Promise<void> {
+  const rows = await db
+    .select()
+    .from(githubCommentsTable)
+    .where(eq(githubCommentsTable.projectId, projectId));
+  const row = rows.find((candidate) => candidate.githubId === input.githubId);
+
+  if (row) {
+    await db
+      .update(githubCommentsTable)
+      .set({
+        parentType: input.parentType,
+        parentNumber: input.parentNumber,
+        author: input.author,
+        body: input.body,
+        url: input.url,
+        createdAt: input.createdAt,
+        updatedAt: input.updatedAt,
+        syncedAt: input.syncedAt
+      })
+      .where(eq(githubCommentsTable.id, row.id));
+    return;
+  }
+
+  await db.insert(githubCommentsTable).values({
+    projectId,
+    githubId: input.githubId,
+    parentType: input.parentType,
+    parentNumber: input.parentNumber,
+    author: input.author,
+    body: input.body,
+    url: input.url,
+    createdAt: input.createdAt,
+    updatedAt: input.updatedAt,
+    syncedAt: input.syncedAt
+  });
+}
+
+async function getWorkItemByIssueNumber(
+  db: DirectorDatabase,
+  projectId: number,
+  issueNumber: number
+): Promise<WorkItemRecord | null> {
+  const rows = await db
+    .select()
+    .from(workItemsTable)
+    .where(eq(workItemsTable.projectId, projectId));
+  const row = rows.find((candidate) => candidate.issueNumber === issueNumber);
+  return row ? mapWorkItemRow(row) : null;
+}
+
+async function upsertWorkItem(
+  db: DirectorDatabase,
+  projectId: number,
+  input: Omit<WorkItemRecord, "id" | "projectId" | "createdAt" | "updatedAt">
+): Promise<WorkItemRecord> {
+  const rows = await db
+    .select()
+    .from(workItemsTable)
+    .where(eq(workItemsTable.projectId, projectId));
+  const row = rows.find((candidate) => candidate.issueNumber === input.issueNumber);
+  const timestamp = nowIso();
+
+  if (row) {
+    await db
+      .update(workItemsTable)
+      .set({
+        parentIssueNumber: input.parentIssueNumber,
+        title: input.title,
+        summary: input.summary,
+        kind: input.kind,
+        executionMode: input.executionMode,
+        ownerRole: input.ownerRole,
+        status: input.status,
+        priorityBucket: input.priorityBucket,
+        activeRunId: input.activeRunId,
+        activePrNumber: input.activePrNumber,
+        lastSummary: input.lastSummary,
+        updatedAt: timestamp
+      })
+      .where(eq(workItemsTable.id, row.id));
+  } else {
+    await db.insert(workItemsTable).values({
+      projectId,
+      issueNumber: input.issueNumber,
+      parentIssueNumber: input.parentIssueNumber,
+      title: input.title,
+      summary: input.summary,
+      kind: input.kind,
+      executionMode: input.executionMode,
+      ownerRole: input.ownerRole,
+      status: input.status,
+      priorityBucket: input.priorityBucket,
+      activeRunId: input.activeRunId,
+      activePrNumber: input.activePrNumber,
+      lastSummary: input.lastSummary,
+      createdAt: timestamp,
+      updatedAt: timestamp
+    });
+  }
+
+  return assertPresent(
+    await getWorkItemByIssueNumber(db, projectId, input.issueNumber),
+    `Work item for issue #${input.issueNumber} is missing after upsert.`
+  );
+}
+
+async function insertRun(
+  session: ProjectSession,
+  input: Omit<RunRecord, "id" | "projectId" | "createdAt" | "updatedAt">
+): Promise<RunRecord> {
+  const timestamp = nowIso();
+  const result = await session.db.insert(runsTable).values({
+    projectId: session.project.id,
+    workItemId: input.workItemId,
+    issueNumber: input.issueNumber,
+    prNumber: input.prNumber,
+    role: input.role,
+    status: input.status,
+    phase: input.phase,
+    summary: input.summary,
+    recommendedNextAction: input.recommendedNextAction,
+    artifacts: asJson(input.artifacts),
+    blockingQuestions: asJson(input.blockingQuestions),
+    outputJson: input.outputJson ? asJson(input.outputJson) : null,
+    worktreePath: input.worktreePath,
+    createdAt: timestamp,
+    updatedAt: timestamp
+  });
+
+  const row = await session.db
+    .select()
+    .from(runsTable)
+    .where(eq(runsTable.id, Number(result.lastInsertRowid)))
+    .limit(1);
+  const mapped = mapRunRow(assertPresent(row[0], "Run row missing after insert."));
+  await syncOrchestratorActiveRuns(session);
+  return mapped;
+}
+
+async function updateRun(
+  session: ProjectSession,
+  runId: number,
+  patch: Partial<Omit<RunRecord, "id" | "projectId" | "createdAt">>
+): Promise<RunRecord> {
+  await session.db
+    .update(runsTable)
+    .set({
+      workItemId: patch.workItemId,
+      issueNumber: patch.issueNumber,
+      prNumber: patch.prNumber,
+      role: patch.role,
+      status: patch.status,
+      phase: patch.phase,
+      summary: patch.summary,
+      recommendedNextAction: patch.recommendedNextAction,
+      artifacts: patch.artifacts ? asJson(patch.artifacts) : undefined,
+      blockingQuestions: patch.blockingQuestions ? asJson(patch.blockingQuestions) : undefined,
+      outputJson: patch.outputJson ? asJson(patch.outputJson) : patch.outputJson === null ? null : undefined,
+      worktreePath: patch.worktreePath,
+      updatedAt: nowIso()
+    })
+    .where(eq(runsTable.id, runId));
+
+  const row = await session.db.select().from(runsTable).where(eq(runsTable.id, runId)).limit(1);
+  const mapped = mapRunRow(assertPresent(row[0], `Run ${runId} is missing after update.`));
+  await syncOrchestratorActiveRuns(session);
+  return mapped;
+}
+
+async function createDecision(
+  session: ProjectSession,
+  input: Omit<DecisionRecord, "id" | "projectId" | "createdAt" | "updatedAt" | "status" | "resolution">
+): Promise<DecisionRecord> {
+  const timestamp = nowIso();
+  const result = await session.db.insert(decisionsTable).values({
+    projectId: session.project.id,
+    workItemId: input.workItemId,
+    issueNumber: input.issueNumber,
+    prNumber: input.prNumber,
+    target: input.target,
+    title: input.title,
+    summary: input.summary,
+    recommendation: input.recommendation,
+    rationale: input.rationale,
+    status: "open",
+    resolution: null,
+    createdAt: timestamp,
+    updatedAt: timestamp
+  });
+
+  const row = await session.db
+    .select()
+    .from(decisionsTable)
+    .where(eq(decisionsTable.id, Number(result.lastInsertRowid)))
+    .limit(1);
+  return mapDecisionRow(assertPresent(row[0], "Decision row missing after insert."));
+}
+
+async function upsertPrCycle(
+  db: DirectorDatabase,
+  projectId: number,
+  input: Omit<PrCycleRecord, "id" | "projectId" | "createdAt" | "updatedAt">
+): Promise<PrCycleRecord> {
+  const rows = await db.select().from(prCyclesTable).where(eq(prCyclesTable.projectId, projectId));
+  const row = rows.find((candidate) => candidate.prNumber === input.prNumber);
+  const timestamp = nowIso();
+
+  if (row) {
+    await db
+      .update(prCyclesTable)
+      .set({
+        issueNumber: input.issueNumber,
+        status: input.status,
+        summary: input.summary,
+        automationWindowEndsAt: input.automationWindowEndsAt,
+        lastCheckedAt: input.lastCheckedAt,
+        lastHandledCommentAt: input.lastHandledCommentAt,
+        mergedAt: input.mergedAt,
+        updatedAt: timestamp
+      })
+      .where(eq(prCyclesTable.id, row.id));
+  } else {
+    await db.insert(prCyclesTable).values({
+      projectId,
+      issueNumber: input.issueNumber,
+      prNumber: input.prNumber,
+      status: input.status,
+      summary: input.summary,
+      automationWindowEndsAt: input.automationWindowEndsAt,
+      lastCheckedAt: input.lastCheckedAt,
+      lastHandledCommentAt: input.lastHandledCommentAt,
+      mergedAt: input.mergedAt,
+      createdAt: timestamp,
+      updatedAt: timestamp
+    });
+  }
+
+  const currentRows = await db.select().from(prCyclesTable).where(eq(prCyclesTable.projectId, projectId));
+  return mapPrCycleRow(
+    assertPresent(
+      currentRows.find((candidate) => candidate.prNumber === input.prNumber),
+      `PR cycle ${input.prNumber} is missing after upsert.`
+    )
+  );
+}
+
+async function ensureOrchestratorRow(session: ProjectSession): Promise<OrchestratorStatusRecord> {
+  const rows = await session.db
+    .select()
+    .from(orchestratorStateTable)
+    .where(eq(orchestratorStateTable.projectId, session.project.id))
+    .limit(1);
+  const existing = rows[0];
+
+  if (existing) {
+    return mapOrchestratorRow(existing);
+  }
+
+  const timestamp = nowIso();
+  await session.db.insert(orchestratorStateTable).values({
+    projectId: session.project.id,
+    status: "idle",
+    pauseReason: null,
+    activeRunIds: asJson([]),
+    lastLoopAt: null,
+    lastSummary: "Orchestrator has not started yet.",
+    createdAt: timestamp,
+    updatedAt: timestamp
+  });
+
+  const current = await session.db
+    .select()
+    .from(orchestratorStateTable)
+    .where(eq(orchestratorStateTable.projectId, session.project.id))
+    .limit(1);
+  return mapOrchestratorRow(assertPresent(current[0], "Orchestrator row missing after insert."));
+}
+
+async function syncOrchestratorActiveRuns(session: ProjectSession): Promise<void> {
+  const orchestrator = await ensureOrchestratorRow(session);
+  const runningRows = await session.db
+    .select()
+    .from(runsTable)
+    .where(eq(runsTable.projectId, session.project.id));
+  const activeRunIds = runningRows
+    .filter((candidate) => candidate.status === "running")
+    .map((candidate) => candidate.id);
+
+  await session.db
+    .update(orchestratorStateTable)
+    .set({
+      activeRunIds: asJson(activeRunIds),
+      updatedAt: nowIso()
+    })
+    .where(eq(orchestratorStateTable.id, orchestrator.id));
+}
+
+async function setOrchestratorState(
+  session: ProjectSession,
+  status: OrchestratorStatus,
+  options: {
+    pauseReason?: string | null;
+    lastSummary?: string | null;
+    lastLoopAt?: string | null;
+  } = {}
+): Promise<OrchestratorStatusRecord> {
+  const current = await ensureOrchestratorRow(session);
+  await session.db
+    .update(orchestratorStateTable)
+    .set({
+      status,
+      pauseReason: options.pauseReason === undefined ? current.pauseReason : options.pauseReason,
+      lastSummary: options.lastSummary === undefined ? current.lastSummary : options.lastSummary,
+      lastLoopAt: options.lastLoopAt === undefined ? current.lastLoopAt : options.lastLoopAt,
+      updatedAt: nowIso()
+    })
+    .where(eq(orchestratorStateTable.id, current.id));
+
+  const row = await session.db
+    .select()
+    .from(orchestratorStateTable)
+    .where(eq(orchestratorStateTable.id, current.id))
+    .limit(1);
+  return mapOrchestratorRow(assertPresent(row[0], "Orchestrator row missing after update."));
+}
+
+async function getOpenPullRequests(
+  session: ProjectSession
+): Promise<GitHubPullRequestRecord[]> {
+  const rows = await session.db
+    .select()
+    .from(githubPullRequestsTable)
+    .where(eq(githubPullRequestsTable.projectId, session.project.id));
+  return rows
+    .map(mapGitHubPullRequestRow)
+    .filter((pullRequest) => pullRequest.state.toLowerCase() === "open");
+}
+
+async function seedWorkItemsFromGitHub(session: ProjectSession): Promise<void> {
+  const issueRows = await session.db
+    .select()
+    .from(githubIssuesTable)
+    .where(eq(githubIssuesTable.projectId, session.project.id));
+  const issues = issueRows.map(mapGitHubIssueRow);
+  const pullRequests = await getOpenPullRequests(session);
+  const existingRows = await session.db
+    .select()
+    .from(workItemsTable)
+    .where(eq(workItemsTable.projectId, session.project.id));
+  const existingMap = new Map(existingRows.map((row) => [row.issueNumber, mapWorkItemRow(row)]));
+
+  for (const issue of issues) {
+    const linkedPr =
+      pullRequests.find((pullRequest) => pullRequest.linkedIssueNumbers.includes(issue.number)) ?? null;
+    const existing = existingMap.get(issue.number) ?? null;
+    const kind = existing?.kind ?? inferWorkItemKind(issue);
+    const executionMode = existing?.executionMode ?? inferExecutionMode(kind, issue);
+    const status = inferWorkItemStatus(issue, existing, linkedPr);
+    await upsertWorkItem(session.db, session.project.id, {
+      issueNumber: issue.number,
+      parentIssueNumber: existing?.parentIssueNumber ?? null,
+      title: issue.title,
+      summary: summarizeText(issue.body || issue.title),
+      kind,
+      executionMode,
+      ownerRole: executionMode === "lane" ? "lane_owner" : "worker",
+      status,
+      priorityBucket: inferPriorityBucket(status),
+      activeRunId: existing?.activeRunId ?? null,
+      activePrNumber: linkedPr?.number ?? null,
+      lastSummary: existing?.lastSummary ?? null
+    });
+  }
+
+  await refreshWorkstreamStatuses(session);
+}
+
+async function refreshWorkstreamStatuses(session: ProjectSession): Promise<void> {
+  const rows = await session.db
+    .select()
+    .from(workItemsTable)
+    .where(eq(workItemsTable.projectId, session.project.id));
+  const workItems = rows.map(mapWorkItemRow);
+  const parents = workItems.filter((workItem) => workItem.kind === "workstream");
+
+  for (const parent of parents) {
+    const children = workItems.filter((workItem) => workItem.parentIssueNumber === parent.issueNumber);
+    if (!children.length) {
+      continue;
+    }
+
+    let status: WorkItemStatus = "running";
+    if (children.every((child) => child.status === "completed")) {
+      status = "completed";
+    } else if (children.some((child) => child.status === "waiting_decision")) {
+      status = "waiting_decision";
+    } else if (children.some((child) => child.status === "blocked")) {
+      status = "blocked";
+    }
+
+    await upsertWorkItem(session.db, session.project.id, {
+      issueNumber: parent.issueNumber,
+      parentIssueNumber: parent.parentIssueNumber,
+      title: parent.title,
+      summary: parent.summary,
+      kind: parent.kind,
+      executionMode: parent.executionMode,
+      ownerRole: parent.ownerRole,
+      status,
+      priorityBucket: inferPriorityBucket(status),
+      activeRunId: parent.activeRunId,
+      activePrNumber: parent.activePrNumber,
+      lastSummary: parent.lastSummary
+    });
+  }
+}
+
+async function syncPrCyclesFromGitHub(session: ProjectSession): Promise<void> {
+  const pullRequests = await getOpenPullRequests(session);
+  const workItems = (
+    await session.db
+      .select()
+      .from(workItemsTable)
+      .where(eq(workItemsTable.projectId, session.project.id))
+  ).map(mapWorkItemRow);
+  const activePrNumbers = new Set<number>();
+
+  for (const pullRequest of pullRequests) {
+    const issueNumber = pullRequest.linkedIssueNumbers[0];
+    if (!issueNumber) {
+      continue;
+    }
+    activePrNumbers.add(pullRequest.number);
+    const existingWorkItem = workItems.find((candidate) => candidate.issueNumber === issueNumber);
+    if (existingWorkItem) {
+      await upsertWorkItem(session.db, session.project.id, {
+        issueNumber: existingWorkItem.issueNumber,
+        parentIssueNumber: existingWorkItem.parentIssueNumber,
+        title: existingWorkItem.title,
+        summary: existingWorkItem.summary,
+        kind: existingWorkItem.kind,
+        executionMode: existingWorkItem.executionMode,
+        ownerRole: existingWorkItem.ownerRole,
+        status: "waiting_review",
+        priorityBucket: inferPriorityBucket("waiting_review"),
+        activeRunId: existingWorkItem.activeRunId,
+        activePrNumber: pullRequest.number,
+        lastSummary: existingWorkItem.lastSummary
+      });
+    }
+
+    const cycleRows = await session.db
+      .select()
+      .from(prCyclesTable)
+      .where(eq(prCyclesTable.projectId, session.project.id));
+    const existingCycle = cycleRows.find((candidate) => candidate.prNumber === pullRequest.number);
+    const existingCycleStatus = existingCycle
+      ? (existingCycle.status as PrCycleRecord["status"])
+      : null;
+    await upsertPrCycle(session.db, session.project.id, {
+      issueNumber,
+      prNumber: pullRequest.number,
+      status: pullRequest.checksBucket === "pass" ? "cos_review" : existingCycleStatus ?? "opened",
+      summary: summarizeText(pullRequest.title),
+      automationWindowEndsAt: existingCycle?.automationWindowEndsAt ?? null,
+      lastCheckedAt: existingCycle?.lastCheckedAt ?? null,
+      lastHandledCommentAt: existingCycle?.lastHandledCommentAt ?? null,
+      mergedAt: existingCycle?.mergedAt ?? null
+    });
+  }
+
+  const cycleRows = await session.db
+    .select()
+    .from(prCyclesTable)
+    .where(eq(prCyclesTable.projectId, session.project.id));
+  for (const cycle of cycleRows) {
+    if (!activePrNumbers.has(cycle.prNumber) && cycle.status !== "merged") {
+      await upsertPrCycle(session.db, session.project.id, {
+        issueNumber: cycle.issueNumber,
+        prNumber: cycle.prNumber,
+        status: cycle.mergedAt ? "merged" : "blocked",
+        summary: cycle.summary,
+        automationWindowEndsAt: cycle.automationWindowEndsAt,
+        lastCheckedAt: cycle.lastCheckedAt,
+        lastHandledCommentAt: cycle.lastHandledCommentAt,
+        mergedAt: cycle.mergedAt
+      });
+    }
+  }
+}
+
+async function syncProjectInternal(session: ProjectSession): Promise<DirectorOperationResponse> {
+  const [issues, pullRequests, comments] = await Promise.all([
+    listIssues(session.project.repoSlug),
+    listPullRequests(session.project.repoSlug),
+    listComments(session.project.repoSlug)
+  ]);
+
+  for (const issue of issues) {
+    await upsertGitHubIssueMirror(session.db, session.project.id, {
+      number: issue.number,
+      title: issue.title,
+      body: issue.body,
+      state: issue.state,
+      workflowState: inferWorkflowState(issue.labels, issue.state),
+      labels: issue.labels,
+      url: issue.url,
+      updatedAt: issue.updatedAt,
+      syncedAt: nowIso()
+    });
+  }
+
+  for (const pullRequest of pullRequests) {
+    await upsertGitHubPullRequestMirror(session.db, session.project.id, {
+      number: pullRequest.number,
+      title: pullRequest.title,
+      body: pullRequest.body,
+      state: pullRequest.state.toLowerCase(),
+      isDraft: pullRequest.isDraft,
+      reviewDecision: pullRequest.reviewDecision,
+      checksBucket: pullRequest.checksBucket,
+      headRefName: pullRequest.headRefName,
+      baseRefName: pullRequest.baseRefName,
+      url: pullRequest.url,
+      linkedIssueNumbers: pullRequest.linkedIssueNumbers,
+      updatedAt: pullRequest.updatedAt,
+      syncedAt: nowIso()
+    });
+  }
+
+  for (const comment of comments) {
+    await upsertGitHubCommentMirror(session.db, session.project.id, {
+      githubId: comment.githubId,
+      parentType: comment.parentType,
+      parentNumber: comment.parentNumber,
+      author: comment.author,
+      body: comment.body,
+      url: comment.url,
+      createdAt: comment.createdAt,
+      updatedAt: comment.updatedAt,
+      syncedAt: nowIso()
+    });
+  }
+
+  await seedWorkItemsFromGitHub(session);
+  await syncPrCyclesFromGitHub(session);
+  await recordEvent(session.db, session.project.id, "github.synced", {
+    issues: issues.length,
+    pullRequests: pullRequests.length,
+    comments: comments.length
+  });
+
+  return {
+    ok: true,
+    issues: issues.length,
+    pullRequests: pullRequests.length,
+    comments: comments.length
+  };
+}
+
+function parseDataNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function parseDataString(value: unknown): string | null {
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function parseDataArray(value: unknown): Array<Record<string, unknown>> {
+  return Array.isArray(value)
+    ? value.filter((candidate): candidate is Record<string, unknown> => Boolean(candidate) && typeof candidate === "object")
+    : [];
+}
+
+async function chooseNextWorkItem(session: ProjectSession): Promise<WorkItemRecord | null> {
+  const workItems = (
+    await session.db
+      .select()
+      .from(workItemsTable)
+      .where(eq(workItemsTable.projectId, session.project.id))
+  )
+    .map(mapWorkItemRow)
+    .filter((workItem) =>
+      ["queued", "ready"].includes(workItem.status) &&
+      workItem.activePrNumber === null &&
+      workItem.activeRunId === null
+    )
+    .sort((left, right) =>
+      left.priorityBucket === right.priorityBucket
+        ? left.issueNumber - right.issueNumber
+        : left.priorityBucket - right.priorityBucket
+    );
+
+  if (!workItems.length) {
+    return null;
+  }
+
+  const fallbackWorkItem = assertPresent(
+    workItems[0],
+    "At least one queued work item should exist before selection."
+  );
+
+  if (workItems.length === 1) {
+    return fallbackWorkItem;
+  }
+
+  const prompt = [
+    "You are the Chief of Staff for Director OS.",
+    "Choose the next GitHub issue to execute, classify it as lane or worker, and decide whether it is a workstream or task.",
+    "Prefer locally ready work first, then choose the highest-leverage remaining bounded slice.",
+    "Return the machine-readable selection in `data` using keys `selected_issue_number`, `execution_mode`, `kind`, and `rationale`.",
+    "",
+    "Candidates:",
+    ...workItems.slice(0, 8).map((workItem) =>
+      `- #${workItem.issueNumber} (${workItem.status}, ${workItem.kind}, ${workItem.executionMode}): ${workItem.title}\n  Summary: ${workItem.summary}`
+    )
+  ].join("\n");
+
+  const result = await runCodexAgent(
+    {
+      role: "chief_of_staff",
+      cwd: session.project.repoPath,
+      model: session.project.model,
+      allowWrite: false,
+      prompt
+    },
+    {
+      status: "ok",
+      summary: `Selected issue #${fallbackWorkItem.issueNumber} by fallback ordering.`,
+      recommended_next_action: "Dispatch the first locally ready or queued issue.",
+      artifact_refs: [],
+      blocking_questions: [],
+      data: {
+        selected_issue_number: fallbackWorkItem.issueNumber,
+        execution_mode: fallbackWorkItem.executionMode,
+        kind: fallbackWorkItem.kind,
+        rationale: "Fallback ordering selected the first available issue."
+      }
+    }
+  );
+
+  const selection = parseDataNumber(result.data?.selected_issue_number) ?? fallbackWorkItem.issueNumber;
+  const chosen = workItems.find((candidate) => candidate.issueNumber === selection) ?? fallbackWorkItem;
+  const executionMode = parseDataString(result.data?.execution_mode) as ExecutionMode | null;
+  const kind = parseDataString(result.data?.kind) as WorkItemKind | null;
+  const rationale = parseDataString(result.data?.rationale) ?? result.summary;
+
+  const nextStatus = executionMode === "lane" ? "planning" : "ready";
+  return upsertWorkItem(session.db, session.project.id, {
+    issueNumber: chosen.issueNumber,
+    parentIssueNumber: chosen.parentIssueNumber,
+    title: chosen.title,
+    summary: chosen.summary,
+    kind: kind ?? chosen.kind,
+    executionMode: executionMode ?? chosen.executionMode,
+    ownerRole: (executionMode ?? chosen.executionMode) === "lane" ? "lane_owner" : "worker",
+    status: nextStatus,
+    priorityBucket: inferPriorityBucket(nextStatus),
+    activeRunId: chosen.activeRunId,
+    activePrNumber: chosen.activePrNumber,
+    lastSummary: rationale
+  });
+}
+
+async function createIssuesFromPlan(
+  session: ProjectSession,
+  parentIssueNumber: number,
+  items: Array<Record<string, unknown>>,
+  executionMode: ExecutionMode
+): Promise<number[]> {
+  const created: number[] = [];
+
+  for (const item of items.slice(0, 5)) {
+    const title = parseDataString(item.title);
+    const body = parseDataString(item.body);
+    if (!title || !body) {
+      continue;
+    }
+
+    const issue = await createIssue(session.project.repoSlug, {
+      title,
+      body: `${body}\n\nParent workstream: #${parentIssueNumber}`,
+      labels: [labelFor("task"), labelFor("ready"), labelFor(executionMode === "lane" ? "lane" : "worker")]
+    });
+
+    created.push(issue.number);
+    await upsertWorkItem(session.db, session.project.id, {
+      issueNumber: issue.number,
+      parentIssueNumber,
+      title,
+      summary: summarizeText(body),
+      kind: "task",
+      executionMode,
+      ownerRole: executionMode === "lane" ? "lane_owner" : "worker",
+      status: "ready",
+      priorityBucket: inferPriorityBucket("ready"),
+      activeRunId: null,
+      activePrNumber: null,
+      lastSummary: `Spawned from lane plan for #${parentIssueNumber}.`
+    });
+  }
+
+  return created;
+}
+
+async function maybeExpandNotesIntoIssues(session: ProjectSession): Promise<boolean> {
+  const notes = (
+    await session.db
+      .select()
+      .from(directorNotesTable)
+      .where(eq(directorNotesTable.projectId, session.project.id))
+  )
+    .map(mapNoteRow)
+    .filter((note) => note.status === "active");
+
+  if (!notes.length) {
+    return false;
+  }
+
+  const primaryNote = assertPresent(notes[0], "At least one active director note is required.");
+
+  const prompt = [
+    "You are the Chief of Staff for Director OS.",
+    "The backlog is empty. Turn the director's most recent note into 1 to 3 concrete GitHub issues.",
+    "Return them in `data.new_issues` as objects with `title`, `body`, `kind`, and `execution_mode`.",
+    "Only create issues that are bounded enough to enter the queue immediately.",
+    "",
+    "Active notes:",
+    ...notes.slice(0, 3).map((note) => `- ${note.content}`)
+  ].join("\n");
+
+  const result = await runCodexAgent(
+    {
+      role: "chief_of_staff",
+      cwd: session.project.repoPath,
+      model: session.project.model,
+      allowWrite: false,
+      prompt
+    },
+    {
+      status: "needs_input",
+      summary: "No expansion issues were proposed.",
+      recommended_next_action: "Ask the director for a more concrete note.",
+      artifact_refs: [],
+      blocking_questions: []
+    }
+  );
+
+  const items = parseDataArray(result.data?.new_issues);
+  if (!items.length) {
+    return false;
+  }
+
+  for (const item of items.slice(0, 3)) {
+    const title = parseDataString(item.title);
+    const body = parseDataString(item.body);
+    const kind = (parseDataString(item.kind) as WorkItemKind | null) ?? "task";
+    const executionMode = (parseDataString(item.execution_mode) as ExecutionMode | null) ?? (kind === "workstream" ? "lane" : "worker");
+    if (!title || !body) {
+      continue;
+    }
+
+    const created = await createIssue(session.project.repoSlug, {
+      title,
+      body,
+      labels: [labelFor(kind), labelFor("ready"), labelFor(executionMode)]
+    });
+
+    await upsertWorkItem(session.db, session.project.id, {
+      issueNumber: created.number,
+      parentIssueNumber: null,
+      title,
+      summary: summarizeText(body),
+      kind,
+      executionMode,
+      ownerRole: executionMode === "lane" ? "lane_owner" : "worker",
+      status: "ready",
+      priorityBucket: inferPriorityBucket("ready"),
+      activeRunId: null,
+      activePrNumber: null,
+      lastSummary: `Generated from director note ${primaryNote.id}.`
+    });
+  }
+
+  await session.db
+    .update(directorNotesTable)
+    .set({
+      status: "archived",
+      updatedAt: nowIso()
+    })
+    .where(eq(directorNotesTable.id, primaryNote.id));
+
+  await recordEvent(session.db, session.project.id, "director_note.expanded", {
+    noteId: primaryNote.id
+  });
+
+  return true;
+}
+
+async function planLaneWork(session: ProjectSession, workItem: WorkItemRecord): Promise<void> {
+  const issueRows = await session.db
+    .select()
+    .from(githubIssuesTable)
+    .where(eq(githubIssuesTable.projectId, session.project.id));
+  const issue = issueRows.map(mapGitHubIssueRow).find((candidate) => candidate.number === workItem.issueNumber);
+  const liveIssue = assertPresent(issue, `Issue #${workItem.issueNumber} is missing from the local mirror.`);
+
+  const run = await insertRun(session, {
+    workItemId: workItem.id,
+    issueNumber: workItem.issueNumber,
+    prNumber: null,
+    role: "lane_owner",
+    status: "running",
+    phase: "planning",
+    summary: `Planning workstream #${workItem.issueNumber}.`,
+    recommendedNextAction: null,
+    artifacts: [],
+    blockingQuestions: [],
+    outputJson: null,
+    worktreePath: null
+  });
+
+  await upsertWorkItem(session.db, session.project.id, {
+    issueNumber: workItem.issueNumber,
+    parentIssueNumber: workItem.parentIssueNumber,
+    title: workItem.title,
+    summary: workItem.summary,
+    kind: "workstream",
+    executionMode: "lane",
+    ownerRole: "lane_owner",
+    status: "planning",
+    priorityBucket: inferPriorityBucket("planning"),
+    activeRunId: run.id,
+    activePrNumber: workItem.activePrNumber,
+    lastSummary: workItem.lastSummary
+  });
+
+  const laneResult = await runCodexAgent(
+    {
+      role: "lane_owner",
+      cwd: session.project.repoPath,
+      model: session.project.model,
+      allowWrite: false,
+      prompt: [
+        `You own GitHub issue #${liveIssue.number}: ${liveIssue.title}.`,
+        "Plan the slice end to end before any write-enabled execution begins.",
+        "If this should split into child issues, return them in `data.child_tasks` as objects with `title` and `body`.",
+        "Only raise blocking questions when genuine product judgment is required.",
+        "",
+        liveIssue.body
+      ].join("\n")
+    },
+    {
+      status: "ok",
+      summary: `Fallback lane plan for #${liveIssue.number}: continue as a bounded worker issue.`,
+      recommended_next_action: "Execute the issue directly as a worker task.",
+      artifact_refs: [],
+      blocking_questions: [],
+      data: {
+        child_tasks: []
+      }
+    }
+  );
+
+  await updateRun(session, run.id, {
+    status: laneResult.status === "failed" ? "failed" : laneResult.status === "needs_input" ? "needs_input" : "succeeded",
+    summary: laneResult.summary,
+    recommendedNextAction: laneResult.recommended_next_action,
+    artifacts: laneResult.artifact_refs,
+    blockingQuestions: laneResult.blocking_questions,
+    outputJson: laneResult.data ?? null
+  });
+
+  if (laneResult.blocking_questions.length > 0) {
+    await createDecision(session, {
+      workItemId: workItem.id,
+      issueNumber: workItem.issueNumber,
+      prNumber: null,
+      target: "human_director",
+      title: `Answer product questions for #${workItem.issueNumber}`,
+      summary: laneResult.summary,
+      recommendation: laneResult.recommended_next_action,
+      rationale: laneResult.blocking_questions.join("\n")
+    });
+
+    await upsertWorkItem(session.db, session.project.id, {
+      issueNumber: workItem.issueNumber,
+      parentIssueNumber: workItem.parentIssueNumber,
+      title: workItem.title,
+      summary: workItem.summary,
+      kind: "workstream",
+      executionMode: "lane",
+      ownerRole: "lane_owner",
+      status: "waiting_decision",
+      priorityBucket: inferPriorityBucket("waiting_decision"),
+      activeRunId: null,
+      activePrNumber: workItem.activePrNumber,
+      lastSummary: laneResult.summary
+    });
+    return;
+  }
+
+  const childTasks = parseDataArray(laneResult.data?.child_tasks);
+  if (childTasks.length) {
+    await createIssuesFromPlan(session, workItem.issueNumber, childTasks, "worker");
+    await upsertWorkItem(session.db, session.project.id, {
+      issueNumber: workItem.issueNumber,
+      parentIssueNumber: workItem.parentIssueNumber,
+      title: workItem.title,
+      summary: workItem.summary,
+      kind: "workstream",
+      executionMode: "lane",
+      ownerRole: "lane_owner",
+      status: "running",
+      priorityBucket: inferPriorityBucket("running"),
+      activeRunId: null,
+      activePrNumber: workItem.activePrNumber,
+      lastSummary: laneResult.summary
+    });
+    await recordEvent(session.db, session.project.id, "lane.plan_spawned", {
+      issueNumber: workItem.issueNumber,
+      childCount: childTasks.length
+    });
+    return;
+  }
+
+  await upsertWorkItem(session.db, session.project.id, {
+    issueNumber: workItem.issueNumber,
+    parentIssueNumber: workItem.parentIssueNumber,
+    title: workItem.title,
+    summary: workItem.summary,
+    kind: "task",
+    executionMode: "worker",
+    ownerRole: "worker",
+    status: "ready",
+    priorityBucket: inferPriorityBucket("ready"),
+    activeRunId: null,
+    activePrNumber: workItem.activePrNumber,
+    lastSummary: laneResult.summary
+  });
+}
+
+async function executeWorkerRun(
+  session: ProjectSession,
+  workItem: WorkItemRecord,
+  options: {
+    issue: GitHubIssueRecord;
+    phase: string;
+    promptSuffix?: string;
+    existingPrNumber?: number | null;
+    existingHeadRefName?: string | null;
+  }
+): Promise<void> {
+  const branchName =
+    options.existingHeadRefName ??
+    `codex/issue-${workItem.issueNumber}-${slugify(workItem.title).slice(0, 36)}`;
+  const worktreePath = path.join(session.project.worktreeRoot, `issue-${workItem.issueNumber}`);
+
+  await ensureWorktree(session.project, workItem.issueNumber, branchName, worktreePath);
+
+  const existingWorktreeRows = await session.db
+    .select()
+    .from(worktreesTable)
+    .where(eq(worktreesTable.path, worktreePath))
+    .limit(1);
+  const timestamp = nowIso();
+  if (existingWorktreeRows[0]) {
+    await session.db
+      .update(worktreesTable)
+      .set({
+        issueNumber: workItem.issueNumber,
+        branchName,
+        status: "active",
+        updatedAt: timestamp
+      })
+      .where(eq(worktreesTable.id, existingWorktreeRows[0].id));
+  } else {
+    await session.db.insert(worktreesTable).values({
+      projectId: session.project.id,
+      issueNumber: workItem.issueNumber,
+      branchName,
+      path: worktreePath,
+      status: "active",
+      createdAt: timestamp,
+      updatedAt: timestamp
+    });
+  }
+
+  const run = await insertRun(session, {
+    workItemId: workItem.id,
+    issueNumber: workItem.issueNumber,
+    prNumber: options.existingPrNumber ?? null,
+    role: "worker",
+    status: "running",
+    phase: options.phase,
+    summary: `Executing issue #${workItem.issueNumber}.`,
+    recommendedNextAction: null,
+    artifacts: [worktreePath],
+    blockingQuestions: [],
+    outputJson: null,
+    worktreePath
+  });
+
+  await upsertWorkItem(session.db, session.project.id, {
+    issueNumber: workItem.issueNumber,
+    parentIssueNumber: workItem.parentIssueNumber,
+    title: workItem.title,
+    summary: workItem.summary,
+    kind: workItem.kind,
+    executionMode: "worker",
+    ownerRole: "worker",
+    status: "running",
+    priorityBucket: inferPriorityBucket("running"),
+    activeRunId: run.id,
+    activePrNumber: workItem.activePrNumber,
+    lastSummary: workItem.lastSummary
+  });
+
+  const workerResult = await runCodexAgent(
+    {
+      role: "worker",
+      cwd: worktreePath,
+      model: session.project.model,
+      allowWrite: true,
+      prompt: [
+        `Implement GitHub issue #${options.issue.number}: ${options.issue.title}.`,
+        "Use your built-in planning discipline before editing, then make the bounded code changes needed to satisfy the issue.",
+        "If product judgment is required, do not guess; explain the blocking question.",
+        "Leave the repository ready for commit.",
+        "",
+        options.issue.body,
+        options.promptSuffix ? `\nFollow-up context:\n${options.promptSuffix}` : ""
+      ].join("\n")
+    },
+    {
+      status: "needs_input",
+      summary: `Worker completed without a clear implementation outcome for #${options.issue.number}.`,
+      recommended_next_action: "Inspect the worktree and decide whether to retry or escalate.",
+      artifact_refs: [worktreePath],
+      blocking_questions: []
+    }
+  );
+
+  if (workerResult.blocking_questions.length > 0 || workerResult.status === "needs_input") {
+    await updateRun(session, run.id, {
+      status: "needs_input",
+      summary: workerResult.summary,
+      recommendedNextAction: workerResult.recommended_next_action,
+      artifacts: workerResult.artifact_refs,
+      blockingQuestions: workerResult.blocking_questions,
+      outputJson: workerResult.data ?? null
+    });
+
+    await createDecision(session, {
+      workItemId: workItem.id,
+      issueNumber: workItem.issueNumber,
+      prNumber: options.existingPrNumber ?? null,
+      target: "human_director",
+      title: `Clarify issue #${workItem.issueNumber}`,
+      summary: workerResult.summary,
+      recommendation: workerResult.recommended_next_action,
+      rationale: workerResult.blocking_questions.join("\n") || "Worker requested human clarification."
+    });
+
+    await upsertWorkItem(session.db, session.project.id, {
+      issueNumber: workItem.issueNumber,
+      parentIssueNumber: workItem.parentIssueNumber,
+      title: workItem.title,
+      summary: workItem.summary,
+      kind: workItem.kind,
+      executionMode: "worker",
+      ownerRole: "worker",
+      status: "waiting_decision",
+      priorityBucket: inferPriorityBucket("waiting_decision"),
+      activeRunId: null,
+      activePrNumber: options.existingPrNumber ?? workItem.activePrNumber,
+      lastSummary: workerResult.summary
+    });
+    return;
+  }
+
+  try {
+    await maybeRunPackageScript(worktreePath, "test");
+    await maybeRunPackageScript(worktreePath, "build");
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    await updateRun(session, run.id, {
+      status: "failed",
+      summary: `Validation failed for #${workItem.issueNumber}: ${message}`,
+      recommendedNextAction: "Inspect the failing command output and retry.",
+      artifacts: [worktreePath],
+      blockingQuestions: [],
+      outputJson: workerResult.data ?? null
+    });
+    await upsertWorkItem(session.db, session.project.id, {
+      issueNumber: workItem.issueNumber,
+      parentIssueNumber: workItem.parentIssueNumber,
+      title: workItem.title,
+      summary: workItem.summary,
+      kind: workItem.kind,
+      executionMode: "worker",
+      ownerRole: "worker",
+      status: "blocked",
+      priorityBucket: inferPriorityBucket("blocked"),
+      activeRunId: null,
+      activePrNumber: options.existingPrNumber ?? workItem.activePrNumber,
+      lastSummary: message
+    });
+    return;
+  }
+
+  const statusOutput = await runCommand("git", ["status", "--porcelain"], worktreePath);
+  if (!statusOutput.trim()) {
+    await updateRun(session, run.id, {
+      status: "needs_input",
+      summary: "Worker completed without producing file changes.",
+      recommendedNextAction: "Inspect the repository and decide whether the issue needs a different prompt.",
+      artifacts: [worktreePath],
+      blockingQuestions: [],
+      outputJson: workerResult.data ?? null
+    });
+    await upsertWorkItem(session.db, session.project.id, {
+      issueNumber: workItem.issueNumber,
+      parentIssueNumber: workItem.parentIssueNumber,
+      title: workItem.title,
+      summary: workItem.summary,
+      kind: workItem.kind,
+      executionMode: "worker",
+      ownerRole: "worker",
+      status: "blocked",
+      priorityBucket: inferPriorityBucket("blocked"),
+      activeRunId: null,
+      activePrNumber: options.existingPrNumber ?? workItem.activePrNumber,
+      lastSummary: workerResult.summary
+    });
+    return;
+  }
+
+  await runCommand("git", ["add", "-A"], worktreePath);
+  await runCommand(
+    "git",
+    ["commit", "-m", `${options.existingPrNumber ? "Refine" : "Implement"} #${workItem.issueNumber}: ${workItem.title}`],
+    worktreePath
+  );
+  await runCommand("git", ["push", "-u", "origin", branchName], worktreePath);
+
+  let prNumber = options.existingPrNumber ?? null;
+  let prUrl: string | null = null;
+
+  if (!prNumber) {
+    const createdPullRequest = await createPullRequest(worktreePath, {
+      baseBranch: session.project.defaultBranch,
+      headBranch: branchName,
+      title: workItem.title,
+      body: [`Fixes #${workItem.issueNumber}`, "", workerResult.summary].join("\n")
+    });
+    prNumber = createdPullRequest.number;
+    prUrl = createdPullRequest.url;
+  }
+
+  const livePullRequest = await viewPullRequest(worktreePath, assertPresent(prNumber, "PR number missing after worker run."));
+  await upsertGitHubPullRequestMirror(session.db, session.project.id, {
+    number: livePullRequest.number,
+    title: livePullRequest.title,
+    body: livePullRequest.body,
+    state: livePullRequest.state.toLowerCase(),
+    isDraft: livePullRequest.isDraft,
+    reviewDecision: livePullRequest.reviewDecision,
+    checksBucket: livePullRequest.checksBucket,
+    headRefName: livePullRequest.headRefName,
+    baseRefName: livePullRequest.baseRefName,
+    url: livePullRequest.url,
+    linkedIssueNumbers: livePullRequest.linkedIssueNumbers,
+    updatedAt: livePullRequest.updatedAt,
+    syncedAt: nowIso()
+  });
+
+  await upsertPrCycle(session.db, session.project.id, {
+    issueNumber: workItem.issueNumber,
+    prNumber: livePullRequest.number,
+    status: "opened",
+    summary: workerResult.summary,
+    automationWindowEndsAt: new Date(Date.now() + AUTOMATION_WAIT_MS).toISOString(),
+    lastCheckedAt: nowIso(),
+    lastHandledCommentAt: null,
+    mergedAt: null
+  });
+
+  await updateRun(session, run.id, {
+    prNumber: livePullRequest.number,
+    status: "succeeded",
+    summary: workerResult.summary,
+    recommendedNextAction: "Wait through the automated review window, then continue the PR cycle.",
+    artifacts: workerResult.artifact_refs.length ? workerResult.artifact_refs : [livePullRequest.url],
+    blockingQuestions: workerResult.blocking_questions,
+    outputJson: workerResult.data ?? null
+  });
+
+  await upsertWorkItem(session.db, session.project.id, {
+    issueNumber: workItem.issueNumber,
+    parentIssueNumber: workItem.parentIssueNumber,
+    title: workItem.title,
+    summary: workItem.summary,
+    kind: workItem.kind,
+    executionMode: "worker",
+    ownerRole: "worker",
+    status: "waiting_review",
+    priorityBucket: inferPriorityBucket("waiting_review"),
+    activeRunId: null,
+    activePrNumber: livePullRequest.number,
+    lastSummary: workerResult.summary
+  });
+
+  await recordEvent(session.db, session.project.id, "work_item.pr_opened", {
+    issueNumber: workItem.issueNumber,
+    prNumber: livePullRequest.number,
+    prUrl: prUrl ?? livePullRequest.url
+  });
+}
+
+function latestUnhandledComment(
+  comments: Array<{ author: string; body: string; updatedAt: string }>,
+  lastHandledCommentAt: string | null
+): { author: string; body: string; updatedAt: string } | null {
+  const ordered = [...comments].sort((left, right) => left.updatedAt.localeCompare(right.updatedAt));
+  const latest = ordered.at(-1) ?? null;
+  if (!latest) {
+    return null;
+  }
+
+  if (!lastHandledCommentAt) {
+    return latest;
+  }
+
+  return latest.updatedAt > lastHandledCommentAt ? latest : null;
+}
+
+async function runCosReviewOnPr(
+  session: ProjectSession,
+  workItem: WorkItemRecord,
+  pr: GitHubPullRequestRecord,
+  comments: Array<{ author: string; body: string; updatedAt: string }>
+): Promise<"merge" | "changes" | "escalate"> {
+  const [diff, checks] = await Promise.all([
+    pullRequestDiff(session.project.repoPath, pr.number),
+    pullRequestChecks(session.project.repoPath, pr.number)
+  ]);
+
+  const result = await runCodexAgent(
+    {
+      role: "chief_of_staff",
+      cwd: session.project.repoPath,
+      model: session.project.model,
+      allowWrite: false,
+      prompt: [
+        `You are the Chief of Staff reviewing PR #${pr.number} for issue #${workItem.issueNumber}.`,
+        "Decide whether to merge, request changes, or escalate to the human director.",
+        "Return the verdict in `data.decision` as `merge`, `changes`, or `escalate`.",
+        "If you choose `changes`, provide concise `data.feedback` that a worker can act on.",
+        "",
+        `Issue: ${workItem.title}`,
+        "",
+        "Checks:",
+        JSON.stringify(checks, null, 2),
+        "",
+        "Recent comments:",
+        comments.length
+          ? comments.map((comment) => `- ${comment.author}: ${comment.body}`).join("\n")
+          : "No recent PR comments.",
+        "",
+        "Diff:",
+        diff.slice(0, 24_000)
+      ].join("\n")
+    },
+    {
+      status: "ok",
+      summary: `Fallback CoS review approved merge for PR #${pr.number}.`,
+      recommended_next_action: "Merge the pull request.",
+      artifact_refs: [],
+      blocking_questions: [],
+      data: {
+        decision: "merge"
+      }
+    }
+  );
+
+  const verdict = parseDataString(result.data?.decision);
+  const normalized = verdict === "changes" || verdict === "escalate" ? verdict : "merge";
+
+  await insertRun(session, {
+    workItemId: workItem.id,
+    issueNumber: workItem.issueNumber,
+    prNumber: pr.number,
+    role: "reviewer",
+    status: result.status === "failed" ? "failed" : "succeeded",
+    phase: "cos_review",
+    summary: result.summary,
+    recommendedNextAction: result.recommended_next_action,
+    artifacts: result.artifact_refs,
+    blockingQuestions: result.blocking_questions,
+    outputJson: result.data ?? null,
+    worktreePath: null
+  });
+
+  if (normalized === "changes") {
+    const feedback = parseDataString(result.data?.feedback) ?? result.summary;
+    await executeWorkerRun(session, workItem, {
+      issue: assertPresent(
+        (
+          await session.db
+            .select()
+            .from(githubIssuesTable)
+            .where(eq(githubIssuesTable.projectId, session.project.id))
+        )
+          .map(mapGitHubIssueRow)
+          .find((candidate) => candidate.number === workItem.issueNumber),
+        `Issue #${workItem.issueNumber} is missing from the local mirror.`
+      ),
+      phase: "cos_follow_up",
+      promptSuffix: feedback,
+      existingPrNumber: pr.number,
+      existingHeadRefName: pr.headRefName
+    });
+  }
+
+  if (normalized === "escalate") {
+    await createDecision(session, {
+      workItemId: workItem.id,
+      issueNumber: workItem.issueNumber,
+      prNumber: pr.number,
+      target: "human_director",
+      title: `Resolve merge judgment for PR #${pr.number}`,
+      summary: result.summary,
+      recommendation: result.recommended_next_action,
+      rationale: result.blocking_questions.join("\n") || "Chief of Staff requested a human decision."
+    });
+  }
+
+  return normalized;
+}
+
+async function processPrCycles(session: ProjectSession): Promise<boolean> {
+  const cycles = (
+    await session.db
+      .select()
+      .from(prCyclesTable)
+      .where(eq(prCyclesTable.projectId, session.project.id))
+  )
+    .map(mapPrCycleRow)
+    .filter((cycle) => cycle.status !== "merged")
+    .sort((left, right) => left.updatedAt.localeCompare(right.updatedAt));
+
+  if (!cycles.length) {
+    return false;
+  }
+
+  const workItems = (
+    await session.db
+      .select()
+      .from(workItemsTable)
+      .where(eq(workItemsTable.projectId, session.project.id))
+  ).map(mapWorkItemRow);
+  const prRows = (
+    await session.db
+      .select()
+      .from(githubPullRequestsTable)
+      .where(eq(githubPullRequestsTable.projectId, session.project.id))
+  ).map(mapGitHubPullRequestRow);
+  const commentRows = await session.db
+    .select()
+    .from(githubCommentsTable)
+    .where(eq(githubCommentsTable.projectId, session.project.id));
+
+  for (const cycle of cycles) {
+    const workItem = workItems.find((candidate) => candidate.issueNumber === cycle.issueNumber);
+    const pullRequest = prRows.find((candidate) => candidate.number === cycle.prNumber);
+    if (!workItem || !pullRequest) {
+      continue;
+    }
+
+    if (pullRequest.state.toLowerCase() !== "open") {
+      const merged = pullRequest.state.toLowerCase() === "merged";
+      await upsertPrCycle(session.db, session.project.id, {
+        issueNumber: cycle.issueNumber,
+        prNumber: cycle.prNumber,
+        status: merged ? "merged" : "blocked",
+        summary: cycle.summary,
+        automationWindowEndsAt: cycle.automationWindowEndsAt,
+        lastCheckedAt: nowIso(),
+        lastHandledCommentAt: cycle.lastHandledCommentAt,
+        mergedAt: merged ? nowIso() : cycle.mergedAt
+      });
+      await upsertWorkItem(session.db, session.project.id, {
+        issueNumber: workItem.issueNumber,
+        parentIssueNumber: workItem.parentIssueNumber,
+        title: workItem.title,
+        summary: workItem.summary,
+        kind: workItem.kind,
+        executionMode: workItem.executionMode,
+        ownerRole: workItem.ownerRole,
+        status: merged ? "completed" : "blocked",
+        priorityBucket: inferPriorityBucket(merged ? "completed" : "blocked"),
+        activeRunId: null,
+        activePrNumber: merged ? null : cycle.prNumber,
+        lastSummary: merged ? "Merged successfully." : "Pull request closed without merge."
+      });
+      return true;
+    }
+
+    if (cycle.automationWindowEndsAt && Date.now() < Date.parse(cycle.automationWindowEndsAt)) {
+      await upsertPrCycle(session.db, session.project.id, {
+        issueNumber: cycle.issueNumber,
+        prNumber: cycle.prNumber,
+        status: "waiting_automation",
+        summary: cycle.summary,
+        automationWindowEndsAt: cycle.automationWindowEndsAt,
+        lastCheckedAt: nowIso(),
+        lastHandledCommentAt: cycle.lastHandledCommentAt,
+        mergedAt: cycle.mergedAt
+      });
+      continue;
+    }
+
+    const comments = commentRows
+      .filter((candidate) => candidate.parentType === "pr" && candidate.parentNumber === cycle.prNumber)
+      .map((candidate) => ({
+        author: candidate.author,
+        body: candidate.body,
+        updatedAt: candidate.updatedAt
+      }));
+    const unhandled = latestUnhandledComment(comments, cycle.lastHandledCommentAt);
+
+    if (pullRequest.reviewDecision === "CHANGES_REQUESTED" || unhandled) {
+      const issueRows = await session.db
+        .select()
+        .from(githubIssuesTable)
+        .where(eq(githubIssuesTable.projectId, session.project.id));
+      const issue = issueRows.map(mapGitHubIssueRow).find((candidate) => candidate.number === workItem.issueNumber);
+      if (!issue) {
+        continue;
+      }
+
+      await upsertPrCycle(session.db, session.project.id, {
+        issueNumber: cycle.issueNumber,
+        prNumber: cycle.prNumber,
+        status: "changes_requested",
+        summary: unhandled?.body ? summarizeText(unhandled.body) : "Changes requested on the pull request.",
+        automationWindowEndsAt: cycle.automationWindowEndsAt,
+        lastCheckedAt: nowIso(),
+        lastHandledCommentAt: unhandled?.updatedAt ?? cycle.lastHandledCommentAt,
+        mergedAt: cycle.mergedAt
+      });
+
+      await executeWorkerRun(session, workItem, {
+        issue,
+        phase: "review_follow_up",
+        promptSuffix: unhandled?.body ?? "Review feedback was requested on the pull request.",
+        existingPrNumber: pullRequest.number,
+        existingHeadRefName: pullRequest.headRefName
+      });
+
+      await upsertPrCycle(session.db, session.project.id, {
+        issueNumber: cycle.issueNumber,
+        prNumber: cycle.prNumber,
+        status: "revalidating",
+        summary: "Worker addressed review feedback and pushed a follow-up commit.",
+        automationWindowEndsAt: new Date(Date.now() + AUTOMATION_WAIT_MS).toISOString(),
+        lastCheckedAt: nowIso(),
+        lastHandledCommentAt: unhandled?.updatedAt ?? cycle.lastHandledCommentAt,
+        mergedAt: cycle.mergedAt
+      });
+      return true;
+    }
+
+    if (!pullRequest.checksBucket || pullRequest.checksBucket === "pending") {
+      await upsertPrCycle(session.db, session.project.id, {
+        issueNumber: cycle.issueNumber,
+        prNumber: cycle.prNumber,
+        status: "waiting_automation",
+        summary: "Waiting for checks to settle.",
+        automationWindowEndsAt: cycle.automationWindowEndsAt,
+        lastCheckedAt: nowIso(),
+        lastHandledCommentAt: cycle.lastHandledCommentAt,
+        mergedAt: cycle.mergedAt
+      });
+      continue;
+    }
+
+    if (pullRequest.checksBucket === "fail") {
+      await createDecision(session, {
+        workItemId: workItem.id,
+        issueNumber: workItem.issueNumber,
+        prNumber: pullRequest.number,
+        target: "human_director",
+        title: `Investigate failing checks on PR #${pullRequest.number}`,
+        summary: "Automated checks failed and need human judgment or a deeper fix.",
+        recommendation: "Inspect the failing GitHub checks and decide whether to retry or narrow scope.",
+        rationale: "The current MVP does not yet fetch full CI logs for autonomous remediation."
+      });
+      await upsertPrCycle(session.db, session.project.id, {
+        issueNumber: cycle.issueNumber,
+        prNumber: cycle.prNumber,
+        status: "blocked",
+        summary: "Checks failed and were escalated.",
+        automationWindowEndsAt: cycle.automationWindowEndsAt,
+        lastCheckedAt: nowIso(),
+        lastHandledCommentAt: cycle.lastHandledCommentAt,
+        mergedAt: cycle.mergedAt
+      });
+      return true;
+    }
+
+    await upsertPrCycle(session.db, session.project.id, {
+      issueNumber: cycle.issueNumber,
+      prNumber: cycle.prNumber,
+      status: "cos_review",
+      summary: "Checks passed. Chief of Staff is reviewing merge readiness.",
+      automationWindowEndsAt: cycle.automationWindowEndsAt,
+      lastCheckedAt: nowIso(),
+      lastHandledCommentAt: cycle.lastHandledCommentAt,
+      mergedAt: cycle.mergedAt
+    });
+
+    const verdict = await runCosReviewOnPr(session, workItem, pullRequest, comments);
+    if (verdict === "merge") {
+      await mergePullRequest(session.project.repoPath, pullRequest.number);
+      await upsertPrCycle(session.db, session.project.id, {
+        issueNumber: cycle.issueNumber,
+        prNumber: cycle.prNumber,
+        status: "merged",
+        summary: "Chief of Staff merged the pull request.",
+        automationWindowEndsAt: cycle.automationWindowEndsAt,
+        lastCheckedAt: nowIso(),
+        lastHandledCommentAt: cycle.lastHandledCommentAt,
+        mergedAt: nowIso()
+      });
+      await upsertWorkItem(session.db, session.project.id, {
+        issueNumber: workItem.issueNumber,
+        parentIssueNumber: workItem.parentIssueNumber,
+        title: workItem.title,
+        summary: workItem.summary,
+        kind: workItem.kind,
+        executionMode: workItem.executionMode,
+        ownerRole: workItem.ownerRole,
+        status: "completed",
+        priorityBucket: inferPriorityBucket("completed"),
+        activeRunId: null,
+        activePrNumber: null,
+        lastSummary: "Merged by Chief of Staff."
+      });
+    } else if (verdict === "escalate") {
+      await upsertPrCycle(session.db, session.project.id, {
+        issueNumber: cycle.issueNumber,
+        prNumber: cycle.prNumber,
+        status: "blocked",
+        summary: "Chief of Staff escalated merge judgment.",
+        automationWindowEndsAt: cycle.automationWindowEndsAt,
+        lastCheckedAt: nowIso(),
+        lastHandledCommentAt: cycle.lastHandledCommentAt,
+        mergedAt: cycle.mergedAt
+      });
+    }
+    return true;
+  }
+
+  return false;
+}
+
+async function processNextQueueItem(session: ProjectSession): Promise<boolean> {
+  const next = await chooseNextWorkItem(session);
+  if (!next) {
+    const expanded = await maybeExpandNotesIntoIssues(session);
+    if (expanded) {
+      return true;
+    }
+
+    const openDecisions = (
+      await session.db
+        .select()
+        .from(decisionsTable)
+        .where(eq(decisionsTable.projectId, session.project.id))
+    )
+      .map(mapDecisionRow)
+      .filter((decision) => decision.status === "open" && decision.title === "No queueable work remains");
+    if (!openDecisions.length) {
+      await createDecision(session, {
+        workItemId: null,
+        issueNumber: null,
+        prNumber: null,
+        target: "human_director",
+        title: "No queueable work remains",
+        summary: "The backlog is empty and the Chief of Staff could not expand any active notes.",
+        recommendation: "Add a new director note or create fresh GitHub issues.",
+        rationale: "Director OS ran out of safe autonomous work."
+      });
+    }
+    return false;
+  }
+
+  if (next.executionMode === "lane") {
+    await planLaneWork(session, next);
+    return true;
+  }
+
+  const issueRows = await session.db
+    .select()
+    .from(githubIssuesTable)
+    .where(eq(githubIssuesTable.projectId, session.project.id));
+  const issue = issueRows.map(mapGitHubIssueRow).find((candidate) => candidate.number === next.issueNumber);
+  if (!issue) {
+    return false;
+  }
+
+  await executeWorkerRun(session, next, {
+    issue,
+    phase: "implementation"
+  });
+  return true;
+}
+
+async function runOrchestratorIteration(): Promise<boolean> {
+  return withProject(async (session) => {
+    const orchestrator = await ensureOrchestratorRow(session);
+    if (orchestrator.status !== "running") {
+      return false;
+    }
+
+    try {
+      await syncProjectInternal(session);
+      const handledPrCycle = await processPrCycles(session);
+      const handledQueue = handledPrCycle ? true : await processNextQueueItem(session);
+      await setOrchestratorState(session, "running", {
+        lastLoopAt: nowIso(),
+        lastSummary: handledPrCycle
+          ? "Processed an active PR cycle."
+          : handledQueue
+            ? "Processed the next queued work item."
+            : "No autonomous work was available this cycle."
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      await setOrchestratorState(session, "blocked", {
+        lastLoopAt: nowIso(),
+        lastSummary: message
+      });
+      await createDecision(session, {
+        workItemId: null,
+        issueNumber: null,
+        prNumber: null,
+        target: "human_director",
+        title: "Orchestrator blocked",
+        summary: message,
+        recommendation: "Inspect the latest run and local environment, then restart the orchestrator.",
+        rationale: "The background loop hit an unexpected error."
+      });
+      return false;
+    }
+
+    const refreshed = await ensureOrchestratorRow(session);
+    return refreshed.status === "running";
+  });
+}
+
+function scheduleOrchestratorLoop(delayMs = 0): void {
+  if (orchestratorTimer) {
+    clearTimeout(orchestratorTimer);
+  }
+
+  orchestratorTimer = setTimeout(() => {
+    orchestratorTimer = null;
+    void ensureOrchestratorLoop();
+  }, delayMs);
+}
+
+async function ensureOrchestratorLoop(): Promise<void> {
+  if (orchestratorRunning) {
+    return;
+  }
+
+  orchestratorRunning = true;
+  try {
+    const shouldContinue = await runOrchestratorIteration();
+    if (shouldContinue) {
+      scheduleOrchestratorLoop(LOOP_INTERVAL_MS);
+    }
+  } finally {
+    orchestratorRunning = false;
   }
 }
 
@@ -1543,984 +2820,261 @@ export async function initDirector(options: InitCommandOptions = {}) {
       }
     }
 
-    const projectName =
-      options.projectName ?? discoveredDraft?.projectName ?? detected?.name ?? path.basename(repoPath);
     const finalDraft: SetupRepositoryDraft = {
       repoPath,
-      projectName,
-      repoSlug: options.repoSlug ?? discoveredDraft?.repoSlug ?? detected?.repoSlug ?? "",
+      projectName:
+        options.projectName?.trim() ||
+        discoveredDraft?.projectName ||
+        detected?.name ||
+        path.basename(repoPath),
+      repoSlug:
+        options.repoSlug?.trim() || discoveredDraft?.repoSlug || detected?.repoSlug || "",
       defaultBranch:
-        options.defaultBranch ?? discoveredDraft?.defaultBranch ?? detected?.defaultBranch ?? "",
-      worktreeRoot: path.resolve(
-        options.worktreeRoot ?? discoveredDraft?.worktreeRoot ?? path.join(paths.worktreesDir, slugify(projectName))
-      ),
-      agentRunner: options.agentRunner ?? discoveredDraft?.agentRunner ?? "codex",
-      model: options.model ?? discoveredDraft?.model ?? "gpt-5.4"
+        options.defaultBranch?.trim() ||
+        discoveredDraft?.defaultBranch ||
+        detected?.defaultBranch ||
+        "main",
+      worktreeRoot:
+        options.worktreeRoot?.trim() ||
+        discoveredDraft?.worktreeRoot ||
+        path.join(paths.worktreesDir, slugify(options.projectName || discoveredDraft?.projectName || path.basename(repoPath))),
+      agentRunner: options.agentRunner?.trim() || discoveredDraft?.agentRunner || "codex",
+      model: options.model?.trim() || discoveredDraft?.model || "gpt-5.4"
     };
 
-    if (!finalDraft.repoSlug || !finalDraft.defaultBranch) {
-      throw new Error(
-        "Could not determine the GitHub repo slug and default branch. Pass them explicitly."
-      );
-    }
-
-    if (!options.skipGhCheck) {
-      const readiness = await evaluateSetupState(session, {
-        activeProject: await getActiveProjectFromRuntime(session),
-        repositoryDraft: finalDraft,
-        runWorkspace: true
-      });
-      const blocking = readiness.checks.filter((check) => check.status !== "ready");
-
-      if (blocking.length) {
-        throw new Error(blocking.map((check) => `${check.title}: ${check.detail}`).join(" "));
-      }
-    }
-
-    const storedProject = await persistProjectRegistration(session, finalDraft);
-
-    return {
-      ok: true,
-      paths: session.paths,
-      project: storedProject
-    };
-  });
-}
-
-export async function getHomeOverview(): Promise<HomeOverview> {
-  return withRuntime(async (session) => {
-    const slug = session.config.activeProjectSlug;
-
-    if (!slug) {
-      return emptyOverview();
-    }
-
-    const rows = await session.db
-      .select()
-      .from(projectsTable)
-      .where(eq(projectsTable.slug, slug))
-      .limit(1);
-    const projectRow = rows[0];
-
-    if (!projectRow) {
-      return emptyOverview();
-    }
-
-    const project = mapProjectRow(projectRow);
-    const [briefRows, taskRows, issueRows, prRows, runRows] = await Promise.all([
-      session.db
-        .select()
-        .from(briefsTable)
-        .where(eq(briefsTable.projectId, project.id))
-        .orderBy(desc(briefsTable.updatedAt)),
-      session.db
-        .select()
-        .from(directorTasksTable)
-        .where(eq(directorTasksTable.projectId, project.id))
-        .orderBy(desc(directorTasksTable.updatedAt)),
-      session.db
-        .select()
-        .from(githubIssuesTable)
-        .where(eq(githubIssuesTable.projectId, project.id))
-        .orderBy(desc(githubIssuesTable.updatedAt)),
-      session.db
-        .select()
-        .from(githubPullRequestsTable)
-        .where(eq(githubPullRequestsTable.projectId, project.id))
-        .orderBy(desc(githubPullRequestsTable.updatedAt)),
-      session.db
-        .select()
-        .from(agentRunsTable)
-        .where(eq(agentRunsTable.projectId, project.id))
-        .orderBy(desc(agentRunsTable.updatedAt))
-    ]);
-
-    const briefs = briefRows.map(mapBriefRow);
-    const tasks = taskRows.map(mapTaskRow);
-    const issues = issueRows.map(mapIssueRow);
-    const pullRequests = prRows.map(mapPullRequestRow);
-    const recentRuns = runRows.map(mapAgentRunRow);
-
-    return {
-      project,
-      counts: {
-        pendingDirectorTasks: tasks.filter((task) => task.status !== "resolved").length,
-        activeBriefs: briefs.filter((brief) => brief.status !== "rejected" && brief.status !== "superseded").length,
-        readyIssues: issues.filter((issue) => issue.workflowState === "ready").length,
-        inReviewIssues: issues.filter((issue) => issue.workflowState === "in_review").length,
-        openPullRequests: pullRequests.filter((pr) => pr.state === "open").length
-      },
-      pendingTasks: tasks.filter((task) => task.status !== "resolved").slice(0, 6),
-      activeIssues: issues.filter((issue) => issue.state === "open").slice(0, 8),
-      openPullRequests: pullRequests.filter((pr) => pr.state === "open").slice(0, 6),
-      recentRuns: recentRuns.slice(0, 6),
-      latestBrief: briefs[0] ?? null
-    };
-  });
-}
-
-export async function getInbox(): Promise<InboxResponse> {
-  return withRuntime(async (session) => {
-    const slug = session.config.activeProjectSlug;
-
-    if (!slug) {
-      return {
-        tasks: []
-      };
-    }
-
-    const projectRows = await session.db
-      .select()
-      .from(projectsTable)
-      .where(eq(projectsTable.slug, slug))
-      .limit(1);
-    const projectRow = projectRows[0];
-
-    if (!projectRow) {
-      return {
-        tasks: []
-      };
-    }
-
-    const tasks = await session.db
-      .select()
-      .from(directorTasksTable)
-      .where(eq(directorTasksTable.projectId, projectRow.id))
-      .orderBy(desc(directorTasksTable.updatedAt));
-
-    return {
-      tasks: tasks.map(mapTaskRow).filter((task) => task.status !== "resolved")
-    };
-  });
-}
-
-export async function getIntakeState(): Promise<IntakeResponse> {
-  return withRuntime(async (session) => {
-    const slug = session.config.activeProjectSlug;
-
-    if (!slug) {
-      return {
-        project: null,
-        brief: null
-      };
-    }
-
-    const projectRows = await session.db
-      .select()
-      .from(projectsTable)
-      .where(eq(projectsTable.slug, slug))
-      .limit(1);
-    const projectRow = projectRows[0];
-
-    if (!projectRow) {
-      return {
-        project: null,
-        brief: null
-      };
-    }
-
-    return {
-      project: mapProjectRow(projectRow),
-      brief: await getLatestBrief(session.db, projectRow.id)
-    };
-  });
-}
-
-export async function syncProject() {
-  return withProject(async (session) => {
-    const syncedAt = nowIso();
-    const [issues, pullRequests, comments] = await Promise.all([
-      listIssues(session.project.repoSlug),
-      listPullRequests(session.project.repoSlug),
-      listComments(session.project.repoSlug)
-    ]);
-
-    for (const issue of issues) {
-      await upsertIssueMirror(session.db, session.project.id, {
-        number: issue.number,
-        title: issue.title,
-        body: issue.body,
-        state: issue.state.toLowerCase(),
-        workflowState: deriveWorkflowState(issue.labels, issue.state),
-        labels: issue.labels,
-        url: issue.url,
-        updatedAt: issue.updatedAt,
-        syncedAt
-      });
-    }
-
-    for (const pullRequest of pullRequests) {
-      await upsertPullRequestMirror(session.db, session.project.id, {
-        number: pullRequest.number,
-        title: pullRequest.title,
-        body: pullRequest.body,
-        state: pullRequest.state.toLowerCase(),
-        isDraft: pullRequest.isDraft,
-        reviewDecision: pullRequest.reviewDecision,
-        checksBucket: pullRequest.checksBucket,
-        headRefName: pullRequest.headRefName,
-        baseRefName: pullRequest.baseRefName,
-        url: pullRequest.url,
-        linkedIssueNumbers: pullRequest.linkedIssueNumbers,
-        updatedAt: pullRequest.updatedAt,
-        syncedAt
-      });
-    }
-
-    for (const comment of comments) {
-      await upsertCommentMirror(session.db, session.project.id, {
-        ...comment,
-        syncedAt
-      });
-    }
-
-    await recordEvent(session.db, session.project.id, "github.synced", {
-      issues: issues.length,
-      pullRequests: pullRequests.length,
-      comments: comments.length
+    const status = await evaluateSetupState(session, {
+      activeProject: null,
+      repositoryDraft: finalDraft,
+      runWorkspace: true
     });
 
+    if (!status.canComplete) {
+      const blocking = status.checks
+        .filter((candidate) => candidate.status !== "ready")
+        .map((candidate) => `${candidate.title}: ${candidate.detail}`)
+        .join(" ");
+      throw new Error(blocking || "Director OS could not be initialized.");
+    }
+
+    const project = await persistProjectRegistration(session, finalDraft);
     return {
       ok: true,
-      syncedAt,
-      counts: {
-        issues: issues.length,
-        pullRequests: pullRequests.length,
-        comments: comments.length
-      }
+      paths,
+      project
     };
   });
 }
 
-export async function submitIntakeMessage(content: string): Promise<BriefRecord> {
+export async function syncProject(): Promise<DirectorOperationResponse> {
+  return withProject(async (session) => syncProjectInternal(session));
+}
+
+export async function getDirectorStatus(): Promise<DirectorStatusResponse> {
   return withProject(async (session) => {
-    const latestBrief = await getLatestBrief(session.db, session.project.id);
-    const reusable =
-      latestBrief &&
-      latestBrief.status !== "approved" &&
-      latestBrief.status !== "rejected" &&
-      latestBrief.status !== "superseded"
-        ? latestBrief
-        : null;
+    const orchestrator = await ensureOrchestratorRow(session);
+    if (orchestrator.status === "running" && !orchestratorTimer && !orchestratorRunning) {
+      scheduleOrchestratorLoop(0);
+    }
+
+    const [workItemRows, decisionRows, prCycleRows, runRows, noteRows, prRows] = await Promise.all([
+      session.db.select().from(workItemsTable).where(eq(workItemsTable.projectId, session.project.id)),
+      session.db.select().from(decisionsTable).where(eq(decisionsTable.projectId, session.project.id)),
+      session.db.select().from(prCyclesTable).where(eq(prCyclesTable.projectId, session.project.id)),
+      session.db.select().from(runsTable).where(eq(runsTable.projectId, session.project.id)),
+      session.db.select().from(directorNotesTable).where(eq(directorNotesTable.projectId, session.project.id)),
+      session.db.select().from(githubPullRequestsTable).where(eq(githubPullRequestsTable.projectId, session.project.id))
+    ]);
+
+    const workItems = workItemRows.map(mapWorkItemRow);
+    return {
+      project: session.project,
+      orchestrator,
+      queue: workItems
+        .filter((workItem) => ["queued", "ready", "planning"].includes(workItem.status))
+        .sort((left, right) => left.priorityBucket - right.priorityBucket || left.issueNumber - right.issueNumber),
+      activeWork: workItems
+        .filter((workItem) => ["running", "waiting_review", "waiting_decision"].includes(workItem.status))
+        .sort((left, right) => left.issueNumber - right.issueNumber),
+      decisions: decisionRows
+        .map(mapDecisionRow)
+        .filter((decision) => decision.status === "open")
+        .sort((left, right) => left.createdAt.localeCompare(right.createdAt)),
+      prCycles: prCycleRows
+        .map(mapPrCycleRow)
+        .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
+        .slice(0, 10),
+      recentRuns: runRows
+        .map(mapRunRow)
+        .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
+        .slice(0, 12),
+      notes: noteRows
+        .map(mapNoteRow)
+        .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
+        .slice(0, 10),
+      openPullRequests: prRows
+        .map(mapGitHubPullRequestRow)
+        .filter((pullRequest) => pullRequest.state.toLowerCase() === "open")
+        .sort((left, right) => left.number - right.number)
+    };
+  });
+}
+
+export async function listDecisions(): Promise<DecisionsResponse> {
+  return withProject(async (session) => {
+    const rows = await session.db
+      .select()
+      .from(decisionsTable)
+      .where(eq(decisionsTable.projectId, session.project.id));
+    return {
+      decisions: rows
+        .map(mapDecisionRow)
+        .filter((decision) => decision.status === "open")
+        .sort((left, right) => left.createdAt.localeCompare(right.createdAt))
+    };
+  });
+}
+
+export async function submitDirectorNote(content: string): Promise<DirectorNoteRecord> {
+  const trimmed = content.trim();
+  if (!trimmed) {
+    throw new Error("Director note cannot be empty.");
+  }
+
+  return withProject(async (session) => {
     const timestamp = nowIso();
-    const baseTranscript = reusable?.transcript ?? [];
-    const transcript: IntakeMessage[] = [
-      ...baseTranscript,
-      {
-        role: "director",
-        content,
-        createdAt: timestamp
-      }
-    ];
-
-    const fallbackDraft = synthesizeBriefDraft(transcript);
-    const chiefOfStaffFallback: AgentResultEnvelope = {
-      status: "ok",
-      summary: summarizeBrief(fallbackDraft),
-      recommended_next_action: "Approve, revise, or reject the draft brief.",
-      artifact_refs: [],
-      blocking_questions: [],
-      data: {
-        brief: fallbackDraft
-      }
-    };
-
-    const envelope = await runCodexAgent(
-      {
-        role: "chief_of_staff",
-        cwd: session.project.repoPath,
-        model: session.project.model,
-        prompt: [
-          "You are the chief of staff for Director OS.",
-          "Convert the intake conversation into a concise product brief.",
-          "Return JSON with a `data.brief` object containing title, problem, targetUser, desiredOutcome, constraints, nonGoals, and successMetrics.",
-          "Also provide a short summary and the next recommended action.",
-          "",
-          transcript
-            .map((entry) => `${entry.role === "director" ? "Director" : "Chief of staff"}: ${entry.content}`)
-            .join("\n")
-        ].join("\n")
-      },
-      chiefOfStaffFallback
-    );
-
-    const draft = parseBriefDraftCandidate(envelope.data?.brief, fallbackDraft);
-    const summary = envelope.summary || summarizeBrief(draft);
-    const nextTranscript: IntakeMessage[] = [
-      ...transcript,
-      {
-        role: "chief_of_staff",
-        content: summary,
-        createdAt: nowIso()
-      }
-    ];
-
-    let brief: BriefRecord;
-
-    if (reusable) {
-      await session.db
-        .update(briefsTable)
-        .set({
-          title: draft.title,
-          status: "awaiting_approval",
-          summary,
-          draft: asJson(draft),
-          transcript: asJson(nextTranscript),
-          updatedAt: nowIso()
-        })
-        .where(eq(briefsTable.id, reusable.id));
-
-      brief = assertPresent(
-        await getBriefById(session.db, session.project.id, reusable.id),
-        `Brief ${reusable.id} disappeared after update.`
-      );
-    } else {
-      const inserted = await session.db
-        .insert(briefsTable)
-        .values({
-          projectId: session.project.id,
-          title: draft.title,
-          status: "awaiting_approval",
-          summary,
-          draft: asJson(draft),
-          transcript: asJson(nextTranscript),
-          githubEpicNumber: null,
-          createdAt: timestamp,
-          updatedAt: timestamp
-        })
-        .returning();
-
-      brief = mapBriefRow(assertPresent(inserted[0], "Failed to create a brief."));
-    }
-
-    await ensureDirectorTask(session.db, {
+    const result = await session.db.insert(directorNotesTable).values({
       projectId: session.project.id,
-      briefId: brief.id,
-      kind: "approve_brief",
-      title: `Approve brief: ${brief.draft.title}`,
-      description: summary,
-      recommendation: envelope.recommended_next_action,
-      status: "ready_for_director",
-      payload: {}
-    });
-
-    await insertAgentRun(session.db, {
-      projectId: session.project.id,
-      role: "chief_of_staff",
-      targetType: "brief",
-      targetId: String(brief.id),
-      status: envelope.status === "failed" ? "failed" : envelope.status === "needs_input" ? "needs_input" : "succeeded",
-      inputSummary: content,
-      outputSummary: summary,
-      outputJson: envelope.data ?? null,
-      workingDirectory: session.project.repoPath,
-      createdAt: nowIso(),
-      updatedAt: nowIso()
-    });
-
-    await recordEvent(session.db, session.project.id, "brief.intake_updated", {
-      briefId: brief.id
-    });
-
-    return brief;
-  });
-}
-
-export async function actOnBrief(
-  briefId: number,
-  action: BriefAction
-): Promise<BriefRecord> {
-  return withProject(async (session) => {
-    const brief = await getBriefById(session.db, session.project.id, briefId);
-
-    if (!brief) {
-      throw new Error(`Brief ${briefId} was not found.`);
-    }
-
-    if (action === "revise") {
-      await session.db
-        .update(briefsTable)
-        .set({
-          status: "draft",
-          updatedAt: nowIso()
-        })
-        .where(eq(briefsTable.id, brief.id));
-
-      await resolveDirectorTasksForBrief(session.db, session.project.id, brief.id);
-
-      return assertPresent(
-        await getBriefById(session.db, session.project.id, brief.id),
-        `Brief ${brief.id} disappeared after revision.`
-      );
-    }
-
-    if (action === "reject") {
-      await session.db
-        .update(briefsTable)
-        .set({
-          status: "rejected",
-          updatedAt: nowIso()
-        })
-        .where(eq(briefsTable.id, brief.id));
-
-      await resolveDirectorTasksForBrief(session.db, session.project.id, brief.id);
-
-      return assertPresent(
-        await getBriefById(session.db, session.project.id, brief.id),
-        `Brief ${brief.id} disappeared after rejection.`
-      );
-    }
-
-    const fallbackPlans = fallbackIssuePlans(brief);
-    const planEnvelope = await runCodexAgent(
-      {
-        role: "spec",
-        cwd: session.project.repoPath,
-        model: session.project.model,
-        prompt: [
-          "You are the decomposition agent for Director OS.",
-          "Break the approved brief into 3 to 5 implementation issues.",
-          "Return them under `data.issues` as objects with title, body, acceptance, and workflowState.",
-          "",
-          buildEpicBody(brief)
-        ].join("\n")
-      },
-      {
-        status: "ok",
-        summary: `Created ${fallbackPlans.length} MVP issue slices.`,
-        recommended_next_action: "Create the epic and child issues in GitHub.",
-        artifact_refs: [],
-        blocking_questions: [],
-        data: {
-          issues: fallbackPlans
-        }
-      }
-    );
-
-    const issuePlans = parseIssuePlans(planEnvelope.data?.issues, brief);
-    const epicBody = buildEpicBody(brief);
-    const epicRemote = await createIssue(session.project.repoSlug, {
-      title: `Epic: ${brief.draft.title}`,
-      body: epicBody,
-      labels: [`${DIRECTOR_LABEL_PREFIX}epic`, workflowLabel("draft")]
-    });
-
-    const syncedAt = nowIso();
-
-    await upsertIssueMirror(session.db, session.project.id, {
-      number: epicRemote.number,
-      title: `Epic: ${brief.draft.title}`,
-      body: epicBody,
-      state: "open",
-      workflowState: "draft",
-      labels: [`${DIRECTOR_LABEL_PREFIX}epic`, workflowLabel("draft")],
-      url: epicRemote.url,
-      updatedAt: syncedAt,
-      syncedAt
-    });
-
-    const childNumbers: number[] = [];
-
-    for (const plan of issuePlans) {
-      const body = buildIssueBody(brief, plan);
-      const labels = [`${DIRECTOR_LABEL_PREFIX}task`, workflowLabel(plan.workflowState)];
-      const remoteIssue = await createIssue(session.project.repoSlug, {
-        title: plan.title,
-        body,
-        labels
-      });
-
-      childNumbers.push(remoteIssue.number);
-      await upsertIssueMirror(session.db, session.project.id, {
-        number: remoteIssue.number,
-        title: plan.title,
-        body,
-        state: "open",
-        workflowState: plan.workflowState,
-        labels,
-        url: remoteIssue.url,
-        updatedAt: syncedAt,
-        syncedAt
-      });
-    }
-
-    await session.db
-      .update(briefsTable)
-      .set({
-        title: brief.draft.title,
-        status: "approved",
-        githubEpicNumber: epicRemote.number,
-        updatedAt: nowIso()
-      })
-      .where(eq(briefsTable.id, brief.id));
-
-    await session.db.insert(epicsTable).values({
-      projectId: session.project.id,
-      briefId: brief.id,
-      title: brief.draft.title,
-      summary: brief.summary,
+      content: trimmed,
       status: "active",
-      githubIssueNumber: epicRemote.number,
-      childIssueNumbers: asJson(childNumbers),
-      createdAt: nowIso(),
-      updatedAt: nowIso()
+      createdAt: timestamp,
+      updatedAt: timestamp
     });
-
-    await resolveDirectorTasksForBrief(session.db, session.project.id, brief.id);
-
-    await insertAgentRun(session.db, {
-      projectId: session.project.id,
-      role: "spec",
-      targetType: "brief",
-      targetId: String(brief.id),
-      status: planEnvelope.status === "failed" ? "failed" : "succeeded",
-      inputSummary: brief.summary,
-      outputSummary: planEnvelope.summary,
-      outputJson: planEnvelope.data ?? null,
-      workingDirectory: session.project.repoPath,
-      createdAt: nowIso(),
-      updatedAt: nowIso()
+    await recordEvent(session.db, session.project.id, "director_note.created", {
+      content: trimmed
     });
-
-    await recordEvent(session.db, session.project.id, "brief.approved", {
-      briefId: brief.id,
-      epicIssueNumber: epicRemote.number,
-      childIssueNumbers: childNumbers
-    });
-
-    return assertPresent(
-      await getBriefById(session.db, session.project.id, brief.id),
-      `Brief ${brief.id} disappeared after approval.`
-    );
+    const row = await session.db
+      .select()
+      .from(directorNotesTable)
+      .where(eq(directorNotesTable.id, Number(result.lastInsertRowid)))
+      .limit(1);
+    const note = mapNoteRow(assertPresent(row[0], "Director note missing after insert."));
+    const orchestrator = await ensureOrchestratorRow(session);
+    if (orchestrator.status === "running" && !orchestratorTimer && !orchestratorRunning) {
+      scheduleOrchestratorLoop(0);
+    }
+    return note;
   });
 }
 
-export async function actOnTask(
-  taskId: number,
-  _action: DirectorTaskAction
-): Promise<DirectorTaskRecord> {
+export async function resolveDecision(
+  decisionId: number,
+  resolution: string
+): Promise<DecisionRecord> {
+  const trimmed = resolution.trim();
+  if (!trimmed) {
+    throw new Error("Resolution cannot be empty.");
+  }
+
   return withProject(async (session) => {
     const rows = await session.db
       .select()
-      .from(directorTasksTable)
-      .where(and(eq(directorTasksTable.projectId, session.project.id), eq(directorTasksTable.id, taskId)))
+      .from(decisionsTable)
+      .where(eq(decisionsTable.id, decisionId))
       .limit(1);
-    const row = rows[0];
-
-    if (!row) {
-      throw new Error(`Director task ${taskId} was not found.`);
-    }
+    const row = assertPresent(rows[0], `Decision ${decisionId} was not found.`);
 
     await session.db
-      .update(directorTasksTable)
+      .update(decisionsTable)
       .set({
         status: "resolved",
+        resolution: trimmed,
         updatedAt: nowIso()
       })
-      .where(eq(directorTasksTable.id, taskId));
+      .where(eq(decisionsTable.id, decisionId));
 
-    await recordEvent(session.db, session.project.id, "director_task.resolved", {
-      taskId
-    });
-
-    const updatedRows = await session.db
-      .select()
-      .from(directorTasksTable)
-      .where(eq(directorTasksTable.id, taskId))
-      .limit(1);
-
-    return mapTaskRow(assertPresent(updatedRows[0], `Director task ${taskId} vanished.`));
-  });
-}
-
-export async function runIssueWorkflow(issueNumber: number): Promise<DirectorOperationResponse> {
-  return withProject(async (session) => {
-    const issue = assertPresent(
-      await getIssueByNumber(session.db, session.project.id, issueNumber),
-      `Issue #${issueNumber} was not found in the local mirror. Run \`director sync\` first.`
-    );
-
-    const activeIssue =
-      issue.workflowState === "ready" || issue.workflowState === "draft"
-        ? await updateIssueWorkflow(session, issue, "in_progress")
-        : issue;
-    const branchName = `codex/issue-${issueNumber}-${slugify(issue.title).slice(0, 36)}`;
-    const worktreePath = path.join(session.project.worktreeRoot, `issue-${issueNumber}`);
-    const timestamp = nowIso();
-
-    await ensureWorktree(session.project, issueNumber, branchName, worktreePath);
-
-    const existingWorktreeRows = await session.db
-      .select()
-      .from(worktreesTable)
-      .where(eq(worktreesTable.path, worktreePath))
-      .limit(1);
-
-    if (existingWorktreeRows[0]) {
-      await session.db
-        .update(worktreesTable)
-        .set({
-          issueNumber,
-          branchName,
-          status: "active",
-          updatedAt: timestamp
-        })
-        .where(eq(worktreesTable.id, existingWorktreeRows[0].id));
-    } else {
-      await session.db.insert(worktreesTable).values({
-        projectId: session.project.id,
-        issueNumber,
-        branchName,
-        path: worktreePath,
-        status: "active",
-        createdAt: timestamp,
-        updatedAt: timestamp
-      });
-    }
-
-    const executorFallback: AgentResultEnvelope = {
-      status: "needs_input",
-      summary: `Executor prompt prepared for issue #${issueNumber}.`,
-      recommended_next_action: "Inspect the worktree changes, run tests, and open a pull request if work was produced.",
-      artifact_refs: [worktreePath],
-      blocking_questions: []
-    };
-
-    const executorResult = await runCodexAgent(
-      {
-        role: "executor",
-        cwd: worktreePath,
-        model: session.project.model,
-        allowWrite: true,
-        prompt: [
-          `Implement GitHub issue #${issue.number}: ${issue.title}.`,
-          "Read the issue body, make the necessary code changes, and leave the repo in a committable state.",
-          "Prefer small, coherent edits and update tests when appropriate.",
-          "",
-          issue.body
-        ].join("\n")
-      },
-      executorFallback
-    );
-
-    try {
-      await maybeRunPackageScript(worktreePath, "test");
-      await maybeRunPackageScript(worktreePath, "build");
-    } catch (error) {
-      await insertAgentRun(session.db, {
-        projectId: session.project.id,
-        role: "executor",
-        targetType: "issue",
-        targetId: String(issue.number),
-        status: "failed",
-        inputSummary: issue.title,
-        outputSummary: `Validation failed: ${error instanceof Error ? error.message : String(error)}`,
-        outputJson: executorResult.data ?? null,
-        workingDirectory: worktreePath,
-        createdAt: nowIso(),
-        updatedAt: nowIso()
-      });
-      throw error;
-    }
-
-    const statusOutput = await runCommand("git", ["status", "--porcelain"], worktreePath);
-
-    if (!statusOutput.trim()) {
-      await insertAgentRun(session.db, {
-        projectId: session.project.id,
-        role: "executor",
-        targetType: "issue",
-        targetId: String(issue.number),
-        status: "needs_input",
-        inputSummary: issue.title,
-        outputSummary: "Executor completed without producing file changes.",
-        outputJson: executorResult.data ?? null,
-        workingDirectory: worktreePath,
-        createdAt: nowIso(),
-        updatedAt: nowIso()
-      });
-
-      return {
-        ok: true,
-        issueNumber,
-        branchName,
-        worktreePath,
-        changed: false
-      };
-    }
-
-    await runCommand("git", ["add", "-A"], worktreePath);
-    await runCommand(
-      "git",
-      ["commit", "-m", `Implement #${issue.number}: ${issue.title}`],
-      worktreePath
-    );
-    await runCommand("git", ["push", "-u", "origin", branchName], worktreePath);
-
-    const prTitle = `${issue.title}`;
-    const prBody = [
-      `Implements #${issue.number}`,
-      "",
-      `Fixes #${issue.number}`,
-      "",
-      executorResult.summary
-    ].join("\n");
-    const createdPullRequest = await createPullRequest(worktreePath, {
-      baseBranch: session.project.defaultBranch,
-      headBranch: branchName,
-      title: prTitle,
-      body: prBody
-    });
-    const livePullRequest = await viewPullRequest(worktreePath, createdPullRequest.number);
-
-    await upsertPullRequestMirror(session.db, session.project.id, {
-      number: livePullRequest.number,
-      title: livePullRequest.title,
-      body: livePullRequest.body,
-      state: livePullRequest.state.toLowerCase(),
-      isDraft: livePullRequest.isDraft,
-      reviewDecision: livePullRequest.reviewDecision,
-      checksBucket: livePullRequest.checksBucket,
-      headRefName: livePullRequest.headRefName,
-      baseRefName: livePullRequest.baseRefName,
-      url: livePullRequest.url,
-      linkedIssueNumbers: livePullRequest.linkedIssueNumbers,
-      updatedAt: livePullRequest.updatedAt,
-      syncedAt: nowIso()
-    });
-
-    await updateIssueWorkflow(session, activeIssue, "in_review");
-
-    await insertAgentRun(session.db, {
-      projectId: session.project.id,
-      role: "executor",
-      targetType: "issue",
-      targetId: String(issue.number),
-      status: executorResult.status === "failed" ? "failed" : "succeeded",
-      inputSummary: issue.title,
-      outputSummary: executorResult.summary,
-      outputJson: executorResult.data ?? null,
-      workingDirectory: worktreePath,
-      createdAt: nowIso(),
-      updatedAt: nowIso()
-    });
-
-    await recordEvent(session.db, session.project.id, "issue.pr_opened", {
-      issueNumber: issue.number,
-      prNumber: createdPullRequest.number,
-      branchName
-    });
-
-    return {
-      ok: true,
-      issueNumber,
-      branchName,
-      worktreePath,
-      changed: true,
-      pullRequest: createdPullRequest
-    };
-  });
-}
-
-export async function reviewPullRequestWorkflow(
-  prNumber: number
-): Promise<DirectorOperationResponse> {
-  return withProject(async (session) => {
-    const pullRequest = await viewPullRequest(session.project.repoPath, prNumber);
-    const [diff, checks] = await Promise.all([
-      pullRequestDiff(session.project.repoPath, prNumber),
-      pullRequestChecks(session.project.repoPath, prNumber)
-    ]);
-
-    const allChecksPassing = checks.length === 0 || checks.every((check) => check.bucket === "pass");
-    const fallbackReview: AgentResultEnvelope = {
-      status: allChecksPassing ? "ok" : "needs_input",
-      summary: allChecksPassing
-        ? `Pull request #${prNumber} looks ready for merge review.`
-        : `Pull request #${prNumber} still has failing or pending checks.`,
-      recommended_next_action: allChecksPassing
-        ? "Mark the pull request merge-ready."
-        : "Resolve checks or code review findings before merging.",
-      artifact_refs: [pullRequest.url],
-      blocking_questions: allChecksPassing ? [] : ["How should the failing or pending checks be resolved?"]
-    };
-
-    const reviewResult = await runCodexAgent(
-      {
-        role: "reviewer",
-        cwd: session.project.repoPath,
-        model: session.project.model,
-        prompt: [
-          `Review GitHub pull request #${pullRequest.number}: ${pullRequest.title}.`,
-          "Focus on bugs, regressions, missing tests, and behavior drift.",
-          "If no material findings exist, say the pull request is ready for merge.",
-          "",
-          "Diff:",
-          diff
-        ].join("\n")
-      },
-      fallbackReview
-    );
-
-    const mergeReady =
-      reviewResult.status === "ok" &&
-      reviewResult.blocking_questions.length === 0 &&
-      allChecksPassing;
-    const reviewDecision = mergeReady ? "APPROVED" : "CHANGES_REQUESTED";
-    const checksBucket = allChecksPassing ? "pass" : checks.some((check) => check.bucket === "fail") ? "fail" : "pending";
-    const commentBody = [
-      "## Director OS Review",
-      "",
-      reviewResult.summary,
-      "",
-      `Recommended next action: ${reviewResult.recommended_next_action}`,
-      reviewResult.blocking_questions.length
-        ? `Blocking questions:\n${reviewResult.blocking_questions.map((question) => `- ${question}`).join("\n")}`
-        : ""
-    ]
-      .filter(Boolean)
-      .join("\n");
-
-    await commentOnPr(session.project.repoPath, prNumber, commentBody);
-
-    const mirroredPr = await upsertPullRequestMirror(session.db, session.project.id, {
-      number: pullRequest.number,
-      title: pullRequest.title,
-      body: pullRequest.body,
-      state: pullRequest.state.toLowerCase(),
-      isDraft: pullRequest.isDraft,
-      reviewDecision,
-      checksBucket,
-      headRefName: pullRequest.headRefName,
-      baseRefName: pullRequest.baseRefName,
-      url: pullRequest.url,
-      linkedIssueNumbers: pullRequest.linkedIssueNumbers,
-      updatedAt: pullRequest.updatedAt,
-      syncedAt: nowIso()
-    });
-
-    if (mergeReady) {
-      await ensureDirectorTask(session.db, {
-        projectId: session.project.id,
-        briefId: null,
-        kind: "approve_merge",
-        title: `Approve merge for PR #${pullRequest.number}`,
-        description: reviewResult.summary,
-        recommendation: reviewResult.recommended_next_action,
-        status: "ready_for_director",
-        payload: {
-          prNumber: pullRequest.number,
-          url: pullRequest.url
-        }
-      });
-    }
-
-    await insertAgentRun(session.db, {
-      projectId: session.project.id,
-      role: "reviewer",
-      targetType: "pull_request",
-      targetId: String(prNumber),
-      status: reviewResult.status === "failed" ? "failed" : mergeReady ? "succeeded" : "needs_input",
-      inputSummary: pullRequest.title,
-      outputSummary: reviewResult.summary,
-      outputJson: reviewResult.data ?? null,
-      workingDirectory: session.project.repoPath,
-      createdAt: nowIso(),
-      updatedAt: nowIso()
-    });
-
-    await recordEvent(session.db, session.project.id, "pull_request.reviewed", {
-      prNumber,
-      mergeReady
-    });
-
-    return {
-      ok: true,
-      mergeReady,
-      pullRequest: mirroredPr,
-      review: reviewResult
-    };
-  });
-}
-
-export async function mergePullRequestWorkflow(
-  prNumber: number
-): Promise<DirectorOperationResponse> {
-  return withProject(async (session) => {
-    const pullRequest = assertPresent(
-      await getPullRequestByNumber(session.db, session.project.id, prNumber),
-      `Pull request #${prNumber} is missing from the local mirror. Review or sync it first.`
-    );
-
-    const checks = await pullRequestChecks(session.project.repoPath, prNumber);
-    const hasFailingCheck = checks.some((check) => check.bucket === "fail");
-    const hasPendingCheck = checks.some((check) => check.bucket === "pending");
-
-    if (hasFailingCheck || hasPendingCheck) {
-      throw new Error(`Pull request #${prNumber} is not mergeable yet because checks are not all passing.`);
-    }
-
-    await mergePullRequest(session.project.repoPath, prNumber);
-
-    const updatedPr = await upsertPullRequestMirror(session.db, session.project.id, {
-      ...pullRequest,
-      state: "merged",
-      reviewDecision: pullRequest.reviewDecision ?? "APPROVED",
-      checksBucket: "pass",
-      syncedAt: nowIso(),
-      updatedAt: nowIso()
-    });
-
-    await resolveDirectorTasksForPr(session.db, session.project.id, prNumber);
-
-    for (const issueNumber of updatedPr.linkedIssueNumbers) {
-      const issue = await getIssueByNumber(session.db, session.project.id, issueNumber);
-      if (issue) {
-        await upsertIssueMirror(session.db, session.project.id, {
-          ...issue,
-          state: "closed",
-          workflowState: "done",
-          labels: [...stripWorkflowLabels(issue.labels), workflowLabel("done")],
-          syncedAt: nowIso(),
-          updatedAt: nowIso()
+    if (row.workItemId) {
+      const workItemRows = await session.db
+        .select()
+        .from(workItemsTable)
+        .where(eq(workItemsTable.id, row.workItemId))
+        .limit(1);
+      if (workItemRows[0]) {
+        const workItem = mapWorkItemRow(workItemRows[0]);
+        const resumedStatus: WorkItemStatus = workItem.activePrNumber ? "waiting_review" : "ready";
+        await upsertWorkItem(session.db, session.project.id, {
+          issueNumber: workItem.issueNumber,
+          parentIssueNumber: workItem.parentIssueNumber,
+          title: workItem.title,
+          summary: workItem.summary,
+          kind: workItem.kind,
+          executionMode: workItem.executionMode,
+          ownerRole: workItem.ownerRole,
+          status: resumedStatus,
+          priorityBucket: inferPriorityBucket(resumedStatus),
+          activeRunId: null,
+          activePrNumber: workItem.activePrNumber,
+          lastSummary: `Decision resolved: ${trimmed}`
         });
       }
     }
 
-    const worktreeRows = await session.db
-      .select()
-      .from(worktreesTable)
-      .where(eq(worktreesTable.branchName, updatedPr.headRefName))
-      .limit(1);
-    const worktree = worktreeRows[0];
-
-    if (worktree) {
-      try {
-        await runCommand(
-          "git",
-          ["-C", session.project.repoPath, "worktree", "remove", "--force", worktree.path],
-          session.project.repoPath
-        );
-      } catch {
-        // Keep the local row marked for cleanup if removal fails.
-      }
-
-      await session.db
-        .update(worktreesTable)
-        .set({
-          status: "cleaned",
-          updatedAt: nowIso()
-        })
-        .where(eq(worktreesTable.id, worktree.id));
-    }
-
-    await recordEvent(session.db, session.project.id, "pull_request.merged", {
-      prNumber
+    await recordEvent(session.db, session.project.id, "decision.resolved", {
+      decisionId,
+      resolution: trimmed
     });
 
+    const updatedRows = await session.db
+      .select()
+      .from(decisionsTable)
+      .where(eq(decisionsTable.id, decisionId))
+      .limit(1);
+    const decision = mapDecisionRow(assertPresent(updatedRows[0], `Decision ${decisionId} vanished after update.`));
+
+    const orchestrator = await ensureOrchestratorRow(session);
+    if (orchestrator.status === "running" && !orchestratorTimer && !orchestratorRunning) {
+      scheduleOrchestratorLoop(0);
+    }
+
+    return decision;
+  });
+}
+
+export async function startOrchestrator(): Promise<DirectorOperationResponse> {
+  const response = await withProject(async (session) => {
+    await ensureOrchestratorRow(session);
+    await setOrchestratorState(session, "running", {
+      pauseReason: null,
+      lastSummary: "Chief of Staff is running.",
+      lastLoopAt: nowIso()
+    });
+    await recordEvent(session.db, session.project.id, "orchestrator.started", {});
     return {
       ok: true,
-      prNumber
+      message: "Chief of Staff loop started."
+    };
+  });
+
+  scheduleOrchestratorLoop(0);
+  return response;
+}
+
+export async function pauseOrchestrator(reason?: string): Promise<DirectorOperationResponse> {
+  return withProject(async (session) => {
+    await ensureOrchestratorRow(session);
+    await setOrchestratorState(session, "paused", {
+      pauseReason: reason?.trim() || "Paused by the director.",
+      lastSummary: "Chief of Staff loop paused."
+    });
+    if (orchestratorTimer) {
+      clearTimeout(orchestratorTimer);
+      orchestratorTimer = null;
+    }
+    await recordEvent(session.db, session.project.id, "orchestrator.paused", {
+      reason: reason?.trim() || null
+    });
+    return {
+      ok: true,
+      message: "Chief of Staff loop paused."
     };
   });
 }
