@@ -132,7 +132,7 @@ program
   .argument("<decisionId>", "Local decision id")
   .argument("<resolution...>", "Resolution text")
   .action(async (decisionId, resolutionParts) => {
-    const result = await resolveDecision(Number(decisionId), resolutionParts.join(" "));
+    const result = await resolveDecision(String(decisionId), resolutionParts.join(" "));
     console.log(JSON.stringify(result, null, 2));
   });
 

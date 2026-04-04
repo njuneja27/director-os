@@ -71,9 +71,9 @@ export function App() {
 
   const counts = useMemo(
     () => ({
-      queued: status?.queue.length ?? 0,
-      active: status?.activeWork.length ?? 0,
-      decisions: status?.decisions.length ?? 0,
+      queued: status?.queue?.length ?? 0,
+      active: status?.activeWork?.length ?? 0,
+      decisions: status?.decisions?.length ?? 0,
       prs: status?.openPullRequests.length ?? 0
     }),
     [status]
@@ -334,11 +334,13 @@ export function App() {
           {openQuestion ? (
             <div className="open-question-card">
               <div className="eyebrow">Reply needed</div>
-              <div className="open-question-title">{openQuestion.summary ?? "Chief of Staff question"}</div>
-              <p className="open-question-copy">{openQuestion.content}</p>
+              <div className="open-question-title">{openQuestion.title || "Chief of Staff question"}</div>
+              <p className="open-question-copy">{openQuestion.question}</p>
               <div className="open-question-meta">
                 {openQuestion.linkedIssueNumber ? <span>Issue #{openQuestion.linkedIssueNumber}</span> : null}
-                {openQuestion.linkedPrNumber ? <span>PR #{openQuestion.linkedPrNumber}</span> : null}
+                {openQuestion.linkedPullRequestNumber ? (
+                  <span>PR #{openQuestion.linkedPullRequestNumber}</span>
+                ) : null}
                 <span>{formatTimestamp(openQuestion.createdAt)}</span>
               </div>
               {conversation?.openQuestionRun ? (
@@ -436,7 +438,7 @@ export function App() {
                 <div className="section-meta">Questions the CoS could not safely answer without you.</div>
               </div>
             </div>
-            <ItemList<DirectorStatusResponse["decisions"][number]>
+            <ItemList<NonNullable<DirectorStatusResponse["decisions"]>[number]>
               empty="No human escalations are waiting right now."
               items={status?.decisions ?? []}
               render={(decision) => (
@@ -446,10 +448,12 @@ export function App() {
                     <span className="check-pill check-pill-needs-action">Reply needed</span>
                   </div>
                   <div className="compact-card-meta">
-                    {decision.issueNumber ? <span>Issue #{decision.issueNumber}</span> : null}
-                    {decision.prNumber ? <span>PR #{decision.prNumber}</span> : null}
+                    {decision.linkedIssueNumber ? <span>Issue #{decision.linkedIssueNumber}</span> : null}
+                    {decision.linkedPullRequestNumber ? (
+                      <span>PR #{decision.linkedPullRequestNumber}</span>
+                    ) : null}
                   </div>
-                  <div className="list-note">{decision.summary}</div>
+                  <div className="list-note">{decision.whyItMatters}</div>
                 </div>
               )}
             />

@@ -100,7 +100,7 @@ export async function createDirectorServer() {
   );
   app.post<{ Params: { id: string }; Body: { resolution: string } }>(
     "/api/decisions/:id/resolve",
-    async (request) => resolveDecision(Number(request.params.id), request.body.resolution)
+    async (request) => resolveDecision(request.params.id, request.body.resolution)
   );
 
   app.setNotFoundHandler(async (request, reply) => {
