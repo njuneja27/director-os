@@ -59,6 +59,9 @@ const structuredDataSchema = {
   additionalProperties: false,
   properties: {
     outcome: { type: ["string", "null"] },
+    owner_type: { type: ["string", "null"] },
+    lane_id: { type: ["string", "null"] },
+    lane_name: { type: ["string", "null"] },
     guidance: { type: ["string", "null"] },
     transcript_reply: { type: ["string", "null"] },
     why_it_matters: { type: ["string", "null"] },
@@ -306,6 +309,7 @@ export async function runCodexSessionTurn(
         "--skip-git-repo-check",
         "--model",
         input.model,
+        ...(input.allowWrite ? ["--full-auto"] : []),
         "--json",
         "--output-last-message",
         outputPath,

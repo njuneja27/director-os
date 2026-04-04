@@ -2,10 +2,7 @@ import { contextBridge, ipcRenderer } from "electron";
 
 import type {
   ConversationResponse,
-  DecisionRecord,
-  DecisionsResponse,
   DirectorDesktopBridge,
-  DirectorNoteRecord,
   DirectorOperationResponse,
   DirectorStatusResponse,
   SetupProbeRepositoryInput,
@@ -36,10 +33,7 @@ const api: DirectorDesktopBridge = {
     getStatus: () => invoke(IPC_CHANNELS.director.getStatus),
     start: () => invoke(IPC_CHANNELS.director.start),
     pause: (reason?: string) => invoke(IPC_CHANNELS.director.pause, reason),
-    sync: () => invoke(IPC_CHANNELS.director.sync),
-    listDecisions: () => invoke(IPC_CHANNELS.director.listDecisions),
-    resolveDecision: (decisionId: string, resolution: string) =>
-      invoke(IPC_CHANNELS.director.resolveDecision, decisionId, resolution)
+    sync: () => invoke(IPC_CHANNELS.director.sync)
   }
 };
 

@@ -4,10 +4,8 @@ import type {
   ConversationMessageRecord,
   ConversationResponse,
   DirectorStatusResponse,
-  PrCycleRecord,
   RunRecord,
   SetupCheck,
-  WorkItemRecord,
   SetupRepositoryDraft,
   SetupStatusResponse
 } from "./api";
@@ -73,7 +71,7 @@ export function App() {
     () => ({
       lanes: status?.lanes.length ?? 0,
       ownedIssues:
-        status?.issues.filter((issue) => issue.state.toLowerCase() === "open" && issue.laneId).length ?? 0,
+        status?.issues.filter((issue) => issue.state.toLowerCase() === "open" && issue.ownerKind).length ?? 0,
       blockers:
         (status?.openQuestion ? 1 : 0) +
         (status?.lanes.filter((lane) => lane.status === "blocked").length ?? 0),
@@ -339,6 +337,8 @@ export function App() {
               <div className="eyebrow">Reply needed</div>
               <div className="open-question-title">{openQuestion.title || "Chief of Staff question"}</div>
               <p className="open-question-copy">{openQuestion.question}</p>
+              <p className="list-note">{openQuestion.whyItMatters}</p>
+              <p className="list-note">Recommendation: {openQuestion.recommendation}</p>
               <div className="open-question-meta">
                 {openQuestion.linkedIssueNumber ? <span>Issue #{openQuestion.linkedIssueNumber}</span> : null}
                 {openQuestion.linkedPullRequestNumber ? (
@@ -432,6 +432,14 @@ export function App() {
               </span>
               <span>The Chief of Staff loop stays local and routes work through persistent lane sessions.</span>
             </div>
+            <div className="hero-meta">
+              <span>Last successful GitHub sync</span>
+              <span>
+                {status?.lastSuccessfulSyncAt
+                  ? formatTimestamp(status.lastSuccessfulSyncAt)
+                  : "No successful sync yet"}
+              </span>
+            </div>
           </section>
 
           <section className="panel sidebar-card">
@@ -457,6 +465,7 @@ export function App() {
                     ) : null}
                   </div>
                   <div className="list-note">{decision.whyItMatters}</div>
+                  <div className="list-note">Recommendation: {decision.recommendation}</div>
                 </div>
               )}
             />
@@ -491,19 +500,19 @@ export function App() {
           <section className="panel sidebar-card">
             <div className="panel-header">
               <div>
-                <div className="section-title">Lane-owned issues</div>
-                <div className="section-meta">GitHub issues stay durable; the router only shows who currently owns each slice.</div>
+                <div className="section-title">Owned issues</div>
+                <div className="section-meta">GitHub issues stay durable; the router only shows whether the Chief of Staff or a lane currently owns each slice.</div>
               </div>
             </div>
             <ItemList<DirectorStatusResponse["issues"][number]>
-              empty="No GitHub issues are currently routed to lanes."
-              items={(status?.issues ?? []).filter((issue) => issue.state.toLowerCase() === "open" && issue.laneId)}
+              empty="No GitHub issues are currently owned by the Chief of Staff or a lane."
+              items={(status?.issues ?? []).filter((issue) => issue.state.toLowerCase() === "open" && issue.ownerKind)}
               render={(issue) => (
                 <div className="list-row compact-list-row" key={issue.issueNumber}>
                   <div>
                     <div className="list-title">#{issue.issueNumber} {issue.title}</div>
                     <div className="list-meta">
-                      {issue.laneName ? <span>{issue.laneName}</span> : null}
+                      {issue.ownerName ? <span>{issue.ownerName}</span> : null}
                       <span>{String(issue.status).replace("_", " ")}</span>
                       {issue.linkedPullRequestNumber ? <span>PR #{issue.linkedPullRequestNumber}</span> : null}
                     </div>
@@ -909,45 +918,6 @@ function formatOrchestratorStatus(status: string): string {
       return "Blocked";
     default:
       return "Idle";
-  }
-}
-
-function formatWorkItemStatus(status: WorkItemRecord["status"]): string {
-  switch (status) {
-    case "queued":
-    case "ready":
-    case "planning":
-      return "Queued";
-    case "running":
-      return "Running";
-    case "waiting_decision":
-      return "Waiting for you";
-    case "waiting_review":
-      return "Waiting on PR";
-    case "completed":
-      return "Done";
-    case "blocked":
-      return "Blocked";
-    default:
-      return String(status).replace("_", " ");
-  }
-}
-
-function formatPrCycleStatus(status: PrCycleRecord["status"]): string {
-  switch (status) {
-    case "opened":
-    case "waiting_automation":
-    case "changes_requested":
-    case "revalidating":
-    case "cos_review":
-    case "merge_ready":
-      return "Waiting on PR";
-    case "merged":
-      return "Done";
-    case "blocked":
-      return "Blocked";
-    default:
-      return String(status).replace("_", " ");
   }
 }
 

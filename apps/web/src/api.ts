@@ -2,35 +2,27 @@ import type {
   ConversationMessageRecord,
   ConversationResponse,
   ConversationThreadRecord,
-  DecisionsResponse,
   DirectorClient,
   DirectorDesktopBridge,
   DirectorOperationResponse,
   DirectorStatusResponse,
-  HumanQuestionRecord,
-  PrCycleRecord,
   RunRecord,
   SetupCheck,
   SetupProbeRepositoryInput,
   SetupRepositoryDraft,
-  SetupStatusResponse,
-  WorkItemRecord
+  SetupStatusResponse
 } from "@director-os/shared";
 
 export type {
   ConversationMessageRecord,
   ConversationResponse,
   ConversationThreadRecord,
-  DecisionsResponse,
   DirectorStatusResponse,
-  HumanQuestionRecord,
-  PrCycleRecord,
   RunRecord,
   SetupCheck,
   SetupProbeRepositoryInput,
   SetupRepositoryDraft,
-  SetupStatusResponse,
-  WorkItemRecord
+  SetupStatusResponse
 } from "@director-os/shared";
 
 declare global {
@@ -109,12 +101,6 @@ function createHttpDirectorClient(): WebDirectorClient {
     sync: () =>
       requestJson<DirectorOperationResponse>("/api/sync", {
         method: "POST"
-      }),
-    listDecisions: () => requestJson<DecisionsResponse>("/api/decisions"),
-    resolveDecision: (decisionId: string, resolution: string) =>
-      requestJson<HumanQuestionRecord>(`/api/decisions/${decisionId}/resolve`, {
-        method: "POST",
-        body: JSON.stringify({ resolution })
       })
   };
 }
@@ -131,10 +117,7 @@ function createIpcDirectorClient(bridge: DirectorDesktopBridge): WebDirectorClie
     getStatus: () => bridge.director.getStatus(),
     start: () => bridge.director.start(),
     pause: (reason?: string) => bridge.director.pause(reason),
-    sync: () => bridge.director.sync(),
-    listDecisions: () => bridge.director.listDecisions(),
-    resolveDecision: (decisionId: string, resolution: string) =>
-      bridge.director.resolveDecision(decisionId, resolution)
+    sync: () => bridge.director.sync()
   };
 }
 
@@ -196,15 +179,4 @@ export async function pauseDirector(reason?: string): Promise<DirectorOperationR
 
 export async function syncNow(): Promise<DirectorOperationResponse> {
   return getDirectorClient().sync();
-}
-
-export async function fetchDecisions(): Promise<DecisionsResponse> {
-  return getDirectorClient().listDecisions();
-}
-
-export async function resolveEscalation(
-  decisionId: string,
-  resolution: string
-): Promise<HumanQuestionRecord> {
-  return getDirectorClient().resolveDecision(decisionId, resolution);
 }

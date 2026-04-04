@@ -14,14 +14,24 @@ export const COS_TASK_APPENDICES = {
   chooseNextIssue: [
     "Task: choose the next GitHub issue to work on.",
     "Prefer the highest-leverage bounded slice that is explicitly ready.",
-    "Return `data.selected_issue_number`, `data.execution_intent`, and optionally `data.lane_id` / `data.lane_name`.",
+    "Return `data.selected_issue_number` and `data.owner_type` as `lane` or `chief_of_staff`.",
+    "If the issue should move through a lane session, also return `data.execution_intent` and optionally `data.lane_id` / `data.lane_name`.",
     "Use `data.execution_intent` as `plan` or `implement`."
   ].join("\n"),
   mediateBlocker: [
     "Task: mediate a blocked Codex run before any human escalation is created.",
     "Return `data.outcome` as `answer_worker`, `ask_human`, or `reroute`.",
     "If you can answer internally, return `data.guidance` and `data.transcript_reply`.",
+    "If you reroute, also return `data.lane_id` and optionally `data.lane_name`.",
     "If the human must decide, return `data.question`, `data.why_it_matters`, and `data.recommendation`."
+  ].join("\n"),
+  reviewLanePlan: [
+    "Task: review a lane planning result and decide what happens next.",
+    "Return `data.decision` as `implement`, `decompose`, `hold`, or `ask_human`.",
+    "If you choose `implement`, optionally return `data.lane_id`, `data.lane_name`, `data.guidance`, and `data.transcript_reply`.",
+    "If you choose `decompose`, return `data.new_issues` with concrete GitHub-ready child issues.",
+    "If you choose `ask_human`, return `data.question`, `data.why_it_matters`, and `data.recommendation`.",
+    "Keep Director OS thin: return a concise summary, not a custom plan object."
   ].join("\n"),
   reviewPr: [
     "Task: review a real pull request and decide whether it is merge-ready.",
