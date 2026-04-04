@@ -5,6 +5,7 @@ const execFileAsync = promisify(execFile);
 
 export interface CommandExecutionOptions {
   cwd?: string;
+  env?: NodeJS.ProcessEnv;
   timeoutMs?: number;
   maxBuffer?: number;
 }
@@ -35,6 +36,7 @@ export const runCommandCapture: CommandRunner = async (
 ) => {
   const result = await execFileAsync(command, args, {
     cwd: options.cwd,
+    env: options.env,
     timeout: options.timeoutMs,
     maxBuffer: options.maxBuffer ?? 20 * 1024 * 1024
   });
