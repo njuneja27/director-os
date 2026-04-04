@@ -11,6 +11,7 @@
     "src/cos.ts",
     "src/commands.ts",
     "src/db.ts",
+    "src/git-worktrees.ts",
     "src/github.ts",
     "src/index.ts",
     "src/server.ts",
