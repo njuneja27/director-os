@@ -6,7 +6,7 @@ import { integer, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core
 
 import { ensureRuntimeDirectories, resolveRuntimePaths, type RuntimePaths } from "./config.js";
 
-const CURRENT_SCHEMA_VERSION = 4;
+const CURRENT_SCHEMA_VERSION = 5;
 const jsonText = (name: string) => text(name, { mode: "json" });
 
 export const projectsTable = sqliteTable(
@@ -130,6 +130,7 @@ export const runsTable = sqliteTable("runs", {
   artifacts: jsonText("artifacts").notNull(),
   blockingQuestions: jsonText("blocking_questions").notNull(),
   outputJson: jsonText("output_json"),
+  rawModelOutput: text("raw_model_output"),
   worktreePath: text("worktree_path"),
   createdAt: text("created_at").notNull(),
   updatedAt: text("updated_at").notNull()
@@ -385,6 +386,7 @@ create table if not exists runs (
   artifacts text not null,
   blocking_questions text not null,
   output_json text,
+  raw_model_output text,
   worktree_path text,
   created_at text not null,
   updated_at text not null
@@ -544,6 +546,9 @@ export function migrateDatabase(sqlite: Database.Database): void {
   }
   if (!columnExists(sqlite, "decisions", "resolution_message_id")) {
     sqlite.exec("alter table decisions add column resolution_message_id integer;");
+  }
+  if (!columnExists(sqlite, "runs", "raw_model_output")) {
+    sqlite.exec("alter table runs add column raw_model_output text;");
   }
   sqlite.pragma(`user_version = ${CURRENT_SCHEMA_VERSION}`);
 }

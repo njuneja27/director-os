@@ -8,6 +8,7 @@
   "include": [
     "src/config.ts",
     "src/agents.ts",
+    "src/cos.ts",
     "src/commands.ts",
     "src/db.ts",
     "src/github.ts",

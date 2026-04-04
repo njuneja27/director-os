@@ -287,7 +287,7 @@ export function App() {
             disabled={busyAction === "sync"}
             onClick={() => void runDashboardAction("sync", () => syncNow())}
           >
-            Sync GitHub
+            Sync
           </button>
           {status?.orchestrator?.status === "running" ? (
             <button
@@ -341,6 +341,12 @@ export function App() {
                 {openQuestion.linkedPrNumber ? <span>PR #{openQuestion.linkedPrNumber}</span> : null}
                 <span>{formatTimestamp(openQuestion.createdAt)}</span>
               </div>
+              {conversation?.openQuestionRun ? (
+                <RunOutputDetails
+                  run={conversation.openQuestionRun}
+                  summaryLabel="Source run output"
+                />
+              ) : null}
             </div>
           ) : null}
 
@@ -405,19 +411,19 @@ export function App() {
           <section className="panel sidebar-card">
             <div className="panel-header">
               <div>
-                <div className="section-title">Current stance</div>
+                <div className="section-title">State</div>
                 <div className="section-meta">{status?.orchestrator?.lastSummary ?? "The control room is ready."}</div>
               </div>
             </div>
             <div className="hero-stats sidebar-stats">
               <StatCard label="Queue" value={String(counts.queued)} />
-              <StatCard label="Active" value={String(counts.active)} />
-              <StatCard label="Escalations" value={String(counts.decisions)} />
+              <StatCard label="Running" value={String(counts.active)} />
+              <StatCard label="Waiting for you" value={String(counts.decisions)} />
               <StatCard label="Open PRs" value={String(counts.prs)} />
             </div>
             <div className="hero-meta">
               <span className={`status-pill status-pill-${(status?.orchestrator?.status ?? "idle").replace("_", "-")}`}>
-                {status?.orchestrator?.status ?? "idle"}
+                {formatOrchestratorStatus(status?.orchestrator?.status ?? "idle")}
               </span>
               <span>The Chief of Staff loop stays local and synchronized with GitHub.</span>
             </div>
@@ -426,8 +432,8 @@ export function App() {
           <section className="panel sidebar-card">
             <div className="panel-header">
               <div>
-                <div className="section-title">Open escalations</div>
-                <div className="section-meta">Read-only view of the questions the CoS still wants resolved.</div>
+                <div className="section-title">Needs your judgment</div>
+                <div className="section-meta">Questions the CoS could not safely answer without you.</div>
               </div>
             </div>
             <ItemList<DirectorStatusResponse["decisions"][number]>
@@ -437,7 +443,7 @@ export function App() {
                 <div className="compact-card" key={decision.id}>
                   <div className="compact-card-head">
                     <div className="list-title">{decision.title}</div>
-                    <span className="check-pill check-pill-needs-action">{decision.target.replace("_", " ")}</span>
+                    <span className="check-pill check-pill-needs-action">Reply needed</span>
                   </div>
                   <div className="compact-card-meta">
                     {decision.issueNumber ? <span>Issue #{decision.issueNumber}</span> : null}
@@ -452,7 +458,7 @@ export function App() {
           <section className="panel sidebar-card">
             <div className="panel-header">
               <div>
-                <div className="section-title">Queued work</div>
+                <div className="section-title">Queue</div>
                 <div className="section-meta">GitHub remains the durable backlog behind the chat.</div>
               </div>
             </div>
@@ -464,9 +470,8 @@ export function App() {
                   <div>
                     <div className="list-title">#{item.issueNumber} {item.title}</div>
                     <div className="list-meta">
-                      <span>{item.executionMode}</span>
-                      <span>{item.kind}</span>
-                      <span>{item.status}</span>
+                      <span>{formatWorkItemStatus(item.status)}</span>
+                      {item.parentIssueNumber ? <span>From #{item.parentIssueNumber}</span> : null}
                     </div>
                   </div>
                   <div className="list-note">{item.lastSummary ?? item.summary}</div>
@@ -478,8 +483,8 @@ export function App() {
           <section className="panel sidebar-card">
             <div className="panel-header">
               <div>
-                <div className="section-title">Active slices</div>
-                <div className="section-meta">In-flight lane, worker, review, and PR watch runs.</div>
+                <div className="section-title">In progress</div>
+                <div className="section-meta">What the CoS and Codex are actively moving right now.</div>
               </div>
             </div>
             <ItemList<WorkItemRecord>
@@ -490,8 +495,7 @@ export function App() {
                   <div>
                     <div className="list-title">#{item.issueNumber} {item.title}</div>
                     <div className="list-meta">
-                      <span>{item.executionMode}</span>
-                      <span>{item.status}</span>
+                      <span>{formatWorkItemStatus(item.status)}</span>
                       {item.activePrNumber ? <span>PR #{item.activePrNumber}</span> : null}
                     </div>
                   </div>
@@ -504,7 +508,7 @@ export function App() {
           <section className="panel sidebar-card">
             <div className="panel-header">
               <div>
-                <div className="section-title">PR cycles</div>
+                <div className="section-title">Pull requests</div>
                 <div className="section-meta">Automation waits, review follow-up, and merge readiness.</div>
               </div>
             </div>
@@ -516,7 +520,7 @@ export function App() {
                   <div>
                     <div className="list-title">PR #{cycle.prNumber} for issue #{cycle.issueNumber}</div>
                     <div className="list-meta">
-                      <span>{cycle.status}</span>
+                      <span>{formatPrCycleStatus(cycle.status)}</span>
                       {cycle.automationWindowEndsAt ? <span>Window ends {formatTimestamp(cycle.automationWindowEndsAt)}</span> : null}
                     </div>
                   </div>
@@ -530,7 +534,9 @@ export function App() {
             <div className="panel-header">
               <div>
                 <div className="section-title">Recent runs</div>
-                <div className="section-meta">Chief of Staff, lane, worker, and review runs.</div>
+                <div className="section-meta">
+                  Chief of Staff, implementation, and review runs. Expand a run to inspect the stored output.
+                </div>
               </div>
             </div>
             <ItemList<RunRecord>
@@ -539,14 +545,15 @@ export function App() {
               render={(run) => (
                 <div className="list-row compact-list-row" key={run.id}>
                   <div>
-                    <div className="list-title">{run.role} • {run.phase}</div>
+                    <div className="list-title">{formatRunTitle(run)}</div>
                     <div className="list-meta">
-                      <span>{run.status}</span>
+                      <span>{formatRunStatus(run.status)}</span>
                       {run.issueNumber ? <span>Issue #{run.issueNumber}</span> : null}
                       {run.prNumber ? <span>PR #{run.prNumber}</span> : null}
                     </div>
                   </div>
                   <div className="list-note">{run.summary}</div>
+                  <RunOutputDetails run={run} summaryLabel="Run output" />
                 </div>
               )}
             />
@@ -753,7 +760,7 @@ function SetupStepCard(props: {
 }
 
 function StatusPill(props: { status: string }) {
-  return <span className={`status-pill status-pill-${props.status.replace("_", "-")}`}>{props.status.replace("_", " ")}</span>;
+  return <span className={`status-pill status-pill-${props.status.replace("_", "-")}`}>{formatOrchestratorStatus(props.status)}</span>;
 }
 
 function ConversationBubble(props: { message: ConversationMessageRecord }) {
@@ -866,4 +873,137 @@ function formatTimestamp(value: string): string {
   } catch {
     return value;
   }
+}
+
+function formatRunEnvelope(run: RunRecord): string {
+  return JSON.stringify(
+    {
+      role: run.role,
+      phase: run.phase,
+      status: run.status,
+      summary: run.summary,
+      recommendedNextAction: run.recommendedNextAction,
+      blockingQuestions: run.blockingQuestions,
+      artifacts: run.artifacts,
+      worktreePath: run.worktreePath,
+      outputJson: run.outputJson
+    },
+    null,
+    2
+  );
+}
+
+function formatOrchestratorStatus(status: string): string {
+  switch (status) {
+    case "running":
+      return "Running";
+    case "paused":
+      return "Paused";
+    case "blocked":
+      return "Blocked";
+    default:
+      return "Idle";
+  }
+}
+
+function formatWorkItemStatus(status: WorkItemRecord["status"]): string {
+  switch (status) {
+    case "queued":
+    case "ready":
+    case "planning":
+      return "Queued";
+    case "running":
+      return "Running";
+    case "waiting_decision":
+      return "Waiting for you";
+    case "waiting_review":
+      return "Waiting on PR";
+    case "completed":
+      return "Done";
+    case "blocked":
+      return "Blocked";
+    default:
+      return String(status).replace("_", " ");
+  }
+}
+
+function formatPrCycleStatus(status: PrCycleRecord["status"]): string {
+  switch (status) {
+    case "opened":
+    case "waiting_automation":
+    case "changes_requested":
+    case "revalidating":
+    case "cos_review":
+    case "merge_ready":
+      return "Waiting on PR";
+    case "merged":
+      return "Done";
+    case "blocked":
+      return "Blocked";
+    default:
+      return String(status).replace("_", " ");
+  }
+}
+
+function formatRunStatus(status: RunRecord["status"]): string {
+  switch (status) {
+    case "queued":
+      return "Queued";
+    case "running":
+      return "Running";
+    case "needs_input":
+      return "Waiting for you";
+    case "succeeded":
+      return "Done";
+    case "failed":
+      return "Blocked";
+    default:
+      return String(status).replace("_", " ");
+  }
+}
+
+function formatRunTitle(run: RunRecord): string {
+  const roleLabel =
+    run.role === "chief_of_staff"
+      ? "Chief of Staff"
+      : run.role === "reviewer"
+        ? "Review"
+        : run.role === "worker"
+          ? "Implementation"
+          : run.role === "lane_owner"
+            ? "Planning"
+            : run.role.replaceAll("_", " ");
+  return `${roleLabel} • ${run.phase.replaceAll("_", " ")}`;
+}
+
+function RunOutputDetails(props: { run: RunRecord; summaryLabel: string }) {
+  const hasRaw = Boolean(props.run.rawModelOutput?.trim());
+  const hasStructured =
+    Boolean(props.run.outputJson) ||
+    props.run.blockingQuestions.length > 0 ||
+    Boolean(props.run.recommendedNextAction) ||
+    props.run.artifacts.length > 0 ||
+    Boolean(props.run.worktreePath);
+
+  if (!hasRaw && !hasStructured) {
+    return null;
+  }
+
+  return (
+    <details className="run-output-toggle">
+      <summary>{props.summaryLabel}</summary>
+      {hasRaw ? (
+        <div className="run-output-section">
+          <div className="run-output-label">Raw Codex output</div>
+          <pre className="raw-output-block">{props.run.rawModelOutput}</pre>
+        </div>
+      ) : null}
+      {hasStructured ? (
+        <div className="run-output-section">
+          <div className="run-output-label">Parsed run payload</div>
+          <pre className="raw-output-block">{formatRunEnvelope(props.run)}</pre>
+        </div>
+      ) : null}
+    </details>
+  );
 }
