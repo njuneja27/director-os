@@ -1,0 +1,10 @@
+.DS_Store
+node_modules
+dist
+apps/web/dist
+apps/cli/dist
+*.db
+*.db-shm
+*.db-wal
+coverage
+

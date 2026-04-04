@@ -1,0 +1,23 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "jsx": "react-jsx",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "composite": true,
+    "types": [
+      "node"
+    ]
+  },
+  "include": [
+    "src/main.tsx",
+    "src/App.tsx",
+    "src/api.ts",
+    "vite.config.ts"
+  ],
+  "references": [
+    {
+      "path": "../../packages/shared"
+    }
+  ]
+}
