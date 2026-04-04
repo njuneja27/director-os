@@ -13,9 +13,9 @@
   ],
   "scripts": {
     "build": "npm --prefix packages/shared run build && npm --prefix packages/core run build && npm --prefix apps/web run build && npm --prefix apps/desktop run build && npm --prefix apps/cli run build",
-    "desktop:build": "npm --prefix packages/shared run build && npm --prefix packages/core run build && npm --prefix apps/web run build && npm --prefix apps/desktop run build",
+    "desktop:build": "npm --prefix packages/shared run build && npm --prefix packages/core run build && npm --prefix apps/web run build && npm --prefix apps/desktop run build && npm --prefix apps/cli run build",
     "desktop:start": "npm run desktop:build && npm --prefix apps/desktop run start",
-    "desktop:dev": "concurrently -k -n renderer,desktop-ts,electron -c auto \"npm --prefix apps/web run dev -- --host 127.0.0.1\" \"npm --prefix apps/desktop run build:watch\" \"wait-on tcp:4310 file:apps/desktop/dist/main.js && VITE_DEV_SERVER_URL=http://127.0.0.1:4310 npm --prefix apps/desktop run dev\"",
+    "desktop:dev": "npm --prefix apps/cli run build && concurrently -k -n renderer,desktop-ts,electron -c auto \"npm --prefix apps/web run dev -- --host 127.0.0.1\" \"npm --prefix apps/desktop run build:watch\" \"wait-on tcp:4310 file:apps/desktop/dist/main.js && VITE_DEV_SERVER_URL=http://127.0.0.1:4310 npm --prefix apps/desktop run dev\"",
     "typecheck": "npm --prefix packages/shared run build && npm --prefix packages/core run build && npm --prefix apps/web run typecheck && npm --prefix apps/desktop run typecheck && npm --prefix apps/cli run typecheck",
     "dev": "npm --prefix apps/web run dev",
     "test": "vitest run"

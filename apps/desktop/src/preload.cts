@@ -10,19 +10,16 @@ import type {
   InboxResponse,
   IntakeResponse,
   SetupProbeRepositoryInput,
-  SetupRepositoryDraft
+  SetupRepositoryDraft,
+  SetupStatusResponse
 } from "@director-os/shared";
-
-import { IPC_CHANNELS } from "./protocol.js";
 
 interface DesktopBridge {
   setup: {
-    getStatus(): Promise<import("@director-os/shared").SetupStatusResponse>;
-    probeRepository(input: SetupProbeRepositoryInput): Promise<import("@director-os/shared").SetupStatusResponse>;
-    runWorkspaceTest(
-      input: SetupRepositoryDraft
-    ): Promise<import("@director-os/shared").SetupStatusResponse>;
-    complete(input: SetupRepositoryDraft): Promise<import("@director-os/shared").SetupStatusResponse>;
+    getStatus(): Promise<SetupStatusResponse>;
+    probeRepository(input: SetupProbeRepositoryInput): Promise<SetupStatusResponse>;
+    runWorkspaceTest(input: SetupRepositoryDraft): Promise<SetupStatusResponse>;
+    complete(input: SetupRepositoryDraft): Promise<SetupStatusResponse>;
   };
   director: {
     getOverview(): Promise<HomeOverview>;
@@ -37,6 +34,27 @@ interface DesktopBridge {
     mergePr(prNumber: number): Promise<DirectorOperationResponse>;
   };
 }
+
+const IPC_CHANNELS = {
+  setup: {
+    getStatus: "director:setup:get-status",
+    probeRepository: "director:setup:probe-repository",
+    runWorkspaceTest: "director:setup:run-workspace-test",
+    complete: "director:setup:complete"
+  },
+  director: {
+    getOverview: "director:get-overview",
+    getInbox: "director:get-inbox",
+    getIntake: "director:get-intake",
+    submitIntakeMessage: "director:submit-intake-message",
+    actOnBrief: "director:act-on-brief",
+    actOnTask: "director:act-on-task",
+    sync: "director:sync",
+    runIssue: "director:run-issue",
+    reviewPr: "director:review-pr",
+    mergePr: "director:merge-pr"
+  }
+} as const;
 
 function invoke<T>(channel: string, ...args: unknown[]): Promise<T> {
   return ipcRenderer.invoke(channel, ...args) as Promise<T>;
@@ -57,9 +75,9 @@ const api: DesktopBridge = {
     getIntake: () => invoke(IPC_CHANNELS.director.getIntake),
     submitIntakeMessage: (content: string) =>
       invoke(IPC_CHANNELS.director.submitIntakeMessage, content),
-    actOnBrief: (briefId: number, action: "approve" | "revise" | "reject") =>
+    actOnBrief: (briefId: number, action: BriefAction) =>
       invoke(IPC_CHANNELS.director.actOnBrief, briefId, action),
-    actOnTask: (taskId: number, action: "approve" | "reject" | "resolve") =>
+    actOnTask: (taskId: number, action: DirectorTaskAction) =>
       invoke(IPC_CHANNELS.director.actOnTask, taskId, action),
     sync: () => invoke(IPC_CHANNELS.director.sync),
     runIssue: (issueNumber: number) => invoke(IPC_CHANNELS.director.runIssue, issueNumber),

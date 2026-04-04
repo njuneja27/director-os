@@ -14,7 +14,7 @@
   "dependencies": {
     "@director-os/core": "file:../../packages/core",
     "@director-os/shared": "file:../../packages/shared",
-    "electron": "^33.0.0"
+    "electron": "^39.8.3"
   },
   "devDependencies": {
     "@types/node": "^22.13.14",

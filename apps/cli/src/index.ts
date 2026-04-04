@@ -40,7 +40,7 @@ program
       agentRunner: options.agentRunner,
       model: options.model,
       skipGhCheck: options.skipGhCheck,
-      noProjectRegistration: options.projectRegistration === false
+      noProjectRegistration: options.noProjectRegistration
     });
 
     console.log(JSON.stringify(result, null, 2));
