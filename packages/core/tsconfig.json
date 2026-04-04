@@ -13,7 +13,8 @@
     "src/github.ts",
     "src/index.ts",
     "src/server.ts",
-    "src/services.ts"
+    "src/services.ts",
+    "src/work-items.ts"
   ],
   "references": [
     {

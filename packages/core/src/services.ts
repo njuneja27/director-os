@@ -85,6 +85,11 @@ import {
   resolveRepoPath,
   viewPullRequest
 } from "./github.js";
+import {
+  inferWorkItemStatus,
+  selectActiveWorkItems,
+  selectQueuedWorkItems
+} from "./work-items.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -800,34 +805,6 @@ function inferPriorityBucket(status: WorkItemStatus): number {
     default:
       return 3;
   }
-}
-
-function inferWorkItemStatus(
-  issue: GitHubIssueRecord,
-  existing: WorkItemRecord | null,
-  linkedPr: GitHubPullRequestRecord | null
-): WorkItemStatus {
-  if (issue.state.toLowerCase() !== "open") {
-    return "completed";
-  }
-
-  if (linkedPr && linkedPr.state.toLowerCase() === "open") {
-    return "waiting_review";
-  }
-
-  if (existing && ["running", "planning", "waiting_decision"].includes(existing.status)) {
-    return existing.status;
-  }
-
-  if (issue.workflowState === "ready") {
-    return "ready";
-  }
-
-  if (issue.workflowState === "blocked") {
-    return "blocked";
-  }
-
-  return "queued";
 }
 
 async function recordEvent(
@@ -2889,12 +2866,8 @@ export async function getDirectorStatus(): Promise<DirectorStatusResponse> {
     return {
       project: session.project,
       orchestrator,
-      queue: workItems
-        .filter((workItem) => ["queued", "ready", "planning"].includes(workItem.status))
-        .sort((left, right) => left.priorityBucket - right.priorityBucket || left.issueNumber - right.issueNumber),
-      activeWork: workItems
-        .filter((workItem) => ["running", "waiting_review", "waiting_decision"].includes(workItem.status))
-        .sort((left, right) => left.issueNumber - right.issueNumber),
+      queue: selectQueuedWorkItems(workItems),
+      activeWork: selectActiveWorkItems(workItems),
       decisions: decisionRows
         .map(mapDecisionRow)
         .filter((decision) => decision.status === "open")
