@@ -28,6 +28,7 @@ export interface RuntimePaths {
   logsDir: string;
   worktreesDir: string;
   tmpDir: string;
+  orchestratorLockPath: string;
 }
 
 export function nowIso(): string {
@@ -50,7 +51,8 @@ export function resolveRuntimePaths(homeDir = path.join(os.homedir(), ".director
     databasePath: path.join(homeDir, "director.sqlite"),
     logsDir: path.join(homeDir, "logs"),
     worktreesDir: path.join(homeDir, "worktrees"),
-    tmpDir: path.join(homeDir, "tmp")
+    tmpDir: path.join(homeDir, "tmp"),
+    orchestratorLockPath: path.join(homeDir, "orchestrator.lock.json")
   };
 }
 

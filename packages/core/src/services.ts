@@ -1,5 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
@@ -108,9 +109,16 @@ const execFileAsync = promisify(execFile);
 
 const AUTOMATION_WAIT_MS = 10 * 60 * 1000;
 const LOOP_INTERVAL_MS = 5 * 1000;
+const ORCHESTRATOR_OWNER_TOKEN = `${process.pid}:${randomUUID()}`;
 
 let orchestratorTimer: NodeJS.Timeout | null = null;
 let orchestratorRunning = false;
+
+type OrchestratorLockRecord = {
+  pid: number;
+  token: string;
+  acquiredAt: string;
+};
 
 type RuntimeSession = {
   paths: RuntimePaths;
@@ -147,6 +155,124 @@ async function pathExists(targetPath: string): Promise<boolean> {
     return true;
   } catch {
     return false;
+  }
+}
+
+function isProcessAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) {
+    return false;
+  }
+
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function readOrchestratorLock(paths: RuntimePaths): Promise<OrchestratorLockRecord | null> {
+  try {
+    const raw = await fs.readFile(paths.orchestratorLockPath, "utf8");
+    const parsed = JSON.parse(raw) as Partial<OrchestratorLockRecord>;
+    if (
+      typeof parsed.pid === "number" &&
+      typeof parsed.token === "string" &&
+      typeof parsed.acquiredAt === "string"
+    ) {
+      return {
+        pid: parsed.pid,
+        token: parsed.token,
+        acquiredAt: parsed.acquiredAt
+      };
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return null;
+    }
+  }
+
+  return null;
+}
+
+async function writeOrchestratorLock(paths: RuntimePaths): Promise<void> {
+  await fs.writeFile(
+    paths.orchestratorLockPath,
+    `${JSON.stringify(
+      {
+        pid: process.pid,
+        token: ORCHESTRATOR_OWNER_TOKEN,
+        acquiredAt: nowIso()
+      } satisfies OrchestratorLockRecord,
+      null,
+      2
+    )}\n`,
+    {
+      encoding: "utf8",
+      flag: "wx"
+    }
+  );
+}
+
+async function acquireOrchestratorLock(
+  paths: RuntimePaths
+): Promise<"owned" | "acquired" | "busy"> {
+  const current = await readOrchestratorLock(paths);
+  if (current?.token === ORCHESTRATOR_OWNER_TOKEN) {
+    return "owned";
+  }
+
+  try {
+    await writeOrchestratorLock(paths);
+    return "acquired";
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code !== "EEXIST") {
+      throw error;
+    }
+  }
+
+  const existing = await readOrchestratorLock(paths);
+  if (existing?.token === ORCHESTRATOR_OWNER_TOKEN) {
+    return "owned";
+  }
+
+  if (existing && isProcessAlive(existing.pid)) {
+    return "busy";
+  }
+
+  try {
+    await fs.unlink(paths.orchestratorLockPath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      throw error;
+    }
+  }
+
+  try {
+    await writeOrchestratorLock(paths);
+    return "acquired";
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "EEXIST") {
+      return "busy";
+    }
+    throw error;
+  }
+}
+
+async function releaseOrchestratorLock(paths: RuntimePaths): Promise<void> {
+  const current = await readOrchestratorLock(paths);
+  if (current?.token !== ORCHESTRATOR_OWNER_TOKEN) {
+    return;
+  }
+
+  try {
+    await fs.unlink(paths.orchestratorLockPath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      throw error;
+    }
   }
 }
 
@@ -1663,6 +1789,74 @@ async function setOrchestratorState(
   return mapOrchestratorRow(assertPresent(row[0], "Orchestrator row missing after update."));
 }
 
+async function recoverInterruptedRuns(session: ProjectSession): Promise<void> {
+  const runRows = await session.db
+    .select()
+    .from(runsTable)
+    .where(eq(runsTable.projectId, session.project.id));
+  const runningRuns = runRows
+    .map(mapRunRow)
+    .filter((run) => run.status === "running");
+
+  if (!runningRuns.length) {
+    return;
+  }
+
+  for (const run of runningRuns) {
+    await updateRun(session, run.id, {
+      status: "failed",
+      summary:
+        run.issueNumber !== null
+          ? `Recovered interrupted run for issue #${run.issueNumber} after the previous local loop owner exited.`
+          : "Recovered an interrupted run after the previous local loop owner exited.",
+      recommendedNextAction: "Retry the work from the existing worktree.",
+      artifacts: run.artifacts,
+      blockingQuestions: run.blockingQuestions,
+      outputJson: run.outputJson,
+      rawModelOutput: run.rawModelOutput
+    });
+  }
+
+  const workItemRows = await session.db
+    .select()
+    .from(workItemsTable)
+    .where(eq(workItemsTable.projectId, session.project.id));
+  const workItemsById = new Map(workItemRows.map((row) => [row.id, mapWorkItemRow(row)]));
+  const recoveredWorkItems = new Set<number>();
+
+  for (const run of runningRuns) {
+    if (run.workItemId === null || recoveredWorkItems.has(run.workItemId)) {
+      continue;
+    }
+
+    const workItem = workItemsById.get(run.workItemId);
+    if (!workItem) {
+      continue;
+    }
+
+    await upsertWorkItem(session.db, session.project.id, {
+      issueNumber: workItem.issueNumber,
+      parentIssueNumber: workItem.parentIssueNumber,
+      title: workItem.title,
+      summary: workItem.summary,
+      kind: workItem.kind,
+      executionMode: workItem.executionMode,
+      ownerRole: workItem.ownerRole,
+      status: workItem.activePrNumber ? "waiting_review" : "ready",
+      priorityBucket: inferPriorityBucket(workItem.activePrNumber ? "waiting_review" : "ready"),
+      activeRunId: null,
+      activePrNumber: workItem.activePrNumber,
+      lastSummary:
+        run.issueNumber !== null
+          ? `Recovered interrupted work on issue #${run.issueNumber} after the previous local loop owner exited.`
+          : "Recovered interrupted work after the previous local loop owner exited."
+    });
+    recoveredWorkItems.add(run.workItemId);
+  }
+
+  await syncOrchestratorActiveRuns(session);
+}
+
 async function getOpenPullRequests(
   session: ProjectSession
 ): Promise<GitHubPullRequestRecord[]> {
@@ -1962,11 +2156,94 @@ async function createHumanQuestionDecision(
     rationale: string;
   }
 ): Promise<DecisionRecord> {
+  const existingRows = await session.db
+    .select()
+    .from(decisionsTable)
+    .where(eq(decisionsTable.projectId, session.project.id));
+  const existing = existingRows
+    .map(mapDecisionRow)
+    .find(
+      (decision) =>
+        decision.status === "open" &&
+        decision.target === "human_director" &&
+        decision.title === input.title &&
+        decision.issueNumber === (input.workItem?.issueNumber ?? null) &&
+        decision.prNumber === input.prNumber
+    );
+
   const questionContent = formatHumanQuestionContent(
     input.question,
     input.summary,
     input.recommendation
   );
+
+  if (existing) {
+    const timestamp = nowIso();
+
+    await session.db
+      .update(decisionsTable)
+      .set({
+        workItemId: input.workItem?.id ?? null,
+        issueNumber: input.workItem?.issueNumber ?? null,
+        prNumber: input.prNumber,
+        requestedByRunId: input.runId,
+        summary: input.summary,
+        recommendation: input.recommendation,
+        rationale: input.rationale,
+        updatedAt: timestamp
+      })
+      .where(eq(decisionsTable.id, existing.id));
+
+    if (existing.questionMessageId) {
+      await session.db
+        .update(conversationMessagesTable)
+        .set({
+          content: questionContent,
+          summary: summarizeText(input.question),
+          linkedIssueNumber: input.workItem?.issueNumber ?? null,
+          linkedPrNumber: input.prNumber,
+          isOpenQuestion: true,
+          workItemId: input.workItem?.id ?? null,
+          issueNumber: input.workItem?.issueNumber ?? null,
+          prNumber: input.prNumber,
+          decisionId: existing.id,
+          runId: input.runId,
+          updatedAt: timestamp
+        })
+        .where(eq(conversationMessagesTable.id, existing.questionMessageId));
+    } else {
+      const questionMessage = await appendConversationMessage(session, {
+        role: "chief_of_staff",
+        kind: "cos_question",
+        content: questionContent,
+        summary: summarizeText(input.question),
+        linkedIssueNumber: input.workItem?.issueNumber ?? null,
+        linkedPrNumber: input.prNumber,
+        isOpenQuestion: true,
+        workItemId: input.workItem?.id ?? null,
+        issueNumber: input.workItem?.issueNumber ?? null,
+        prNumber: input.prNumber,
+        decisionId: existing.id,
+        runId: input.runId
+      });
+
+      await session.db
+        .update(decisionsTable)
+        .set({
+          questionMessageId: questionMessage.id,
+          updatedAt: timestamp
+        })
+        .where(eq(decisionsTable.id, existing.id));
+    }
+
+    const row = await session.db
+      .select()
+      .from(decisionsTable)
+      .where(eq(decisionsTable.id, existing.id))
+      .limit(1);
+    return mapDecisionRow(assertPresent(row[0], `Decision ${existing.id} missing after update.`));
+  }
+
   const questionMessage = await appendConversationMessage(session, {
     role: "chief_of_staff",
     kind: "cos_question",
@@ -3446,13 +3723,30 @@ async function ensureOrchestratorLoop(): Promise<void> {
     return;
   }
 
+  const paths = await ensureRuntimeDirectories(resolveRuntimePaths());
+  const ownership = await acquireOrchestratorLock(paths);
+  if (ownership === "busy") {
+    return;
+  }
+
   orchestratorRunning = true;
+  let keepLock = false;
   try {
+    if (ownership === "acquired") {
+      await withProject(async (session) => {
+        await recoverInterruptedRuns(session);
+      });
+    }
+
     const shouldContinue = await runOrchestratorIteration();
     if (shouldContinue) {
+      keepLock = true;
       scheduleOrchestratorLoop(LOOP_INTERVAL_MS);
     }
   } finally {
+    if (!keepLock) {
+      await releaseOrchestratorLock(paths);
+    }
     orchestratorRunning = false;
   }
 }
@@ -4021,22 +4315,39 @@ export async function resolveDecision(
 }
 
 export async function startOrchestrator(): Promise<DirectorOperationResponse> {
-  const response = await withProject(async (session) => {
-    await ensureOrchestratorRow(session);
-    await setOrchestratorState(session, "running", {
-      pauseReason: null,
-      lastSummary: "Chief of Staff is running.",
-      lastLoopAt: nowIso()
+  const paths = await ensureRuntimeDirectories(resolveRuntimePaths());
+  const ownership = await acquireOrchestratorLock(paths);
+  try {
+    const response = await withProject(async (session) => {
+      await ensureOrchestratorRow(session);
+      if (ownership === "acquired") {
+        await recoverInterruptedRuns(session);
+      }
+      await setOrchestratorState(session, "running", {
+        pauseReason: null,
+        lastSummary: "Chief of Staff is running.",
+        lastLoopAt: nowIso()
+      });
+      await recordEvent(session.db, session.project.id, "orchestrator.started", {});
+      return {
+        ok: true,
+        message:
+          ownership === "busy"
+            ? "Chief of Staff is already running in another local Director OS process."
+            : "Chief of Staff loop started."
+      };
     });
-    await recordEvent(session.db, session.project.id, "orchestrator.started", {});
-    return {
-      ok: true,
-      message: "Chief of Staff loop started."
-    };
-  });
 
-  scheduleOrchestratorLoop(0);
-  return response;
+    if (ownership !== "busy") {
+      scheduleOrchestratorLoop(0);
+    }
+    return response;
+  } catch (error) {
+    if (ownership !== "busy") {
+      await releaseOrchestratorLock(paths);
+    }
+    throw error;
+  }
 }
 
 export async function pauseOrchestrator(reason?: string): Promise<DirectorOperationResponse> {

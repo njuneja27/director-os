@@ -34,7 +34,23 @@ const outputSchema = {
     "summary",
     "recommended_next_action",
     "artifact_refs",
-    "blocking_questions"
+    "blocking_questions",
+    "outcome",
+    "guidance",
+    "transcript_reply",
+    "why_it_matters",
+    "question",
+    "recommendation",
+    "selected_issue_number",
+    "execution_intent",
+    "rationale",
+    "new_issues",
+    "child_tasks",
+    "decision",
+    "feedback",
+    "kind",
+    "reply",
+    "command_error"
   ],
   properties: {
     status: {
@@ -59,12 +75,113 @@ const outputSchema = {
         type: "string"
       }
     },
-    data: {
-      type: "object",
-      additionalProperties: true
+    outcome: {
+      type: ["string", "null"]
+    },
+    guidance: {
+      type: ["string", "null"]
+    },
+    transcript_reply: {
+      type: ["string", "null"]
+    },
+    why_it_matters: {
+      type: ["string", "null"]
+    },
+    question: {
+      type: ["string", "null"]
+    },
+    recommendation: {
+      type: ["string", "null"]
+    },
+    selected_issue_number: {
+      type: ["number", "null"]
+    },
+    execution_intent: {
+      type: ["string", "null"]
+    },
+    rationale: {
+      type: ["string", "null"]
+    },
+    new_issues: {
+      type: ["array", "null"],
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["title", "body", "kind", "execution_mode"],
+        properties: {
+          title: {
+            type: "string"
+          },
+          body: {
+            type: "string"
+          },
+          kind: {
+            type: "string"
+          },
+          execution_mode: {
+            type: "string"
+          }
+        }
+      }
+    },
+    child_tasks: {
+      type: ["array", "null"],
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["title", "body", "kind", "execution_mode"],
+        properties: {
+          title: {
+            type: "string"
+          },
+          body: {
+            type: "string"
+          },
+          kind: {
+            type: "string"
+          },
+          execution_mode: {
+            type: "string"
+          }
+        }
+      }
+    },
+    decision: {
+      type: ["string", "null"]
+    },
+    feedback: {
+      type: ["string", "null"]
+    },
+    kind: {
+      type: ["string", "null"]
+    },
+    reply: {
+      type: ["string", "null"]
+    },
+    command_error: {
+      type: ["string", "null"]
     }
   }
 } as const;
+
+const structuredDataKeys = [
+  "outcome",
+  "guidance",
+  "transcript_reply",
+  "why_it_matters",
+  "question",
+  "recommendation",
+  "selected_issue_number",
+  "execution_intent",
+  "rationale",
+  "new_issues",
+  "child_tasks",
+  "decision",
+  "feedback",
+  "kind",
+  "reply",
+  "command_error"
+] as const;
 
 const probeSchema = {
   type: "object",
@@ -225,7 +342,12 @@ export async function runCodexAgent(
     });
 
     rawModelOutput = await fs.readFile(outputPath, "utf8");
-    const parsed = JSON.parse(rawModelOutput) as AgentResultEnvelope;
+    const parsed = JSON.parse(rawModelOutput) as AgentResultEnvelope & Record<string, unknown>;
+    const data = Object.fromEntries(
+      structuredDataKeys
+        .map((key) => [key, parsed[key]])
+        .filter(([, value]) => value !== undefined)
+    );
 
     return {
       status: parsed.status,
@@ -233,26 +355,32 @@ export async function runCodexAgent(
       recommended_next_action: parsed.recommended_next_action,
       artifact_refs: Array.isArray(parsed.artifact_refs) ? parsed.artifact_refs : [],
       blocking_questions: Array.isArray(parsed.blocking_questions) ? parsed.blocking_questions : [],
-      data: parsed.data ?? {},
+      data,
       raw_model_output: rawModelOutput
     };
   } catch (error) {
+    const errorDetail = commandErrorText(error);
+
     if (!rawModelOutput) {
       try {
         rawModelOutput = await fs.readFile(outputPath, "utf8");
       } catch {
-        rawModelOutput = null;
+        rawModelOutput = errorDetail || null;
       }
     }
 
     if (fallback) {
       return {
         ...fallback,
+        data: {
+          ...(fallback.data ?? {}),
+          ...(errorDetail ? { command_error: errorDetail } : {})
+        },
         raw_model_output: rawModelOutput
       };
     }
 
-    const message = error instanceof Error ? error.message : String(error);
+    const message = errorDetail || (error instanceof Error ? error.message : String(error));
 
     return {
       status: "failed",
