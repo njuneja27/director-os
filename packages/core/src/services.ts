@@ -91,6 +91,10 @@ import {
   viewPullRequest
 } from "./github.js";
 import {
+  parseGitWorktreeList,
+  selectReusableGitWorktree
+} from "./git-worktrees.js";
+import {
   inferWorkItemStatus,
   selectActiveWorkItems,
   selectQueuedWorkItems
@@ -135,6 +139,29 @@ async function runCommand(command: string, args: string[], cwd: string): Promise
   });
 
   return result.stdout.trim();
+}
+
+async function pathExists(targetPath: string): Promise<boolean> {
+  try {
+    await fs.access(targetPath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function listGitWorktrees(repoPath: string) {
+  const porcelain = await runCommand(
+    "git",
+    ["-C", repoPath, "worktree", "list", "--porcelain"],
+    repoPath
+  );
+
+  return parseGitWorktreeList(porcelain);
+}
+
+async function pruneGitWorktrees(repoPath: string): Promise<void> {
+  await runCommand("git", ["-C", repoPath, "worktree", "prune"], repoPath);
 }
 
 async function withRuntime<TValue>(
@@ -902,19 +929,37 @@ async function ensureWorktree(
   issueNumber: number,
   branchName: string,
   worktreePath: string
-): Promise<void> {
+): Promise<{ branchName: string; worktreePath: string }> {
   await fs.mkdir(project.worktreeRoot, { recursive: true });
+  await pruneGitWorktrees(project.repoPath);
 
-  try {
-    await fs.access(worktreePath);
-    return;
-  } catch {
-    await runCommand(
-      "git",
-      ["-C", project.repoPath, "worktree", "add", "-B", branchName, worktreePath, project.defaultBranch],
-      project.repoPath
-    );
+  const reusable = selectReusableGitWorktree(
+    await listGitWorktrees(project.repoPath),
+    worktreePath,
+    branchName
+  );
+
+  if (reusable && (await pathExists(reusable.path))) {
+    return {
+      branchName: reusable.branchName ?? branchName,
+      worktreePath: reusable.path
+    };
   }
+
+  if (await pathExists(worktreePath)) {
+    await fs.rm(worktreePath, { recursive: true, force: true });
+  }
+
+  await runCommand(
+    "git",
+    ["-C", project.repoPath, "worktree", "add", "-B", branchName, worktreePath, project.defaultBranch],
+    project.repoPath
+  );
+
+  return {
+    branchName,
+    worktreePath
+  };
 }
 
 async function upsertGitHubIssueMirror(
@@ -2589,9 +2634,15 @@ async function executeWorkerRun(
   const branchName =
     options.existingHeadRefName ??
     `codex/issue-${workItem.issueNumber}-${slugify(workItem.title).slice(0, 36)}`;
-  const worktreePath = path.join(session.project.worktreeRoot, `issue-${workItem.issueNumber}`);
-
-  await ensureWorktree(session.project, workItem.issueNumber, branchName, worktreePath);
+  const desiredWorktreePath = path.join(session.project.worktreeRoot, `issue-${workItem.issueNumber}`);
+  const ensuredWorktree = await ensureWorktree(
+    session.project,
+    workItem.issueNumber,
+    branchName,
+    desiredWorktreePath
+  );
+  const worktreePath = ensuredWorktree.worktreePath;
+  const activeBranchName = ensuredWorktree.branchName;
 
   const existingWorktreeRows = await session.db
     .select()
@@ -2604,7 +2655,7 @@ async function executeWorkerRun(
       .update(worktreesTable)
       .set({
         issueNumber: workItem.issueNumber,
-        branchName,
+        branchName: activeBranchName,
         status: "active",
         updatedAt: timestamp
       })
@@ -2613,7 +2664,7 @@ async function executeWorkerRun(
     await session.db.insert(worktreesTable).values({
       projectId: session.project.id,
       issueNumber: workItem.issueNumber,
-      branchName,
+      branchName: activeBranchName,
       path: worktreePath,
       status: "active",
       createdAt: timestamp,
@@ -2821,7 +2872,7 @@ async function executeWorkerRun(
     ["commit", "-m", `${options.existingPrNumber ? "Refine" : "Implement"} #${workItem.issueNumber}: ${workItem.title}`],
     worktreePath
   );
-  await runCommand("git", ["push", "-u", "origin", branchName], worktreePath);
+  await runCommand("git", ["push", "-u", "origin", activeBranchName], worktreePath);
 
   let prNumber = options.existingPrNumber ?? null;
   let prUrl: string | null = null;
@@ -2829,7 +2880,7 @@ async function executeWorkerRun(
   if (!prNumber) {
     const createdPullRequest = await createPullRequest(worktreePath, {
       baseBranch: session.project.defaultBranch,
-      headBranch: branchName,
+      headBranch: activeBranchName,
       title: workItem.title,
       body: [`Fixes #${workItem.issueNumber}`, "", workerResult.summary].join("\n")
     });
