@@ -7,6 +7,7 @@ import Fastify from "fastify";
 
 import {
   completeSetup,
+  getConversation,
   getDirectorStatus,
   getSetupStatus,
   listDecisions,
@@ -15,6 +16,7 @@ import {
   resolveDecision,
   runWorkspaceSetupTest,
   startOrchestrator,
+  sendConversationMessage,
   submitDirectorNote,
   syncProject
 } from "./services.js";
@@ -41,6 +43,7 @@ export async function createDirectorServer() {
   }));
 
   app.get("/api/setup/status", async () => getSetupStatus());
+  app.get("/api/conversation", async () => getConversation());
 
   app.post<{
     Body: {
@@ -83,6 +86,9 @@ export async function createDirectorServer() {
 
   app.get("/api/status", async () => getDirectorStatus());
   app.get("/api/decisions", async () => listDecisions());
+  app.post<{ Body: { content: string } }>("/api/conversation", async (request) =>
+    sendConversationMessage(request.body.content)
+  );
 
   app.post("/api/start", async () => startOrchestrator());
   app.post<{ Body: { reason?: string } }>("/api/pause", async (request) =>

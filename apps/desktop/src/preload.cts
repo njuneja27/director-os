@@ -1,8 +1,10 @@
 import { contextBridge, ipcRenderer } from "electron";
 
 import type {
+  ConversationResponse,
   DecisionRecord,
   DecisionsResponse,
+  DirectorDesktopBridge,
   DirectorNoteRecord,
   DirectorOperationResponse,
   DirectorStatusResponse,
@@ -13,29 +15,15 @@ import type {
 
 import { IPC_CHANNELS } from "./protocol.js";
 
-interface DesktopBridge {
-  setup: {
-    getStatus(): Promise<SetupStatusResponse>;
-    probeRepository(input: SetupProbeRepositoryInput): Promise<SetupStatusResponse>;
-    runWorkspaceTest(input: SetupRepositoryDraft): Promise<SetupStatusResponse>;
-    complete(input: SetupRepositoryDraft): Promise<SetupStatusResponse>;
-  };
-  director: {
-    getStatus(): Promise<DirectorStatusResponse>;
-    start(): Promise<DirectorOperationResponse>;
-    pause(reason?: string): Promise<DirectorOperationResponse>;
-    sync(): Promise<DirectorOperationResponse>;
-    submitNote(content: string): Promise<DirectorNoteRecord>;
-    listDecisions(): Promise<DecisionsResponse>;
-    resolveDecision(decisionId: number, resolution: string): Promise<DecisionRecord>;
-  };
-}
-
 function invoke<T>(channel: string, ...args: unknown[]): Promise<T> {
   return ipcRenderer.invoke(channel, ...args) as Promise<T>;
 }
 
-const api: DesktopBridge = {
+const api: DirectorDesktopBridge = {
+  conversation: {
+    getConversation: () => invoke(IPC_CHANNELS.conversation.get),
+    sendMessage: (content: string) => invoke(IPC_CHANNELS.conversation.send, content)
+  },
   setup: {
     getStatus: () => invoke(IPC_CHANNELS.setup.getStatus),
     probeRepository: (input: SetupProbeRepositoryInput) =>

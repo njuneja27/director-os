@@ -1,7 +1,11 @@
 import type {
+  ConversationMessageRecord,
+  ConversationResponse,
+  ConversationThreadRecord,
   DecisionRecord,
   DecisionsResponse,
   DirectorClient,
+  DirectorDesktopBridge,
   DirectorNoteRecord,
   DirectorOperationResponse,
   DirectorStatusResponse,
@@ -15,6 +19,9 @@ import type {
 } from "@director-os/shared";
 
 export type {
+  ConversationMessageRecord,
+  ConversationResponse,
+  ConversationThreadRecord,
   DecisionRecord,
   DecisionsResponse,
   DirectorNoteRecord,
@@ -30,26 +37,13 @@ export type {
 
 declare global {
   interface Window {
-    director?: ElectronDirectorBridge;
+    director?: DirectorDesktopBridge;
   }
 }
 
-interface ElectronDirectorBridge {
-  setup: {
-    getStatus(): Promise<SetupStatusResponse>;
-    probeRepository(input: SetupProbeRepositoryInput): Promise<SetupStatusResponse>;
-    runWorkspaceTest(repositoryDraft: SetupRepositoryDraft): Promise<SetupStatusResponse>;
-    complete(repositoryDraft: SetupRepositoryDraft): Promise<SetupStatusResponse>;
-  };
-  director: {
-    getStatus(): Promise<DirectorStatusResponse>;
-    start(): Promise<DirectorOperationResponse>;
-    pause(reason?: string): Promise<DirectorOperationResponse>;
-    sync(): Promise<DirectorOperationResponse>;
-    submitNote(content: string): Promise<DirectorNoteRecord>;
-    listDecisions(): Promise<DecisionsResponse>;
-    resolveDecision(decisionId: number, resolution: string): Promise<DecisionRecord>;
-  };
+interface WebDirectorClient extends DirectorClient {
+  getConversation(): Promise<ConversationResponse>;
+  sendMessage(content: string): Promise<ConversationResponse>;
 }
 
 function hasElectronBridge(): boolean {
@@ -80,8 +74,14 @@ async function requestJson<T>(input: string, init?: RequestInit): Promise<T> {
   return (await response.json()) as T;
 }
 
-function createHttpDirectorClient(): DirectorClient {
+function createHttpDirectorClient(): WebDirectorClient {
   return {
+    getConversation: () => requestJson<ConversationResponse>("/api/conversation"),
+    sendMessage: (content: string) =>
+      requestJson<ConversationResponse>("/api/conversation", {
+        method: "POST",
+        body: JSON.stringify({ content })
+      }),
     getSetupStatus: () => requestJson<SetupStatusResponse>("/api/setup/status"),
     probeRepository: (input: SetupProbeRepositoryInput) =>
       requestJson<SetupStatusResponse>("/api/setup/probe-repository", {
@@ -126,8 +126,10 @@ function createHttpDirectorClient(): DirectorClient {
   };
 }
 
-function createIpcDirectorClient(bridge: ElectronDirectorBridge): DirectorClient {
+function createIpcDirectorClient(bridge: DirectorDesktopBridge): WebDirectorClient {
   return {
+    getConversation: () => bridge.conversation.getConversation(),
+    sendMessage: (content: string) => bridge.conversation.sendMessage(content),
     getSetupStatus: () => bridge.setup.getStatus(),
     probeRepository: (input: SetupProbeRepositoryInput) => bridge.setup.probeRepository(input),
     runWorkspaceTest: (repositoryDraft: SetupRepositoryDraft) =>
@@ -144,18 +146,26 @@ function createIpcDirectorClient(bridge: ElectronDirectorBridge): DirectorClient
   };
 }
 
-let cachedClient: DirectorClient | null = null;
+let cachedClient: WebDirectorClient | null = null;
 
-export function getDirectorClient(): DirectorClient {
+export function getDirectorClient(): WebDirectorClient {
   if (cachedClient) {
     return cachedClient;
   }
 
   cachedClient = hasElectronBridge()
-    ? createIpcDirectorClient(window.director as ElectronDirectorBridge)
+    ? createIpcDirectorClient(window.director as DirectorDesktopBridge)
     : createHttpDirectorClient();
 
   return cachedClient;
+}
+
+export async function fetchConversation(): Promise<ConversationResponse> {
+  return getDirectorClient().getConversation();
+}
+
+export async function sendMessage(content: string): Promise<ConversationResponse> {
+  return getDirectorClient().sendMessage(content);
 }
 
 export async function fetchSetupStatus(): Promise<SetupStatusResponse> {

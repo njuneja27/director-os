@@ -9,6 +9,9 @@ import { desc, eq } from "drizzle-orm";
 import {
   DIRECTOR_LABEL_PREFIX,
   type AgentResultEnvelope,
+  type ConversationMessageRecord,
+  type ConversationResponse,
+  type ConversationThreadRecord,
   type DecisionRecord,
   type DecisionsResponse,
   type DirectorNoteRecord,
@@ -51,6 +54,8 @@ import {
 } from "./config.js";
 import {
   asJson,
+  conversationMessagesTable,
+  conversationThreadsTable,
   decisionsTable,
   directorNotesTable,
   eventsTable,
@@ -285,6 +290,9 @@ function mapDecisionRow(row: typeof decisionsTable.$inferSelect): DecisionRecord
     workItemId: row.workItemId ?? null,
     issueNumber: row.issueNumber ?? null,
     prNumber: row.prNumber ?? null,
+    requestedByRunId: row.requestedByRunId ?? null,
+    questionMessageId: row.questionMessageId ?? null,
+    resolutionMessageId: row.resolutionMessageId ?? null,
     target: row.target as DecisionRecord["target"],
     title: row.title,
     summary: row.summary,
@@ -292,6 +300,38 @@ function mapDecisionRow(row: typeof decisionsTable.$inferSelect): DecisionRecord
     rationale: row.rationale,
     status: row.status as DecisionRecord["status"],
     resolution: row.resolution ?? null,
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt
+  };
+}
+
+function mapConversationThreadRow(
+  row: typeof conversationThreadsTable.$inferSelect
+): ConversationThreadRecord {
+  return {
+    id: row.id,
+    projectId: row.projectId,
+    title: row.title,
+    status: row.status as ConversationThreadRecord["status"],
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt
+  };
+}
+
+function mapConversationMessageRow(
+  row: typeof conversationMessagesTable.$inferSelect
+): ConversationMessageRecord {
+  return {
+    id: row.id,
+    threadId: row.threadId,
+    projectId: row.projectId,
+    role: row.role as ConversationMessageRecord["role"],
+    kind: row.kind as ConversationMessageRecord["kind"],
+    content: row.content,
+    summary: row.summary ?? summarizeText(row.content),
+    linkedIssueNumber: row.linkedIssueNumber ?? row.issueNumber ?? null,
+    linkedPrNumber: row.linkedPrNumber ?? row.prNumber ?? null,
+    isOpenQuestion: row.isOpenQuestion ?? false,
     createdAt: row.createdAt,
     updatedAt: row.updatedAt
   };
@@ -1127,6 +1167,265 @@ async function updateRun(
   return mapped;
 }
 
+async function ensureConversationThread(
+  session: ProjectSession
+): Promise<ConversationThreadRecord> {
+  const existingRows = await session.db
+    .select()
+    .from(conversationThreadsTable)
+    .where(eq(conversationThreadsTable.projectId, session.project.id))
+    .limit(1);
+
+  let thread = existingRows[0] ? mapConversationThreadRow(existingRows[0]) : null;
+  if (!thread) {
+    const timestamp = nowIso();
+    const result = await session.db.insert(conversationThreadsTable).values({
+      projectId: session.project.id,
+      title: `${session.project.name} Chief of Staff`,
+      status: "active",
+      createdAt: timestamp,
+      updatedAt: timestamp
+    });
+    const row = await session.db
+      .select()
+      .from(conversationThreadsTable)
+      .where(eq(conversationThreadsTable.id, Number(result.lastInsertRowid)))
+      .limit(1);
+    thread = mapConversationThreadRow(assertPresent(row[0], "Conversation thread missing after insert."));
+  }
+
+  const messageRows = await session.db
+    .select()
+    .from(conversationMessagesTable)
+    .where(eq(conversationMessagesTable.threadId, thread.id))
+    .limit(1);
+  if (messageRows[0]) {
+    return thread;
+  }
+
+  const noteRows = await session.db
+    .select()
+    .from(directorNotesTable)
+    .where(eq(directorNotesTable.projectId, session.project.id));
+  for (const note of noteRows.map(mapNoteRow).sort((left, right) => left.createdAt.localeCompare(right.createdAt))) {
+    await session.db.insert(conversationMessagesTable).values({
+      threadId: thread.id,
+      projectId: session.project.id,
+      role: "director",
+      kind: "human_message",
+      content: note.content,
+      summary: summarizeText(note.content),
+      linkedIssueNumber: null,
+      linkedPrNumber: null,
+      isOpenQuestion: false,
+      workItemId: null,
+      issueNumber: null,
+      prNumber: null,
+      decisionId: null,
+      runId: null,
+      createdAt: note.createdAt,
+      updatedAt: note.updatedAt
+    });
+  }
+
+  return thread;
+}
+
+type ConversationMessageWriteInput = {
+  threadId?: number;
+  role: ConversationMessageRecord["role"];
+  kind: ConversationMessageRecord["kind"];
+  content: string;
+  summary?: string | null;
+  linkedIssueNumber?: number | null;
+  linkedPrNumber?: number | null;
+  isOpenQuestion?: boolean;
+  workItemId?: number | null;
+  issueNumber?: number | null;
+  prNumber?: number | null;
+  decisionId?: number | null;
+  runId?: number | null;
+};
+
+async function appendConversationMessage(
+  session: ProjectSession,
+  input: ConversationMessageWriteInput
+): Promise<ConversationMessageRecord> {
+  const thread =
+    input.threadId !== undefined
+      ? mapConversationThreadRow(
+          assertPresent(
+            (
+              await session.db
+                .select()
+                .from(conversationThreadsTable)
+                .where(eq(conversationThreadsTable.id, input.threadId))
+                .limit(1)
+            )[0],
+            `Conversation thread ${input.threadId} was not found.`
+          )
+        )
+      : await ensureConversationThread(session);
+  const timestamp = nowIso();
+  const result = await session.db.insert(conversationMessagesTable).values({
+    threadId: thread.id,
+    projectId: session.project.id,
+    role: input.role,
+    kind: input.kind,
+    content: input.content,
+    summary: input.summary ?? summarizeText(input.content),
+    linkedIssueNumber: input.linkedIssueNumber ?? input.issueNumber ?? null,
+    linkedPrNumber: input.linkedPrNumber ?? input.prNumber ?? null,
+    isOpenQuestion: input.isOpenQuestion ?? input.kind === "cos_question",
+    workItemId: input.workItemId,
+    issueNumber: input.issueNumber,
+    prNumber: input.prNumber,
+    decisionId: input.decisionId,
+    runId: input.runId,
+    createdAt: timestamp,
+    updatedAt: timestamp
+  });
+
+  await session.db
+    .update(conversationThreadsTable)
+    .set({
+      updatedAt: timestamp
+    })
+    .where(eq(conversationThreadsTable.id, thread.id));
+
+  const row = await session.db
+    .select()
+    .from(conversationMessagesTable)
+    .where(eq(conversationMessagesTable.id, Number(result.lastInsertRowid)))
+    .limit(1);
+  return mapConversationMessageRow(assertPresent(row[0], "Conversation message missing after insert."));
+}
+
+async function getOpenHumanDecision(session: ProjectSession): Promise<DecisionRecord | null> {
+  const rows = await session.db
+    .select()
+    .from(decisionsTable)
+    .where(eq(decisionsTable.projectId, session.project.id));
+  return (
+    rows
+      .map(mapDecisionRow)
+      .filter((decision) => decision.status === "open" && decision.target === "human_director")
+      .sort((left, right) => left.createdAt.localeCompare(right.createdAt))
+      .at(0) ?? null
+  );
+}
+
+function formatQuestionContentFromDecision(decision: DecisionRecord): string {
+  const prompt =
+    decision.issueNumber !== null
+      ? `I need your direction on issue #${decision.issueNumber} before I resume the work.`
+      : decision.title.trim() || "I need your direction before I can continue.";
+  const whyItMatters = decision.summary.trim()
+    ? `Why this matters: ${decision.summary.trim()}`
+    : null;
+  const recommendation = `Recommendation: ${
+    decision.recommendation.trim() || "Reply with the direction you want me to take."
+  }`;
+
+  return [prompt, whyItMatters, recommendation]
+    .filter((value): value is string => Boolean(value && value.trim().length > 0))
+    .join("\n\n");
+}
+
+async function backfillOpenDecisionQuestions(session: ProjectSession): Promise<void> {
+  const thread = await ensureConversationThread(session);
+  const rows = await session.db
+    .select()
+    .from(decisionsTable)
+    .where(eq(decisionsTable.projectId, session.project.id));
+  const openHumanDecisions = rows
+    .map(mapDecisionRow)
+    .filter((decision) => decision.status === "open" && decision.target === "human_director")
+    .filter((decision) => decision.questionMessageId === null)
+    .sort((left, right) => left.createdAt.localeCompare(right.createdAt));
+
+  for (const decision of openHumanDecisions) {
+    const content = formatQuestionContentFromDecision(decision);
+    const questionMessage = await appendConversationMessage(session, {
+      threadId: thread.id,
+      role: "chief_of_staff",
+      kind: "cos_question",
+      content,
+      summary: summarizeText(content),
+      linkedIssueNumber: decision.issueNumber ?? null,
+      linkedPrNumber: decision.prNumber ?? null,
+      isOpenQuestion: true,
+      workItemId: decision.workItemId ?? null,
+      issueNumber: decision.issueNumber ?? null,
+      prNumber: decision.prNumber ?? null,
+      decisionId: decision.id,
+      runId: decision.requestedByRunId ?? null
+    });
+
+    await session.db
+      .update(decisionsTable)
+      .set({
+        questionMessageId: questionMessage.id,
+        updatedAt: nowIso()
+      })
+      .where(eq(decisionsTable.id, decision.id));
+  }
+}
+
+async function getConversationQuestionMessage(
+  session: ProjectSession,
+  decision: DecisionRecord | null
+): Promise<ConversationMessageRecord | null> {
+  if (!decision?.questionMessageId) {
+    return null;
+  }
+
+  const rows = await session.db
+    .select()
+    .from(conversationMessagesTable)
+    .where(eq(conversationMessagesTable.id, decision.questionMessageId))
+    .limit(1);
+
+  return rows[0] ? mapConversationMessageRow(rows[0]) : null;
+}
+
+async function getConversationResponse(session: ProjectSession): Promise<ConversationResponse> {
+  const thread = await ensureConversationThread(session);
+  await backfillOpenDecisionQuestions(session);
+  const messageRows = await session.db
+    .select()
+    .from(conversationMessagesTable)
+    .where(eq(conversationMessagesTable.threadId, thread.id));
+  const messages = messageRows
+    .map(mapConversationMessageRow)
+    .sort((left, right) =>
+      left.createdAt === right.createdAt ? left.id - right.id : left.createdAt.localeCompare(right.createdAt)
+    );
+  const openDecision = await getOpenHumanDecision(session);
+  const openQuestion =
+    (await getConversationQuestionMessage(session, openDecision)) ??
+    messages.find((message) => message.isOpenQuestion && message.kind === "cos_question") ??
+    null;
+
+  return {
+    thread,
+    messages,
+    openQuestion,
+    latestSummary: messages.at(-1)?.summary ?? null
+  };
+}
+
+function formatResolutionMessage(decision: DecisionRecord, resolution: string): string {
+  const lines = [
+    `Resolution recorded for: ${decision.title}`,
+    resolution.trim(),
+    decision.recommendation ? `Chief of Staff recommendation: ${decision.recommendation}` : null,
+    decision.summary ? `Context: ${decision.summary}` : null
+  ].filter((line): line is string => Boolean(line && line.trim().length > 0));
+
+  return lines.join("\n");
+}
+
 async function createDecision(
   session: ProjectSession,
   input: Omit<DecisionRecord, "id" | "projectId" | "createdAt" | "updatedAt" | "status" | "resolution">
@@ -1137,6 +1436,9 @@ async function createDecision(
     workItemId: input.workItemId,
     issueNumber: input.issueNumber,
     prNumber: input.prNumber,
+    requestedByRunId: input.requestedByRunId,
+    questionMessageId: input.questionMessageId,
+    resolutionMessageId: input.resolutionMessageId,
     target: input.target,
     title: input.title,
     summary: input.summary,
@@ -1532,6 +1834,243 @@ function parseDataArray(value: unknown): Array<Record<string, unknown>> {
     : [];
 }
 
+function guidancePromptSuffix(value: string | null): string | undefined {
+  if (!value) {
+    return undefined;
+  }
+
+  if (
+    value.startsWith("Decision resolved:") ||
+    value.startsWith("Chief of Staff guidance:") ||
+    value.startsWith("Human guidance:")
+  ) {
+    return value;
+  }
+
+  return undefined;
+}
+
+async function recentConversationPrompt(session: ProjectSession, limit = 10): Promise<string> {
+  const thread = await ensureConversationThread(session);
+  const rows = await session.db
+    .select()
+    .from(conversationMessagesTable)
+    .where(eq(conversationMessagesTable.threadId, thread.id));
+  const messages = rows
+    .map(mapConversationMessageRow)
+    .sort((left, right) =>
+      left.createdAt === right.createdAt ? left.id - right.id : left.createdAt.localeCompare(right.createdAt)
+    )
+    .slice(-limit);
+
+  if (!messages.length) {
+    return "No prior conversation.";
+  }
+
+  return messages
+    .map((message) => `[${message.role}/${message.kind}] ${message.content}`)
+    .join("\n");
+}
+
+async function createHumanQuestionDecision(
+  session: ProjectSession,
+  input: {
+    workItem: WorkItemRecord | null;
+    prNumber: number | null;
+    runId: number | null;
+    title: string;
+    summary: string;
+    question: string;
+    recommendation: string;
+    rationale: string;
+  }
+): Promise<DecisionRecord> {
+  const questionContent = [
+    input.question.trim(),
+    "",
+    `Why this matters: ${input.summary.trim()}`,
+    `Recommendation: ${input.recommendation.trim() || "Reply with the direction you want me to take."}`
+  ].join("\n");
+  const questionMessage = await appendConversationMessage(session, {
+    role: "chief_of_staff",
+    kind: "cos_question",
+    content: questionContent,
+    summary: summarizeText(questionContent),
+    linkedIssueNumber: input.workItem?.issueNumber ?? null,
+    linkedPrNumber: input.prNumber,
+    isOpenQuestion: true,
+    workItemId: input.workItem?.id ?? null,
+    issueNumber: input.workItem?.issueNumber ?? null,
+    prNumber: input.prNumber,
+    decisionId: null,
+    runId: input.runId
+  });
+
+  const decision = await createDecision(session, {
+    workItemId: input.workItem?.id ?? null,
+    issueNumber: input.workItem?.issueNumber ?? null,
+    prNumber: input.prNumber,
+    requestedByRunId: input.runId,
+    questionMessageId: questionMessage.id,
+    resolutionMessageId: null,
+    target: "human_director",
+    title: input.title,
+    summary: input.summary,
+    recommendation: input.recommendation,
+    rationale: input.rationale
+  });
+
+  await session.db
+    .update(conversationMessagesTable)
+    .set({
+      decisionId: decision.id,
+      isOpenQuestion: true,
+      updatedAt: nowIso()
+    })
+    .where(eq(conversationMessagesTable.id, questionMessage.id));
+
+  return decision;
+}
+
+async function mediateAgentBlock(
+  session: ProjectSession,
+  input: {
+    workItem: WorkItemRecord;
+    runId: number;
+    prNumber: number | null;
+    source: "lane_owner" | "worker";
+    summary: string;
+    recommendedNextAction: string;
+    blockingQuestions: string[];
+    allowInternalResolution: boolean;
+  }
+): Promise<
+  | { kind: "resume"; guidance: string; transcript: string }
+  | { kind: "ask_human"; decision: DecisionRecord }
+> {
+  if (!input.allowInternalResolution) {
+    const firstQuestion =
+      input.blockingQuestions[0] ??
+      "There is a blocking product decision that the Chief of Staff could not safely infer.";
+    const decision = await createHumanQuestionDecision(session, {
+      workItem: input.workItem,
+      prNumber: input.prNumber,
+      runId: input.runId,
+      title: `Chief of Staff question for #${input.workItem.issueNumber}`,
+      summary: input.summary,
+      question: firstQuestion,
+      recommendation: input.recommendedNextAction || "Reply with the direction you want me to take.",
+      rationale:
+        input.blockingQuestions.join("\n") ||
+        `${input.source} could not proceed safely without human product judgment.`
+    });
+    return {
+      kind: "ask_human",
+      decision
+    };
+  }
+
+  const result = await runCodexAgent(
+    {
+      role: "chief_of_staff",
+      cwd: session.project.repoPath,
+      model: session.project.model,
+      allowWrite: false,
+      prompt: [
+        `A ${input.source.replace("_", " ")} is blocked on issue #${input.workItem.issueNumber}: ${input.workItem.title}.`,
+        "Decide whether you can answer the blocker yourself or need to ask the human director.",
+        "Return `data.outcome` as `answer_worker` or `ask_human`.",
+        "If you can answer, return `data.guidance` and `data.transcript_reply`.",
+        "If you need the human, return `data.question`, `data.why_it_matters`, and `data.recommendation`.",
+        "",
+        "Current summary:",
+        input.summary,
+        "",
+        "Blocking questions:",
+        input.blockingQuestions.length ? input.blockingQuestions.map((question) => `- ${question}`).join("\n") : "- No explicit question was returned.",
+        "",
+        "Recent project conversation:",
+        await recentConversationPrompt(session)
+      ].join("\n")
+    },
+    {
+      status: "ok",
+      summary: input.summary,
+      recommended_next_action: input.recommendedNextAction,
+      artifact_refs: [],
+      blocking_questions: [],
+      data: {
+        outcome: "ask_human",
+        question:
+          input.blockingQuestions[0] ??
+          `What product decision should I take for issue #${input.workItem.issueNumber}?`,
+        why_it_matters: input.summary,
+        recommendation: input.recommendedNextAction
+      }
+    }
+  );
+
+  const outcome = parseDataString(result.data?.outcome);
+  if (outcome === "answer_worker") {
+    return {
+      kind: "resume",
+      guidance:
+        parseDataString(result.data?.guidance) ??
+        (input.blockingQuestions.join("\n") || input.recommendedNextAction),
+      transcript:
+        parseDataString(result.data?.transcript_reply) ??
+        `I answered the blocker for #${input.workItem.issueNumber} internally and resumed the work.`
+    };
+  }
+
+  const decision = await createHumanQuestionDecision(session, {
+    workItem: input.workItem,
+    prNumber: input.prNumber,
+    runId: input.runId,
+    title: `Chief of Staff question for #${input.workItem.issueNumber}`,
+    summary: parseDataString(result.data?.why_it_matters) ?? input.summary,
+    question:
+      parseDataString(result.data?.question) ??
+      input.blockingQuestions[0] ??
+      `What direction should I take for issue #${input.workItem.issueNumber}?`,
+    recommendation:
+      parseDataString(result.data?.recommendation) ??
+      (input.recommendedNextAction || "Reply with the direction you want me to take."),
+    rationale:
+      input.blockingQuestions.join("\n") ||
+      result.summary ||
+      `${input.source} could not proceed safely without human product judgment.`
+  });
+  return {
+    kind: "ask_human",
+    decision
+  };
+}
+
+async function appendCoSStatusUpdate(
+  session: ProjectSession,
+  input: {
+    content: string;
+    workItem: WorkItemRecord | null;
+    prNumber?: number | null;
+    runId?: number | null;
+    kind?: ConversationMessageRecord["kind"];
+  }
+): Promise<void> {
+  await appendConversationMessage(session, {
+    role: "chief_of_staff",
+    kind: input.kind ?? "status_update",
+    content: input.content,
+    summary: summarizeText(input.content),
+    workItemId: input.workItem?.id ?? null,
+    issueNumber: input.workItem?.issueNumber ?? null,
+    prNumber: input.prNumber ?? null,
+    decisionId: null,
+    runId: input.runId ?? null
+  });
+}
+
+
 async function chooseNextWorkItem(session: ProjectSession): Promise<WorkItemRecord | null> {
   const workItems = (
     await session.db
@@ -1807,7 +2346,10 @@ async function planLaneWork(session: ProjectSession, workItem: WorkItemRecord): 
         "If this should split into child issues, return them in `data.child_tasks` as objects with `title` and `body`.",
         "Only raise blocking questions when genuine product judgment is required.",
         "",
-        liveIssue.body
+        liveIssue.body,
+        guidancePromptSuffix(workItem.lastSummary)
+          ? `\nExisting guidance:\n${guidancePromptSuffix(workItem.lastSummary)}`
+          : ""
       ].join("\n")
     },
     {
@@ -1832,16 +2374,45 @@ async function planLaneWork(session: ProjectSession, workItem: WorkItemRecord): 
   });
 
   if (laneResult.blocking_questions.length > 0) {
-    await createDecision(session, {
-      workItemId: workItem.id,
-      issueNumber: workItem.issueNumber,
+    const mediated = await mediateAgentBlock(session, {
+      workItem,
+      runId: run.id,
       prNumber: null,
-      target: "human_director",
-      title: `Answer product questions for #${workItem.issueNumber}`,
+      source: "lane_owner",
       summary: laneResult.summary,
-      recommendation: laneResult.recommended_next_action,
-      rationale: laneResult.blocking_questions.join("\n")
+      recommendedNextAction: laneResult.recommended_next_action,
+      blockingQuestions: laneResult.blocking_questions,
+      allowInternalResolution: !guidancePromptSuffix(workItem.lastSummary)
     });
+
+    if (mediated.kind === "resume") {
+      await appendCoSStatusUpdate(session, {
+        content: mediated.transcript,
+        workItem,
+        runId: run.id
+      });
+      await upsertWorkItem(session.db, session.project.id, {
+        issueNumber: workItem.issueNumber,
+        parentIssueNumber: workItem.parentIssueNumber,
+        title: workItem.title,
+        summary: workItem.summary,
+        kind: "workstream",
+        executionMode: "lane",
+        ownerRole: "lane_owner",
+        status: "ready",
+        priorityBucket: inferPriorityBucket("ready"),
+        activeRunId: null,
+        activePrNumber: workItem.activePrNumber,
+        lastSummary: `Chief of Staff guidance: ${mediated.guidance}`
+      });
+      return planLaneWork(
+        session,
+        assertPresent(
+          await getWorkItemByIssueNumber(session.db, session.project.id, workItem.issueNumber),
+          `Work item #${workItem.issueNumber} disappeared during CoS mediation.`
+        )
+      );
+    }
 
     await upsertWorkItem(session.db, session.project.id, {
       issueNumber: workItem.issueNumber,
@@ -1989,7 +2560,9 @@ async function executeWorkerRun(
         "Leave the repository ready for commit.",
         "",
         options.issue.body,
-        options.promptSuffix ? `\nFollow-up context:\n${options.promptSuffix}` : ""
+        options.promptSuffix || guidancePromptSuffix(workItem.lastSummary)
+          ? `\nFollow-up context:\n${options.promptSuffix ?? guidancePromptSuffix(workItem.lastSummary)}`
+          : ""
       ].join("\n")
     },
     {
@@ -2011,16 +2584,51 @@ async function executeWorkerRun(
       outputJson: workerResult.data ?? null
     });
 
-    await createDecision(session, {
-      workItemId: workItem.id,
-      issueNumber: workItem.issueNumber,
+    const mediated = await mediateAgentBlock(session, {
+      workItem,
+      runId: run.id,
       prNumber: options.existingPrNumber ?? null,
-      target: "human_director",
-      title: `Clarify issue #${workItem.issueNumber}`,
+      source: "worker",
       summary: workerResult.summary,
-      recommendation: workerResult.recommended_next_action,
-      rationale: workerResult.blocking_questions.join("\n") || "Worker requested human clarification."
+      recommendedNextAction: workerResult.recommended_next_action,
+      blockingQuestions: workerResult.blocking_questions,
+      allowInternalResolution:
+        !options.promptSuffix && !guidancePromptSuffix(workItem.lastSummary)
     });
+
+    if (mediated.kind === "resume") {
+      await appendCoSStatusUpdate(session, {
+        content: mediated.transcript,
+        workItem,
+        prNumber: options.existingPrNumber ?? null,
+        runId: run.id
+      });
+      await upsertWorkItem(session.db, session.project.id, {
+        issueNumber: workItem.issueNumber,
+        parentIssueNumber: workItem.parentIssueNumber,
+        title: workItem.title,
+        summary: workItem.summary,
+        kind: workItem.kind,
+        executionMode: "worker",
+        ownerRole: "worker",
+        status: "ready",
+        priorityBucket: inferPriorityBucket("ready"),
+        activeRunId: null,
+        activePrNumber: options.existingPrNumber ?? workItem.activePrNumber,
+        lastSummary: `Chief of Staff guidance: ${mediated.guidance}`
+      });
+      return executeWorkerRun(
+        session,
+        assertPresent(
+          await getWorkItemByIssueNumber(session.db, session.project.id, workItem.issueNumber),
+          `Work item #${workItem.issueNumber} disappeared during CoS mediation.`
+        ),
+        {
+          ...options,
+          promptSuffix: mediated.guidance
+        }
+      );
+    }
 
     await upsertWorkItem(session.db, session.project.id, {
       issueNumber: workItem.issueNumber,
@@ -2176,6 +2784,12 @@ async function executeWorkerRun(
     prNumber: livePullRequest.number,
     prUrl: prUrl ?? livePullRequest.url
   });
+  await appendCoSStatusUpdate(session, {
+    content: `I opened PR #${livePullRequest.number} for issue #${workItem.issueNumber}: ${livePullRequest.title}.`,
+    workItem,
+    prNumber: livePullRequest.number,
+    runId: run.id
+  });
 }
 
 function latestUnhandledComment(
@@ -2217,6 +2831,7 @@ async function runCosReviewOnPr(
         "Decide whether to merge, request changes, or escalate to the human director.",
         "Return the verdict in `data.decision` as `merge`, `changes`, or `escalate`.",
         "If you choose `changes`, provide concise `data.feedback` that a worker can act on.",
+        "If you choose `escalate`, provide `data.question`, `data.why_it_matters`, and `data.recommendation`.",
         "",
         `Issue: ${workItem.title}`,
         "",
@@ -2284,14 +2899,19 @@ async function runCosReviewOnPr(
   }
 
   if (normalized === "escalate") {
-    await createDecision(session, {
-      workItemId: workItem.id,
-      issueNumber: workItem.issueNumber,
+    await createHumanQuestionDecision(session, {
+      workItem,
       prNumber: pr.number,
-      target: "human_director",
+      runId: null,
       title: `Resolve merge judgment for PR #${pr.number}`,
-      summary: result.summary,
-      recommendation: result.recommended_next_action,
+      summary: parseDataString(result.data?.why_it_matters) ?? result.summary,
+      question:
+        parseDataString(result.data?.question) ??
+        result.blocking_questions[0] ??
+        `Should I merge PR #${pr.number} for issue #${workItem.issueNumber}?`,
+      recommendation:
+        parseDataString(result.data?.recommendation) ??
+        result.recommended_next_action,
       rationale: result.blocking_questions.join("\n") || "Chief of Staff requested a human decision."
     });
   }
@@ -2447,13 +3067,13 @@ async function processPrCycles(session: ProjectSession): Promise<boolean> {
     }
 
     if (pullRequest.checksBucket === "fail") {
-      await createDecision(session, {
-        workItemId: workItem.id,
-        issueNumber: workItem.issueNumber,
+      await createHumanQuestionDecision(session, {
+        workItem,
         prNumber: pullRequest.number,
-        target: "human_director",
+        runId: null,
         title: `Investigate failing checks on PR #${pullRequest.number}`,
         summary: "Automated checks failed and need human judgment or a deeper fix.",
+        question: `PR #${pullRequest.number} failed automated checks. Should I keep iterating on this slice or narrow its scope?`,
         recommendation: "Inspect the failing GitHub checks and decide whether to retry or narrow scope.",
         rationale: "The current MVP does not yet fetch full CI logs for autonomous remediation."
       });
@@ -2508,6 +3128,11 @@ async function processPrCycles(session: ProjectSession): Promise<boolean> {
         activePrNumber: null,
         lastSummary: "Merged by Chief of Staff."
       });
+      await appendCoSStatusUpdate(session, {
+        content: `PR #${pullRequest.number} merged for issue #${workItem.issueNumber}.`,
+        workItem,
+        prNumber: pullRequest.number
+      });
     } else if (verdict === "escalate") {
       await upsertPrCycle(session.db, session.project.id, {
         issueNumber: cycle.issueNumber,
@@ -2543,14 +3168,14 @@ async function processNextQueueItem(session: ProjectSession): Promise<boolean> {
       .map(mapDecisionRow)
       .filter((decision) => decision.status === "open" && decision.title === "No queueable work remains");
     if (!openDecisions.length) {
-      await createDecision(session, {
-        workItemId: null,
-        issueNumber: null,
+      await createHumanQuestionDecision(session, {
+        workItem: null,
         prNumber: null,
-        target: "human_director",
+        runId: null,
         title: "No queueable work remains",
         summary: "The backlog is empty and the Chief of Staff could not expand any active notes.",
-        recommendation: "Add a new director note or create fresh GitHub issues.",
+        question: "I’m out of safe autonomous work. What product direction or slice should I take next?",
+        recommendation: "Reply in chat with the next direction, constraint, or GitHub issue to prioritize.",
         rationale: "Director OS ran out of safe autonomous work."
       });
     }
@@ -2573,7 +3198,8 @@ async function processNextQueueItem(session: ProjectSession): Promise<boolean> {
 
   await executeWorkerRun(session, next, {
     issue,
-    phase: "implementation"
+    phase: "implementation",
+    promptSuffix: guidancePromptSuffix(next.lastSummary)
   });
   return true;
 }
@@ -2603,13 +3229,13 @@ async function runOrchestratorIteration(): Promise<boolean> {
         lastLoopAt: nowIso(),
         lastSummary: message
       });
-      await createDecision(session, {
-        workItemId: null,
-        issueNumber: null,
+      await createHumanQuestionDecision(session, {
+        workItem: null,
         prNumber: null,
-        target: "human_director",
+        runId: null,
         title: "Orchestrator blocked",
         summary: message,
+        question: "The orchestrator hit an unexpected error and paused itself. What should I do next?",
         recommendation: "Inspect the latest run and local environment, then restart the orchestrator.",
         rationale: "The background loop hit an unexpected error."
       });
@@ -2907,6 +3533,258 @@ export async function listDecisions(): Promise<DecisionsResponse> {
   });
 }
 
+async function insertDirectorNoteRecord(
+  session: ProjectSession,
+  content: string
+): Promise<DirectorNoteRecord> {
+  const timestamp = nowIso();
+  const result = await session.db.insert(directorNotesTable).values({
+    projectId: session.project.id,
+    content,
+    status: "active",
+    createdAt: timestamp,
+    updatedAt: timestamp
+  });
+  await recordEvent(session.db, session.project.id, "director_note.created", {
+    content
+  });
+  const row = await session.db
+    .select()
+    .from(directorNotesTable)
+    .where(eq(directorNotesTable.id, Number(result.lastInsertRowid)))
+    .limit(1);
+  return mapNoteRow(assertPresent(row[0], "Director note missing after insert."));
+}
+
+type CoSChatReply = {
+  kind: "cos_reply" | "cos_question";
+  reply: string;
+  question: string | null;
+  recommendation: string | null;
+  rationale: string | null;
+};
+
+async function runCoSChatReply(
+  session: ProjectSession,
+  content: string
+): Promise<CoSChatReply> {
+  const result = await runCodexAgent(
+    {
+      role: "chief_of_staff",
+      cwd: session.project.repoPath,
+      model: session.project.model,
+      allowWrite: false,
+      prompt: [
+        "You are the Chief of Staff for Director OS.",
+        "Reply to the director's latest chat message in 1 to 3 concise sentences.",
+        "If the message is ambiguous, ask one short follow-up question.",
+        "Otherwise acknowledge the direction and say what you will do next.",
+        "Return `data.kind` as `cos_reply` or `cos_question`.",
+        "Return the human-facing reply in `data.reply`.",
+        "If you ask a question, also return `data.question` and `data.recommendation`.",
+        "",
+        "Recent conversation:",
+        await recentConversationPrompt(session),
+        "",
+        `Latest director message: ${content}`
+      ].join("\n")
+    },
+    {
+      status: "ok",
+      summary: "Noted. I’ll use that direction to steer prioritization and execution.",
+      recommended_next_action: "Continue running the current queue.",
+      artifact_refs: [],
+      blocking_questions: [],
+      data: {
+        kind: "cos_reply",
+        reply: "Noted. I’ll use that direction to steer prioritization and execution."
+      }
+    }
+  );
+
+  return {
+    kind: parseDataString(result.data?.kind) === "cos_question" ? "cos_question" : "cos_reply",
+    reply:
+      parseDataString(result.data?.reply) ??
+      result.summary ??
+      "Noted. I’ll use that direction to steer prioritization and execution.",
+    question: parseDataString(result.data?.question) ?? null,
+    recommendation: parseDataString(result.data?.recommendation) ?? null,
+    rationale: parseDataString(result.data?.rationale) ?? null
+  };
+}
+
+async function resolveDecisionInternal(
+  session: ProjectSession,
+  decisionId: number,
+  resolution: string
+): Promise<DecisionRecord> {
+  const rows = await session.db
+    .select()
+    .from(decisionsTable)
+    .where(eq(decisionsTable.id, decisionId))
+    .limit(1);
+  const row = assertPresent(rows[0], `Decision ${decisionId} was not found.`);
+
+  await session.db
+    .update(decisionsTable)
+    .set({
+      status: "resolved",
+      resolution,
+      updatedAt: nowIso()
+    })
+    .where(eq(decisionsTable.id, decisionId));
+
+  if (row.workItemId) {
+    const workItemRows = await session.db
+      .select()
+      .from(workItemsTable)
+      .where(eq(workItemsTable.id, row.workItemId))
+      .limit(1);
+    if (workItemRows[0]) {
+      const workItem = mapWorkItemRow(workItemRows[0]);
+      const resumedStatus: WorkItemStatus = workItem.activePrNumber ? "waiting_review" : "ready";
+      await upsertWorkItem(session.db, session.project.id, {
+        issueNumber: workItem.issueNumber,
+        parentIssueNumber: workItem.parentIssueNumber,
+        title: workItem.title,
+        summary: workItem.summary,
+        kind: workItem.kind,
+        executionMode: workItem.executionMode,
+        ownerRole: workItem.ownerRole,
+        status: resumedStatus,
+        priorityBucket: inferPriorityBucket(resumedStatus),
+        activeRunId: null,
+        activePrNumber: workItem.activePrNumber,
+        lastSummary: `Human guidance: ${resolution}`
+      });
+    }
+  }
+
+  if (row.questionMessageId) {
+    await session.db
+      .update(conversationMessagesTable)
+      .set({
+        isOpenQuestion: false,
+        decisionId,
+        updatedAt: nowIso()
+      })
+      .where(eq(conversationMessagesTable.id, row.questionMessageId));
+  }
+
+  const resolutionText = formatResolutionMessage(mapDecisionRow(row), resolution);
+  const resolutionMessage = await appendConversationMessage(session, {
+    role: "chief_of_staff",
+    kind: "resolution",
+    content: resolutionText,
+    summary: summarizeText(resolutionText),
+    linkedIssueNumber: row.issueNumber ?? null,
+    linkedPrNumber: row.prNumber ?? null,
+    isOpenQuestion: false,
+    workItemId: row.workItemId ?? null,
+    issueNumber: row.issueNumber ?? null,
+    prNumber: row.prNumber ?? null,
+    decisionId,
+    runId: row.requestedByRunId ?? null
+  });
+
+  await session.db
+    .update(decisionsTable)
+    .set({
+      resolutionMessageId: resolutionMessage.id,
+      updatedAt: nowIso()
+    })
+    .where(eq(decisionsTable.id, decisionId));
+
+  await recordEvent(session.db, session.project.id, "decision.resolved", {
+    decisionId,
+    resolution
+  });
+
+  const updatedRows = await session.db
+    .select()
+    .from(decisionsTable)
+    .where(eq(decisionsTable.id, decisionId))
+    .limit(1);
+  return mapDecisionRow(
+    assertPresent(updatedRows[0], `Decision ${decisionId} vanished after update.`)
+  );
+}
+
+export async function getConversation(): Promise<ConversationResponse> {
+  return withProject(async (session) => getConversationResponse(session));
+}
+
+export async function sendConversationMessage(
+  content: string
+): Promise<ConversationResponse> {
+  const trimmed = content.trim();
+  if (!trimmed) {
+    throw new Error("Message cannot be empty.");
+  }
+
+  return withProject(async (session) => {
+    await backfillOpenDecisionQuestions(session);
+    const openDecision = await getOpenHumanDecision(session);
+    if (openDecision) {
+      await appendConversationMessage(session, {
+        role: "director",
+        kind: "human_message",
+        content: trimmed,
+        summary: summarizeText(trimmed),
+        linkedIssueNumber: openDecision.issueNumber ?? null,
+        linkedPrNumber: openDecision.prNumber ?? null,
+        isOpenQuestion: false,
+        workItemId: openDecision.workItemId ?? null,
+        issueNumber: openDecision.issueNumber ?? null,
+        prNumber: openDecision.prNumber ?? null,
+        decisionId: openDecision.id,
+        runId: null
+      });
+      await resolveDecisionInternal(session, openDecision.id, trimmed);
+    } else {
+      await insertDirectorNoteRecord(session, trimmed);
+      const reply = await runCoSChatReply(session, trimmed);
+
+      if (reply.kind === "cos_question") {
+        await createHumanQuestionDecision(session, {
+          workItem: null,
+          prNumber: null,
+          runId: null,
+          title: "Chief of Staff question",
+          summary: reply.reply,
+          question:
+            reply.question ?? "I need a little more direction before I can continue.",
+          recommendation:
+            reply.recommendation ?? "Reply here with the direction you want me to take.",
+          rationale: reply.rationale ?? reply.reply
+        });
+      } else {
+        await appendConversationMessage(session, {
+          role: "chief_of_staff",
+          kind: "cos_reply",
+          content: reply.reply,
+          summary: summarizeText(reply.reply),
+          linkedIssueNumber: null,
+          linkedPrNumber: null,
+          isOpenQuestion: false,
+          workItemId: null,
+          issueNumber: null,
+          prNumber: null,
+          decisionId: null,
+          runId: null
+        });
+      }
+    }
+
+    const orchestrator = await ensureOrchestratorRow(session);
+    if (orchestrator.status === "running" && !orchestratorTimer && !orchestratorRunning) {
+      scheduleOrchestratorLoop(0);
+    }
+    return getConversationResponse(session);
+  });
+}
+
 export async function submitDirectorNote(content: string): Promise<DirectorNoteRecord> {
   const trimmed = content.trim();
   if (!trimmed) {
@@ -2914,23 +3792,21 @@ export async function submitDirectorNote(content: string): Promise<DirectorNoteR
   }
 
   return withProject(async (session) => {
-    const timestamp = nowIso();
-    const result = await session.db.insert(directorNotesTable).values({
-      projectId: session.project.id,
+    const note = await insertDirectorNoteRecord(session, trimmed);
+    await appendConversationMessage(session, {
+      role: "director",
+      kind: "human_message",
       content: trimmed,
-      status: "active",
-      createdAt: timestamp,
-      updatedAt: timestamp
+      summary: summarizeText(trimmed),
+      linkedIssueNumber: null,
+      linkedPrNumber: null,
+      isOpenQuestion: false,
+      workItemId: null,
+      issueNumber: null,
+      prNumber: null,
+      decisionId: null,
+      runId: null
     });
-    await recordEvent(session.db, session.project.id, "director_note.created", {
-      content: trimmed
-    });
-    const row = await session.db
-      .select()
-      .from(directorNotesTable)
-      .where(eq(directorNotesTable.id, Number(result.lastInsertRowid)))
-      .limit(1);
-    const note = mapNoteRow(assertPresent(row[0], "Director note missing after insert."));
     const orchestrator = await ensureOrchestratorRow(session);
     if (orchestrator.status === "running" && !orchestratorTimer && !orchestratorRunning) {
       scheduleOrchestratorLoop(0);
@@ -2949,59 +3825,7 @@ export async function resolveDecision(
   }
 
   return withProject(async (session) => {
-    const rows = await session.db
-      .select()
-      .from(decisionsTable)
-      .where(eq(decisionsTable.id, decisionId))
-      .limit(1);
-    const row = assertPresent(rows[0], `Decision ${decisionId} was not found.`);
-
-    await session.db
-      .update(decisionsTable)
-      .set({
-        status: "resolved",
-        resolution: trimmed,
-        updatedAt: nowIso()
-      })
-      .where(eq(decisionsTable.id, decisionId));
-
-    if (row.workItemId) {
-      const workItemRows = await session.db
-        .select()
-        .from(workItemsTable)
-        .where(eq(workItemsTable.id, row.workItemId))
-        .limit(1);
-      if (workItemRows[0]) {
-        const workItem = mapWorkItemRow(workItemRows[0]);
-        const resumedStatus: WorkItemStatus = workItem.activePrNumber ? "waiting_review" : "ready";
-        await upsertWorkItem(session.db, session.project.id, {
-          issueNumber: workItem.issueNumber,
-          parentIssueNumber: workItem.parentIssueNumber,
-          title: workItem.title,
-          summary: workItem.summary,
-          kind: workItem.kind,
-          executionMode: workItem.executionMode,
-          ownerRole: workItem.ownerRole,
-          status: resumedStatus,
-          priorityBucket: inferPriorityBucket(resumedStatus),
-          activeRunId: null,
-          activePrNumber: workItem.activePrNumber,
-          lastSummary: `Decision resolved: ${trimmed}`
-        });
-      }
-    }
-
-    await recordEvent(session.db, session.project.id, "decision.resolved", {
-      decisionId,
-      resolution: trimmed
-    });
-
-    const updatedRows = await session.db
-      .select()
-      .from(decisionsTable)
-      .where(eq(decisionsTable.id, decisionId))
-      .limit(1);
-    const decision = mapDecisionRow(assertPresent(updatedRows[0], `Decision ${decisionId} vanished after update.`));
+    const decision = await resolveDecisionInternal(session, decisionId, trimmed);
 
     const orchestrator = await ensureOrchestratorRow(session);
     if (orchestrator.status === "running" && !orchestratorTimer && !orchestratorRunning) {

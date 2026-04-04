@@ -15,8 +15,8 @@ The product goal is not "full autonomy." The goal is a continuous operating loop
 The desired outcome is that the human mostly interacts through:
 
 - `Start` / `Pause`
-- director notes
-- rare escalation decisions
+- one ongoing Chief of Staff chat
+- rare CoS-authored escalation questions
 
 not through manually triggering every issue, review, or merge step.
 
@@ -32,27 +32,29 @@ The core local objects are:
 - `Run`: a Chief of Staff, lane, worker, review, validation, or PR-watch execution with logs and summaries
 - `Decision`: a real escalation, targeted either to the Chief of Staff or the human director
 - `PR cycle`: the local state machine around an open PR while it waits for automation, comments, revalidation, CoS review, and merge
-- `Director note`: freeform direction from the human, used when the org needs more work to pull
+- `Conversation thread`: one ongoing project chat between the director and the Chief of Staff
 
 ### Operating Loop
 
-1. The director adds a note or leaves existing GitHub issues as the durable backlog.
+1. The director talks to the Chief of Staff in one ongoing project thread or leaves existing GitHub issues as the durable backlog.
 2. The Chief of Staff syncs GitHub and chooses the next best ready slice.
 3. Larger or cross-cutting work is classified into a lane owner flow.
 4. Lane planning happens in a read-only Codex pass before any write-enabled execution starts.
 5. Bounded tasks go straight to worker execution.
 6. Workers implement code, validate locally, and open real non-draft PRs linked to numbered issues.
 7. PR cycles wait through automated review, address comments, rerun validation, and return to the Chief of Staff for independent merge judgment.
-8. Only non-obvious product calls, contradictory review outcomes, or "no work left" states escalate back to the human director.
+8. Workers and lane owners ask the Chief of Staff first when blocked.
+9. Only non-obvious product calls, contradictory review outcomes, or "no work left" states escalate back to the human director as explicit CoS-authored questions in the chat.
 
 ### UX Shape
 
-Director OS should feel like a calm control room rather than a ticket board.
+Director OS should feel like a calm Chief of Staff chat with an operational sidebar, not a ticket board.
 
 The primary desktop experience is:
 
 - setup and repair for repository, GitHub CLI, Codex CLI, and local workspace readiness
-- one control room with orchestrator state, queued work, active slices, PR cycles, escalations, recent runs, and director notes
+- one ongoing Chief of Staff chat thread for direction, clarification, and escalation replies
+- a secondary control-room sidebar with orchestrator state, queued work, active slices, PR cycles, escalations, and recent runs
 - explicit `Start`, `Pause`, and `Sync` controls instead of manual per-issue execution buttons
 
 ### Technical Direction
@@ -85,6 +87,8 @@ Examples:
 
 - `npm run director -- status`
 - `npm run director -- sync`
+- `npm run director -- conversation`
+- `npm run director -- message "Focus on setup reliability before UI polish."`
 - `npm run director -- start`
 - `npm run director -- pause --reason "manual stop"`
 
@@ -110,7 +114,7 @@ MVP includes:
 - worker execution via write-enabled Codex runs
 - real non-draft PR creation linked to numbered issues
 - PR-cycle waiting, review follow-up, revalidation, and merge readiness
-- a thin desktop control room for visibility and intervention
+- a primary Chief of Staff chat plus a thin desktop control room for visibility and intervention
 
 MVP does not need:
 
@@ -129,9 +133,9 @@ V1 includes:
 - stronger CoS sequencing and ranking
 - better autonomous handling of review comments and failing checks
 - richer lane ownership across parent/child issue slices
-- more informative human escalation cards
+- better serialization and prioritization of human-facing CoS questions
 - improved activity history and replayability
-- a more expressive director note to issue-expansion loop
+- a more expressive conversation-to-backlog expansion loop
 
 ### Vx
 
