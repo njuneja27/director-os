@@ -63,6 +63,37 @@ The primary desktop experience is:
 - SQLite for orchestration state, runs, decisions, notes, and PR-cycle tracking
 - Codex CLI as the local coding engine, with no separate API-key UX in Director OS
 
+## Dogfood Smoke Test
+
+When operating Director OS from this source checkout rather than an installed build, rebuild first so the local `dist` artifacts match the current source before using the CLI directly.
+
+1. `npm run build`
+2. `node apps/cli/dist/index.js sync`
+3. `node apps/cli/dist/index.js status`
+
+Expected result:
+
+- recently closed GitHub issues do not appear in `status.queue`
+- newly opened GitHub issues do appear in `status.queue`
+- the control-room queue only shows open, claimable work
+
+### Validated Local Smoke-Test Path
+
+When using the CLI directly, prefer the root `director` script so commands run against a fresh build instead of potentially stale compiled artifacts.
+
+Examples:
+
+- `npm run director -- status`
+- `npm run director -- sync`
+- `npm run director -- start`
+- `npm run director -- pause --reason "manual stop"`
+
+For desktop dogfooding, prefer:
+
+- `npm run desktop:start`
+
+This path rebuilds the desktop shell, renderer, core package, and CLI before launch.
+
 ## Scope
 
 ### MVP
