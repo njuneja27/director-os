@@ -382,12 +382,6 @@ export interface DirectorStatusResponse {
   openQuestion: HumanQuestionRecord | null;
   recentActivity: ActivityRecord[];
   openPullRequests: GitHubPullRequestRecord[];
-  queue?: WorkItemRecord[];
-  activeWork?: WorkItemRecord[];
-  decisions?: HumanQuestionRecord[];
-  prCycles?: PrCycleRecord[];
-  recentRuns?: RunRecord[];
-  notes?: DirectorNoteRecord[];
 }
 
 export interface ConversationResponse {

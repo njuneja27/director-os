@@ -71,9 +71,12 @@ export function App() {
 
   const counts = useMemo(
     () => ({
-      queued: status?.queue?.length ?? 0,
-      active: status?.activeWork?.length ?? 0,
-      decisions: status?.decisions?.length ?? 0,
+      lanes: status?.lanes.length ?? 0,
+      ownedIssues:
+        status?.issues.filter((issue) => issue.state.toLowerCase() === "open" && issue.laneId).length ?? 0,
+      blockers:
+        (status?.openQuestion ? 1 : 0) +
+        (status?.lanes.filter((lane) => lane.status === "blocked").length ?? 0),
       prs: status?.openPullRequests.length ?? 0
     }),
     [status]
@@ -414,33 +417,33 @@ export function App() {
             <div className="panel-header">
               <div>
                 <div className="section-title">State</div>
-                <div className="section-meta">{status?.orchestrator?.lastSummary ?? "The control room is ready."}</div>
+                <div className="section-meta">{status?.orchestrator?.lastSummary ?? "The Chief of Staff router is ready."}</div>
               </div>
             </div>
             <div className="hero-stats sidebar-stats">
-              <StatCard label="Queue" value={String(counts.queued)} />
-              <StatCard label="Running" value={String(counts.active)} />
-              <StatCard label="Waiting for you" value={String(counts.decisions)} />
+              <StatCard label="Lanes" value={String(counts.lanes)} />
+              <StatCard label="Owned issues" value={String(counts.ownedIssues)} />
+              <StatCard label="Blockers" value={String(counts.blockers)} />
               <StatCard label="Open PRs" value={String(counts.prs)} />
             </div>
             <div className="hero-meta">
               <span className={`status-pill status-pill-${(status?.orchestrator?.status ?? "idle").replace("_", "-")}`}>
                 {formatOrchestratorStatus(status?.orchestrator?.status ?? "idle")}
               </span>
-              <span>The Chief of Staff loop stays local and synchronized with GitHub.</span>
+              <span>The Chief of Staff loop stays local and routes work through persistent lane sessions.</span>
             </div>
           </section>
 
           <section className="panel sidebar-card">
             <div className="panel-header">
               <div>
-                <div className="section-title">Needs your judgment</div>
-                <div className="section-meta">Questions the CoS could not safely answer without you.</div>
+                <div className="section-title">Current blocker</div>
+                <div className="section-meta">Only the Chief of Staff escalates to you when a real product call is needed.</div>
               </div>
             </div>
-            <ItemList<NonNullable<DirectorStatusResponse["decisions"]>[number]>
-              empty="No human escalations are waiting right now."
-              items={status?.decisions ?? []}
+            <ItemList<NonNullable<DirectorStatusResponse["openQuestion"]>>
+              empty="No blocker is waiting on you right now."
+              items={status?.openQuestion ? [status.openQuestion] : []}
               render={(decision) => (
                 <div className="compact-card" key={decision.id}>
                   <div className="compact-card-head">
@@ -462,23 +465,24 @@ export function App() {
           <section className="panel sidebar-card">
             <div className="panel-header">
               <div>
-                <div className="section-title">Queue</div>
-                <div className="section-meta">GitHub remains the durable backlog behind the chat.</div>
+                <div className="section-title">Lanes</div>
+                <div className="section-meta">Persistent Codex sessions owned by the Chief of Staff.</div>
               </div>
             </div>
-            <ItemList<WorkItemRecord>
-              empty="No queueable work yet."
-              items={status?.queue ?? []}
-              render={(item) => (
-                <div className="list-row compact-list-row" key={item.id}>
+            <ItemList<DirectorStatusResponse["lanes"][number]>
+              empty="No lane sessions are active yet."
+              items={status?.lanes ?? []}
+              render={(lane) => (
+                <div className="list-row compact-list-row" key={lane.id}>
                   <div>
-                    <div className="list-title">#{item.issueNumber} {item.title}</div>
+                    <div className="list-title">{lane.name}</div>
                     <div className="list-meta">
-                      <span>{formatWorkItemStatus(item.status)}</span>
-                      {item.parentIssueNumber ? <span>From #{item.parentIssueNumber}</span> : null}
+                      <span>{String(lane.status).replace("_", " ")}</span>
+                      {lane.currentIssueNumber ? <span>Issue #{lane.currentIssueNumber}</span> : null}
+                      {lane.activePullRequestNumber ? <span>PR #{lane.activePullRequestNumber}</span> : null}
                     </div>
                   </div>
-                  <div className="list-note">{item.lastSummary ?? item.summary}</div>
+                  <div className="list-note">{lane.lastSummary ?? lane.lastPlanSummary ?? "Waiting for a routed issue."}</div>
                 </div>
               )}
             />
@@ -487,23 +491,24 @@ export function App() {
           <section className="panel sidebar-card">
             <div className="panel-header">
               <div>
-                <div className="section-title">In progress</div>
-                <div className="section-meta">What the CoS and Codex are actively moving right now.</div>
+                <div className="section-title">Lane-owned issues</div>
+                <div className="section-meta">GitHub issues stay durable; the router only shows who currently owns each slice.</div>
               </div>
             </div>
-            <ItemList<WorkItemRecord>
-              empty="Nothing is active right now."
-              items={status?.activeWork ?? []}
-              render={(item) => (
-                <div className="list-row compact-list-row" key={item.id}>
+            <ItemList<DirectorStatusResponse["issues"][number]>
+              empty="No GitHub issues are currently routed to lanes."
+              items={(status?.issues ?? []).filter((issue) => issue.state.toLowerCase() === "open" && issue.laneId)}
+              render={(issue) => (
+                <div className="list-row compact-list-row" key={issue.issueNumber}>
                   <div>
-                    <div className="list-title">#{item.issueNumber} {item.title}</div>
+                    <div className="list-title">#{issue.issueNumber} {issue.title}</div>
                     <div className="list-meta">
-                      <span>{formatWorkItemStatus(item.status)}</span>
-                      {item.activePrNumber ? <span>PR #{item.activePrNumber}</span> : null}
+                      {issue.laneName ? <span>{issue.laneName}</span> : null}
+                      <span>{String(issue.status).replace("_", " ")}</span>
+                      {issue.linkedPullRequestNumber ? <span>PR #{issue.linkedPullRequestNumber}</span> : null}
                     </div>
                   </div>
-                  <div className="list-note">{item.lastSummary ?? item.summary}</div>
+                  <div className="list-note">{issue.lastSummary ?? issue.workflowState}</div>
                 </div>
               )}
             />
@@ -513,22 +518,22 @@ export function App() {
             <div className="panel-header">
               <div>
                 <div className="section-title">Pull requests</div>
-                <div className="section-meta">Automation waits, review follow-up, and merge readiness.</div>
+                <div className="section-meta">Linked PRs stay visible, but they are downstream of CoS and lane routing.</div>
               </div>
             </div>
-            <ItemList<PrCycleRecord>
-              empty="No open PR cycles yet."
-              items={status?.prCycles ?? []}
-              render={(cycle) => (
-                <div className="list-row compact-list-row" key={cycle.id}>
+            <ItemList<DirectorStatusResponse["openPullRequests"][number]>
+              empty="No open pull requests yet."
+              items={status?.openPullRequests ?? []}
+              render={(pullRequest) => (
+                <div className="list-row compact-list-row" key={pullRequest.id}>
                   <div>
-                    <div className="list-title">PR #{cycle.prNumber} for issue #{cycle.issueNumber}</div>
+                    <div className="list-title">PR #{pullRequest.number} {pullRequest.title}</div>
                     <div className="list-meta">
-                      <span>{formatPrCycleStatus(cycle.status)}</span>
-                      {cycle.automationWindowEndsAt ? <span>Window ends {formatTimestamp(cycle.automationWindowEndsAt)}</span> : null}
+                      <span>{pullRequest.reviewDecision ?? (pullRequest.isDraft ? "Draft" : "Open")}</span>
+                      {pullRequest.linkedIssueNumbers[0] ? <span>Issue #{pullRequest.linkedIssueNumbers[0]}</span> : null}
                     </div>
                   </div>
-                  <div className="list-note">{cycle.summary}</div>
+                  <div className="list-note">{pullRequest.headRefName} {" -> "} {pullRequest.baseRefName}</div>
                 </div>
               )}
             />
@@ -537,27 +542,24 @@ export function App() {
           <section className="panel sidebar-card">
             <div className="panel-header">
               <div>
-                <div className="section-title">Recent runs</div>
-                <div className="section-meta">
-                  Chief of Staff, implementation, and review runs. Expand a run to inspect the stored output.
-                </div>
+                <div className="section-title">Recent activity</div>
+                <div className="section-meta">A lightweight trail of CoS and lane movement without exposing the old workflow engine.</div>
               </div>
             </div>
-            <ItemList<RunRecord>
-              empty="No runs recorded yet."
-              items={status?.recentRuns ?? []}
-              render={(run) => (
-                <div className="list-row compact-list-row" key={run.id}>
+            <ItemList<DirectorStatusResponse["recentActivity"][number]>
+              empty="No recent activity yet."
+              items={status?.recentActivity ?? []}
+              render={(activity) => (
+                <div className="list-row compact-list-row" key={activity.id}>
                   <div>
-                    <div className="list-title">{formatRunTitle(run)}</div>
+                    <div className="list-title">{activity.summary}</div>
                     <div className="list-meta">
-                      <span>{formatRunStatus(run.status)}</span>
-                      {run.issueNumber ? <span>Issue #{run.issueNumber}</span> : null}
-                      {run.prNumber ? <span>PR #{run.prNumber}</span> : null}
+                      {activity.laneName ? <span>{activity.laneName}</span> : null}
+                      {activity.issueNumber ? <span>Issue #{activity.issueNumber}</span> : null}
+                      {activity.pullRequestNumber ? <span>PR #{activity.pullRequestNumber}</span> : null}
+                      <span>{formatTimestamp(activity.createdAt)}</span>
                     </div>
                   </div>
-                  <div className="list-note">{run.summary}</div>
-                  <RunOutputDetails run={run} summaryLabel="Run output" />
                 </div>
               )}
             />
