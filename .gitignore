@@ -7,4 +7,4 @@ apps/cli/dist
 *.db-shm
 *.db-wal
 coverage
-
+*.tsbuildinfo

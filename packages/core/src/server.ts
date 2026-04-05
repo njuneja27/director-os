@@ -10,14 +10,11 @@ import {
   getConversation,
   getDirectorStatus,
   getSetupStatus,
-  listDecisions,
   pauseOrchestrator,
   probeRepositorySetup,
-  resolveDecision,
   runWorkspaceSetupTest,
   startOrchestrator,
   sendConversationMessage,
-  submitDirectorNote,
   syncProject
 } from "./services.js";
 
@@ -85,7 +82,6 @@ export async function createDirectorServer() {
   }>("/api/setup/complete", async (request) => completeSetup(request.body.repositoryDraft));
 
   app.get("/api/status", async () => getDirectorStatus());
-  app.get("/api/decisions", async () => listDecisions());
   app.post<{ Body: { content: string } }>("/api/conversation", async (request) =>
     sendConversationMessage(request.body.content)
   );
@@ -95,13 +91,6 @@ export async function createDirectorServer() {
     pauseOrchestrator(request.body?.reason)
   );
   app.post("/api/sync", async () => syncProject());
-  app.post<{ Body: { content: string } }>("/api/notes", async (request) =>
-    submitDirectorNote(request.body.content)
-  );
-  app.post<{ Params: { id: string }; Body: { resolution: string } }>(
-    "/api/decisions/:id/resolve",
-    async (request) => resolveDecision(request.params.id, request.body.resolution)
-  );
 
   app.setNotFoundHandler(async (request, reply) => {
     if (request.raw.url?.startsWith("/api/")) {

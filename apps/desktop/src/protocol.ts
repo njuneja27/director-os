@@ -13,9 +13,6 @@ export const IPC_CHANNELS = {
     getStatus: "director:get-status",
     start: "director:start",
     pause: "director:pause",
-    sync: "director:sync",
-    submitNote: "director:submit-note",
-    listDecisions: "director:list-decisions",
-    resolveDecision: "director:resolve-decision"
+    sync: "director:sync"
   }
 } as const;
