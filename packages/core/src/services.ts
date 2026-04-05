@@ -8,9 +8,6 @@ import type {
   ActivityRecord,
   ConversationMessageRecord,
   ConversationResponse,
-  DecisionRecord,
-  DecisionsResponse,
-  DirectorNoteRecord,
   DirectorOperationResponse,
   DirectorStatusResponse,
   ExecutionMode,
@@ -35,7 +32,12 @@ import type {
   WorkItemStatus
 } from "@director-os/shared";
 
-import { probeCodexCli, runCodexSessionAgent } from "./agents.js";
+import {
+  probeCodexCli,
+  runCodexSessionAgent,
+  runCodexSessionTurn
+} from "./agents.js";
+import { runCommandOrThrow } from "./commands.js";
 import {
   ensureRuntimeDirectories,
   getProjectConfig,
@@ -51,6 +53,9 @@ import {
 } from "./config.js";
 import { COS_TASK_APPENDICES, buildChiefOfStaffPrompt } from "./cos.js";
 import {
+  commentOnIssue,
+  createIssue,
+  createPullRequest,
   detectRepoFromPath,
   ensureGhAuthenticated,
   fetchRepoDetails,
@@ -59,8 +64,10 @@ import {
   listPullRequests,
   probeGhCli,
   probeRepositoryPath,
-  resolveRepoPath
+  resolveRepoPath,
+  viewPullRequest
 } from "./github.js";
+import { parseGitWorktreeList, selectReusableGitWorktree } from "./git-worktrees.js";
 import {
   createDefaultConversationState,
   initializeProjectRuntime,
@@ -81,6 +88,7 @@ const execFileAsync = promisify(execFile);
 
 const LOOP_INTERVAL_MS = 30 * 1000;
 const ORCHESTRATOR_OWNER_TOKEN = `${process.pid}:${randomUUID()}`;
+const CHIEF_OF_STAFF_OWNER_ID = "chief_of_staff";
 
 let orchestratorTimer: NodeJS.Timeout | null = null;
 let orchestratorRunning = false;
@@ -110,6 +118,13 @@ type CoSChatReply = {
   run: RunRecord;
 };
 
+interface ProposedIssueTask {
+  title: string;
+  body: string;
+  kind: string;
+  execution_mode: string;
+}
+
 function assertPresent<TValue>(value: TValue | null | undefined, message: string): TValue {
   if (value === null || value === undefined) {
     throw new Error(message);
@@ -129,6 +144,50 @@ function parseDataString(value: unknown): string | null {
 
 function parseDataNumber(value: unknown): number | null {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function parseIssueTasks(value: unknown): ProposedIssueTask[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value.flatMap((entry) => {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      return [];
+    }
+
+    const title = parseDataString((entry as Record<string, unknown>).title);
+    const body = parseDataString((entry as Record<string, unknown>).body);
+    const kind = parseDataString((entry as Record<string, unknown>).kind);
+    const executionMode = parseDataString((entry as Record<string, unknown>).execution_mode);
+
+    if (!title || !body || !kind || !executionMode) {
+      return [];
+    }
+
+    return [
+      {
+        title,
+        body,
+        kind,
+        execution_mode: executionMode
+      }
+    ];
+  });
+}
+
+function labelsForIssueTask(task: ProposedIssueTask): string[] {
+  const labels = ["director:ready"];
+
+  if (task.kind === "task") {
+    labels.push("director:task");
+  }
+
+  if (task.execution_mode === "lane") {
+    labels.push("director:lane");
+  }
+
+  return labels;
 }
 
 function mapAgentStatusToRunStatus(status: "ok" | "needs_input" | "failed"): RunRecord["status"] {
@@ -643,7 +702,21 @@ function mapRemotePullRequest(
   };
 }
 
+function issueOwnerId(router: RouterState, issueNumber: number): string | null {
+  const ownerId = router.issueOwnership[String(issueNumber)];
+  return typeof ownerId === "string" && ownerId.trim() ? ownerId : null;
+}
+
 function findIssueLane(router: RouterState, issueNumber: number): RouterState["lanes"][number] | null {
+  const ownerId = issueOwnerId(router, issueNumber);
+  if (ownerId === CHIEF_OF_STAFF_OWNER_ID) {
+    return null;
+  }
+
+  if (ownerId) {
+    return findLaneById(router, ownerId);
+  }
+
   return router.lanes.find((lane) => lane.issueNumbers.includes(issueNumber)) ?? null;
 }
 
@@ -674,6 +747,44 @@ function ensureLane(router: RouterState, laneId: string, laneName: string): Rout
   return lane;
 }
 
+function removeIssueFromLanes(router: RouterState, issueNumber: number): void {
+  for (const lane of router.lanes) {
+    const before = lane.issueNumbers.length;
+    lane.issueNumbers = lane.issueNumbers.filter((candidate) => candidate !== issueNumber);
+    if (lane.currentIssueNumber === issueNumber) {
+      lane.currentIssueNumber = lane.issueNumbers.at(-1) ?? null;
+    }
+    if (before !== lane.issueNumbers.length) {
+      lane.updatedAt = nowIso();
+      if (!lane.issueNumbers.length && lane.status !== "blocked") {
+        lane.status = "idle";
+      }
+    }
+  }
+}
+
+function assignIssueToLane(
+  router: RouterState,
+  issueNumber: number,
+  laneId: string,
+  laneName: string
+): RouterLaneState {
+  removeIssueFromLanes(router, issueNumber);
+  const lane = ensureLane(router, laneId, laneName);
+  if (!lane.issueNumbers.includes(issueNumber)) {
+    lane.issueNumbers.push(issueNumber);
+  }
+  lane.currentIssueNumber = issueNumber;
+  lane.updatedAt = nowIso();
+  router.issueOwnership[String(issueNumber)] = lane.id;
+  return lane;
+}
+
+function assignIssueToChiefOfStaff(router: RouterState, issueNumber: number): void {
+  removeIssueFromLanes(router, issueNumber);
+  router.issueOwnership[String(issueNumber)] = CHIEF_OF_STAFF_OWNER_ID;
+}
+
 function defaultLaneForIssue(issue: GitHubIssueRecord): { id: string; name: string } {
   const explicitLabel = issue.labels.find((label) => label.startsWith("director:lane:"));
   if (explicitLabel) {
@@ -698,9 +809,90 @@ function defaultExecutionIntentForIssue(issue: GitHubIssueRecord): "plan" | "imp
   return issue.labels.includes("director:lane") ? "plan" : "implement";
 }
 
+async function pathExists(targetPath: string): Promise<boolean> {
+  try {
+    await fs.access(targetPath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function maybeRunPackageScript(cwd: string, script: string): Promise<void> {
+  if (!(await pathExists(path.join(cwd, "package.json")))) {
+    return;
+  }
+
+  await runCommandOrThrow("npm", ["run", script, "--if-present"], { cwd });
+}
+
+async function listGitWorktrees(repoPath: string) {
+  const porcelain = await runCommandOrThrow(
+    "git",
+    ["-C", repoPath, "worktree", "list", "--porcelain"],
+    { cwd: repoPath }
+  );
+  return parseGitWorktreeList(porcelain);
+}
+
+async function pruneGitWorktrees(repoPath: string): Promise<void> {
+  await runCommandOrThrow("git", ["-C", repoPath, "worktree", "prune"], { cwd: repoPath });
+}
+
+async function ensureIssueWorktree(
+  project: ProjectRecord,
+  issueNumber: number,
+  branchName: string,
+  worktreePath: string
+): Promise<{ branchName: string; worktreePath: string }> {
+  await fs.mkdir(project.worktreeRoot, { recursive: true });
+  await pruneGitWorktrees(project.repoPath);
+
+  const reusable = selectReusableGitWorktree(
+    await listGitWorktrees(project.repoPath),
+    worktreePath,
+    branchName
+  );
+
+  if (reusable && (await pathExists(reusable.path))) {
+    return {
+      branchName: reusable.branchName ?? branchName,
+      worktreePath: reusable.path
+    };
+  }
+
+  if (await pathExists(worktreePath)) {
+    await fs.rm(worktreePath, { recursive: true, force: true });
+  }
+
+  await runCommandOrThrow(
+    "git",
+    [
+      "-C",
+      project.repoPath,
+      "worktree",
+      "add",
+      "-B",
+      branchName,
+      worktreePath,
+      project.defaultBranch
+    ],
+    { cwd: project.repoPath }
+  );
+
+  return {
+    branchName,
+    worktreePath
+  };
+}
+
+function branchNameForIssue(issue: GitHubIssueRecord): string {
+  return `codex/issue-${issue.number}-${slugify(issue.title).slice(0, 36)}`;
+}
+
 function hasPendingLaneWork(router: RouterState, issueNumber: number): boolean {
   return (
-    Boolean(findIssueLane(router, issueNumber)) ||
+    Boolean(issueOwnerId(router, issueNumber)) ||
     router.pendingHandoffs.some(
       (handoff) => handoff.issueNumber === issueNumber && handoff.status === "pending"
     )
@@ -724,92 +916,6 @@ function enqueueHandoff(
 
 function pendingHandoff(router: RouterState): RouterHandoffState | null {
   return router.pendingHandoffs.find((handoff) => handoff.status === "pending") ?? null;
-}
-
-function synthesizeWorkItemStatus(
-  issue: GitHubIssueRecord,
-  linkedPullRequest: GitHubPullRequestRecord | null,
-  router: RouterState
-): WorkItemStatus {
-  if (issue.state.toLowerCase() !== "open") {
-    return "completed";
-  }
-
-  if (router.openQuestion?.issueNumber === issue.number) {
-    return "waiting_decision";
-  }
-
-  if (linkedPullRequest && linkedPullRequest.state.toLowerCase() === "open") {
-    return "waiting_review";
-  }
-
-  const lane = findIssueLane(router, issue.number);
-  if (lane?.status === "blocked") {
-    return "blocked";
-  }
-  if (lane?.status === "planning") {
-    return "planning";
-  }
-  if (lane?.status === "implementing") {
-    return "running";
-  }
-  if (issue.workflowState === "blocked") {
-    return "blocked";
-  }
-  if (issue.workflowState === "ready") {
-    return "ready";
-  }
-  return "queued";
-}
-
-function priorityBucketFromStatus(status: WorkItemStatus): number {
-  switch (status) {
-    case "ready":
-      return 0;
-    case "planning":
-    case "running":
-      return 1;
-    case "queued":
-      return 2;
-    case "waiting_review":
-    case "waiting_decision":
-      return 3;
-    case "blocked":
-      return 4;
-    default:
-      return 99;
-  }
-}
-
-function synthesizeWorkItem(
-  project: ProjectRecord,
-  issue: GitHubIssueRecord,
-  linkedPullRequest: GitHubPullRequestRecord | null,
-  router: RouterState
-): WorkItemRecord {
-  const lane = findIssueLane(router, issue.number);
-  const status = synthesizeWorkItemStatus(issue, linkedPullRequest, router);
-  const kind: WorkItemKind = issue.labels.includes("director:task") ? "task" : "workstream";
-  const executionMode: ExecutionMode = lane ? "lane" : kind === "workstream" ? "lane" : "worker";
-
-  return {
-    id: issue.number,
-    projectId: project.id,
-    issueNumber: issue.number,
-    parentIssueNumber: null,
-    title: issue.title,
-    summary: summarizeText(issue.body || issue.title),
-    kind,
-    executionMode,
-    ownerRole: lane?.name ?? "chief_of_staff",
-    status,
-    priorityBucket: priorityBucketFromStatus(status),
-    activeRunId: null,
-    activePrNumber: linkedPullRequest?.number ?? null,
-    lastSummary: lane?.lastSummary ?? null,
-    createdAt: issue.updatedAt,
-    updatedAt: issue.updatedAt
-  };
 }
 
 function toHumanQuestionRecord(question: RouterQuestionState): HumanQuestionRecord {
@@ -854,7 +960,10 @@ function synthesizeIssueOwnership(
   router: RouterState,
   pullRequests: GitHubPullRequestRecord[]
 ): IssueOwnershipRecord {
+  const ownerId = issueOwnerId(router, issue.number);
   const lane = findIssueLane(router, issue.number);
+  const ownerKind =
+    ownerId === CHIEF_OF_STAFF_OWNER_ID ? "chief_of_staff" : lane ? "lane" : null;
   const linkedPullRequest =
     pullRequests.find((pullRequest) => pullRequest.linkedIssueNumbers.includes(issue.number)) ?? null;
 
@@ -864,14 +973,19 @@ function synthesizeIssueOwnership(
     url: issue.url,
     state: issue.state,
     workflowState: issue.workflowState,
+    ownerKind,
+    ownerName:
+      ownerKind === "chief_of_staff" ? "Chief of Staff" : ownerKind === "lane" ? lane?.name ?? null : null,
     laneId: lane?.id ?? null,
     laneName: lane?.name ?? null,
     executionIntent: lane?.status === "planning" ? "plan" : lane ? "implement" : null,
     status:
       issue.state.toLowerCase() !== "open"
         ? "completed"
-        : linkedPullRequest
+      : linkedPullRequest
           ? "waiting_review"
+          : ownerKind === "chief_of_staff"
+            ? "planned"
           : lane?.status === "blocked"
             ? "blocked"
           : issue.workflowState === "blocked"
@@ -890,50 +1004,7 @@ function synthesizeIssueOwnership(
   };
 }
 
-function synthesizePrCycle(
-  project: ProjectRecord,
-  pullRequest: GitHubPullRequestRecord
-): PrCycleRecord {
-  let status: PrCycleRecord["status"] = "opened";
-
-  if (pullRequest.state.toLowerCase() === "merged") {
-    status = "merged";
-  } else if (pullRequest.reviewDecision === "CHANGES_REQUESTED") {
-    status = "changes_requested";
-  } else if (pullRequest.checksBucket === "pending") {
-    status = "waiting_automation";
-  } else if (pullRequest.checksBucket === "pass") {
-    status = "merge_ready";
-  }
-
-  return {
-    id: pullRequest.number,
-    projectId: project.id,
-    issueNumber: pullRequest.linkedIssueNumbers[0] ?? 0,
-    prNumber: pullRequest.number,
-    status,
-    summary: pullRequest.title,
-    automationWindowEndsAt: null,
-    lastCheckedAt: pullRequest.updatedAt,
-    lastHandledCommentAt: null,
-    mergedAt: pullRequest.state.toLowerCase() === "merged" ? pullRequest.updatedAt : null,
-    createdAt: pullRequest.updatedAt,
-    updatedAt: pullRequest.updatedAt
-  };
-}
-
 function synthesizeActivity(router: RouterState): ActivityRecord[] {
-  const noteActivity = router.notes.map<ActivityRecord>((note) => ({
-    id: `note_${note.id}`,
-    kind: "note",
-    summary: note.content,
-    laneId: null,
-    laneName: null,
-    issueNumber: null,
-    pullRequestNumber: null,
-    createdAt: note.createdAt
-  }));
-
   const runActivity = router.recentRuns.map<ActivityRecord>((run) => ({
     id: `run_${run.id}`,
     kind: run.role,
@@ -960,7 +1031,7 @@ function synthesizeActivity(router: RouterState): ActivityRecord[] {
       ]
     : [];
 
-  return [...questionActivity, ...runActivity, ...noteActivity]
+  return [...questionActivity, ...runActivity]
     .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
     .slice(0, 12);
 }
@@ -1067,26 +1138,6 @@ async function getConversationResponse(session: ProjectSession): Promise<Convers
     latestSummary: latestMessage?.summary ?? null,
     openQuestionRun: null
   };
-}
-
-async function addDirectorNote(session: ProjectSession, content: string): Promise<DirectorNoteRecord> {
-  const router = await loadRouterState(session.paths, session.project.slug);
-  const timestamp = nowIso();
-  const note: DirectorNoteRecord = {
-    id: nextNumericId(router.notes),
-    projectId: session.project.id,
-    content,
-    status: "active",
-    createdAt: timestamp,
-    updatedAt: timestamp
-  };
-
-  await saveRouterState(session.paths, {
-    ...router,
-    notes: [...router.notes, note]
-  });
-
-  return note;
 }
 
 function recordRun(
@@ -1207,7 +1258,7 @@ function applyLaneTurn(
   });
 }
 
-function buildLanePrompt(
+function buildLaneNativePlanPrompt(
   session: ProjectSession,
   lane: RouterLaneState,
   issue: GitHubIssueRecord,
@@ -1218,14 +1269,12 @@ function buildLanePrompt(
   const humanGuidance = parseDataString(handoff.details?.human_guidance) ?? null;
 
   return [
-    "You are a persistent lane Codex session owned by the Chief of Staff in Director OS.",
-    "Stay within your lane context. Do not address the human directly. The Chief of Staff handles all human-facing communication.",
-    handoff.kind === "plan"
-      ? "Task: take ownership of this issue and produce a concise lane plan using Codex's native planning mindset."
-      : "Task: take ownership of this issue and produce a concise implementation handoff for the Chief of Staff.",
-    "Return structured output only.",
-    "If you are blocked on product or taste judgment, set `status` to `needs_input` and put the exact blocker in `blocking_questions`.",
-    "Use `data.transcript_reply` for the short update the Chief of Staff should relay back up.",
+    `/plan Take ownership of GitHub issue #${issue.number}: ${issue.title}.`,
+    "Use native Codex plan mode.",
+    "Focus on the shortest safe path from this issue to a real PR.",
+    "If the issue should be decomposed, include a clearly labeled decomposition section with up to 3 child issue proposals.",
+    "If the issue is already bounded, say so explicitly and outline the implementation sequence.",
+    "Do not make code changes in this step.",
     "",
     `Lane: ${lane.name} (${lane.id})`,
     `Issue: #${issue.number} ${issue.title}`,
@@ -1248,17 +1297,85 @@ function buildLanePrompt(
     .join("\n");
 }
 
+function buildLanePlanSummaryPrompt(
+  lane: RouterLaneState,
+  issue: GitHubIssueRecord,
+  nativePlan: string
+): string {
+  return [
+    "Return structured output only.",
+    "Summarize the native lane plan you just produced for the Chief of Staff.",
+    "Set `status` to `needs_input` only if the plan uncovered a real product or taste judgment blocker.",
+    "If decomposition is warranted, return up to 3 child issues in `data.new_issues`.",
+    "Each child issue must include `title`, `body`, `kind`, and `execution_mode`.",
+    "If the issue is already bounded, leave `data.new_issues` empty and explain the next implementation step.",
+    "Use `data.transcript_reply` for the short update the Chief of Staff should relay back up.",
+    "",
+    `Lane: ${lane.name} (${lane.id})`,
+    `Issue: #${issue.number} ${issue.title}`,
+    "",
+    "Native plan output:",
+    nativePlan.trim() || "No native plan output was captured."
+  ].join("\n");
+}
+
+function buildLaneImplementationPrompt(
+  session: ProjectSession,
+  lane: RouterLaneState,
+  issue: GitHubIssueRecord,
+  handoff: RouterHandoffState
+): string {
+  const handoffSummary = handoff.summary?.trim() || "Chief of Staff routed this issue to your lane.";
+  const priorGuidance = parseDataString(handoff.details?.guidance) ?? null;
+  const humanGuidance = parseDataString(handoff.details?.human_guidance) ?? null;
+  const worktreePath = parseDataString(handoff.worktreePath) ?? "(missing worktree path)";
+  const branchName = parseDataString(handoff.branchName) ?? "(missing branch name)";
+
+  return [
+    "You are a persistent lane Codex session owned by the Chief of Staff in Director OS.",
+    "Stay within your lane context. Do not address the human directly. The Chief of Staff handles all human-facing communication.",
+    "Task: implement this GitHub issue inside the assigned git worktree and leave it ready for commit.",
+    "Return structured output only.",
+    "Work only inside the assigned worktree path.",
+    "Use your existing lane context and any prior plan before editing.",
+    "If you are blocked on product or taste judgment, set `status` to `needs_input` and put the exact blocker in `blocking_questions`.",
+    "Use `data.transcript_reply` for the short update the Chief of Staff should relay back up.",
+    "",
+    `Lane: ${lane.name} (${lane.id})`,
+    `Issue: #${issue.number} ${issue.title}`,
+    `Assigned branch: ${branchName}`,
+    `Assigned worktree: ${worktreePath}`,
+    "",
+    "Chief of Staff handoff:",
+    handoffSummary,
+    "",
+    "Issue body:",
+    issue.body.trim() || "No issue body provided.",
+    "",
+    "Recent CoS conversation:",
+    "Use the existing session context plus this explicit handoff. Focus on shipping the bounded slice."
+  ]
+    .concat(
+      priorGuidance ? ["", "Chief of Staff guidance:", priorGuidance] : [],
+      humanGuidance ? ["", "Human guidance:", humanGuidance] : [],
+      lane.lastPlanSummary ? ["", "Existing lane plan summary:", lane.lastPlanSummary] : [],
+      lane.lastSummary ? ["", "Latest lane summary:", lane.lastSummary] : []
+    )
+    .join("\n");
+}
+
 function blockedQuestionForLane(
   issue: GitHubIssueRecord,
   summary: string,
   blockingQuestion: string,
+  whyItMatters: string | null,
   recommendation: string | null
 ): Omit<RouterQuestionState, "id" | "createdAt" | "updatedAt"> {
   return {
     title: `Chief of Staff question for #${issue.number}`,
     summary,
     question: blockingQuestion,
-    whyItMatters: summary,
+    whyItMatters: whyItMatters ?? summary,
     recommendation:
       recommendation ?? "Reply here with the decision you want me to take so I can resume the lane.",
     issueNumber: issue.number,
@@ -1266,6 +1383,42 @@ function blockedQuestionForLane(
     runId: null,
     requestedBy: "lane"
   };
+}
+
+async function createIssuesFromPlan(
+  session: ProjectSession,
+  lane: RouterLaneState,
+  parentIssue: GitHubIssueRecord,
+  tasks: ProposedIssueTask[]
+): Promise<Array<{ number: number; title: string; url: string }>> {
+  const created: Array<{ number: number; title: string; url: string }> = [];
+
+  for (const task of tasks.slice(0, 3)) {
+    const issue = await createIssue(session.project.repoSlug, {
+      title: task.title,
+      body: `${task.body}\n\nParent issue: #${parentIssue.number}`,
+      labels: [...labelsForIssueTask(task), `director:lane:${lane.id}`]
+    });
+
+    created.push({
+      number: issue.number,
+      title: task.title,
+      url: issue.url
+    });
+  }
+
+  if (created.length) {
+    await commentOnIssue(
+      session.project.repoSlug,
+      parentIssue.number,
+      [
+        `Chief of Staff created ${created.length} child issue${created.length === 1 ? "" : "s"} from lane ${lane.name}'s native plan:`,
+        ...created.map((issue) => `- #${issue.number} ${issue.title}`)
+      ].join("\n")
+    );
+  }
+
+  return created;
 }
 
 async function syncProjectInternal(session: ProjectSession): Promise<DirectorOperationResponse> {
@@ -1513,6 +1666,7 @@ async function chooseNextIssue(session: ProjectSession): Promise<void> {
       blocking_questions: [],
       data: {
         selected_issue_number: fallbackIssue.number,
+        owner_type: "lane",
         execution_intent: fallbackIntent,
         lane_id: fallbackLane.id,
         lane_name: fallbackLane.name
@@ -1523,6 +1677,7 @@ async function chooseNextIssue(session: ProjectSession): Promise<void> {
   const selectedIssueNumber = parseDataNumber(turn.result.data?.selected_issue_number) ?? fallbackIssue.number;
   const selectedIssue =
     issues.find((issue) => issue.number === selectedIssueNumber) ?? fallbackIssue;
+  const ownerType = parseDataString(turn.result.data?.owner_type) ?? "lane";
   const laneFallback = defaultLaneForIssue(selectedIssue);
   const laneId = slugify(parseDataString(turn.result.data?.lane_id) ?? laneFallback.id);
   const laneName = parseDataString(turn.result.data?.lane_name) ?? laneFallback.name;
@@ -1537,14 +1692,32 @@ async function chooseNextIssue(session: ProjectSession): Promise<void> {
     result: turn.result,
     issueNumber: selectedIssue.number
   });
-  const lane = ensureLane(nextRouter, laneId, laneName);
-  if (!lane.issueNumbers.includes(selectedIssue.number)) {
-    lane.issueNumbers.push(selectedIssue.number);
+  if (ownerType === CHIEF_OF_STAFF_OWNER_ID) {
+    assignIssueToChiefOfStaff(nextRouter, selectedIssue.number);
+    nextRouter.orchestrator = {
+      ...nextRouter.orchestrator,
+      lastLoopAt: nowIso(),
+      lastSummary: `Chief of Staff claimed issue #${selectedIssue.number} for direct handling.`
+    };
+
+    await saveRouterState(session.paths, nextRouter);
+    await appendConversationMessage(session, {
+      role: "chief_of_staff",
+      kind: "status_update",
+      content: `I claimed issue #${selectedIssue.number} for direct Chief of Staff handling.`,
+      summary: `Chief of Staff claimed #${selectedIssue.number}`,
+      linkedIssueNumber: selectedIssue.number,
+      linkedPrNumber: null,
+      linkedPullRequestNumber: null,
+      isOpenQuestion: false
+    });
+    return;
   }
+
+  const lane = assignIssueToLane(nextRouter, selectedIssue.number, laneId, laneName);
   lane.currentIssueNumber = selectedIssue.number;
   lane.status = executionIntent === "plan" ? "planning" : "implementing";
   lane.updatedAt = nowIso();
-  nextRouter.issueOwnership[String(selectedIssue.number)] = lane.id;
   enqueueHandoff(nextRouter, {
     laneId: lane.id,
     issueNumber: selectedIssue.number,
@@ -1657,17 +1830,23 @@ async function mediateLaneBlocker(
   });
   const outcome = parseDataString(turn.result.data?.outcome);
   const guidance = parseDataString(turn.result.data?.guidance);
+  const reroutedLaneId = slugify(parseDataString(turn.result.data?.lane_id) ?? lane.id);
+  const reroutedLaneName = parseDataString(turn.result.data?.lane_name) ?? lane.name;
   const transcriptReply =
     parseDataString(turn.result.data?.transcript_reply) ?? turn.result.summary;
 
   if (outcome === "answer_worker" || outcome === "reroute") {
     handoff.status = "completed";
     handoff.updatedAt = nowIso();
-    lane.status = handoff.kind === "plan" ? "planning" : "implementing";
-    lane.lastSummary = transcriptReply;
-    lane.updatedAt = nowIso();
+    const targetLane =
+      outcome === "reroute"
+        ? assignIssueToLane(nextRouter, issue.number, reroutedLaneId, reroutedLaneName)
+        : lane;
+    targetLane.status = handoff.kind === "plan" ? "planning" : "implementing";
+    targetLane.lastSummary = transcriptReply;
+    targetLane.updatedAt = nowIso();
     enqueueHandoff(nextRouter, {
-      laneId: lane.id,
+      laneId: targetLane.id,
       issueNumber: issue.number,
       kind: handoff.kind,
       status: "pending",
@@ -1684,14 +1863,23 @@ async function mediateLaneBlocker(
     nextRouter.orchestrator = {
       ...nextRouter.orchestrator,
       lastLoopAt: nowIso(),
-      lastSummary: `Chief of Staff resolved a blocker for lane ${lane.name} on issue #${issue.number}.`
+      lastSummary:
+        outcome === "reroute"
+          ? `Chief of Staff rerouted issue #${issue.number} to lane ${targetLane.name}.`
+          : `Chief of Staff resolved a blocker for lane ${lane.name} on issue #${issue.number}.`
     };
     await saveRouterState(session.paths, nextRouter);
     await appendConversationMessage(session, {
       role: "chief_of_staff",
       kind: "status_update",
-      content: `I resolved a blocker for lane ${lane.name} on issue #${issue.number} and resumed the lane.`,
-      summary: `Resumed ${lane.name} on #${issue.number}`,
+      content:
+        outcome === "reroute"
+          ? `I rerouted issue #${issue.number} to lane ${targetLane.name} and resumed work there.`
+          : `I resolved a blocker for lane ${lane.name} on issue #${issue.number} and resumed the lane.`,
+      summary:
+        outcome === "reroute"
+          ? `Rerouted #${issue.number} to ${targetLane.name}`
+          : `Resumed ${lane.name} on #${issue.number}`,
       linkedIssueNumber: issue.number,
       linkedPrNumber: null,
       linkedPullRequestNumber: null,
@@ -1709,6 +1897,7 @@ async function mediateLaneBlocker(
     issue,
     turn.result.summary,
     parseDataString(turn.result.data?.question) ?? fallbackQuestion,
+    parseDataString(turn.result.data?.why_it_matters),
     parseDataString(turn.result.data?.recommendation)
   );
   const timestamp = nowIso();
@@ -1744,6 +1933,230 @@ async function mediateLaneBlocker(
     isOpenQuestion: true
   });
 
+  return nextRouter;
+}
+
+async function reviewLanePlan(
+  session: ProjectSession,
+  router: RouterState,
+  lane: RouterLaneState,
+  issue: GitHubIssueRecord,
+  handoff: RouterHandoffState,
+  laneResult: {
+    status: "ok" | "needs_input" | "failed";
+    summary: string;
+    recommended_next_action: string;
+    artifact_refs: string[];
+    blocking_questions: string[];
+    data?: Record<string, unknown> | null;
+    raw_model_output?: string | null;
+  }
+): Promise<RouterState> {
+  const proposedIssues = parseIssueTasks(laneResult.data?.child_tasks ?? laneResult.data?.new_issues);
+  const prompt = buildChiefOfStaffPrompt(COS_TASK_APPENDICES.reviewLanePlan, [
+    {
+      title: "Lane",
+      content: `${lane.name} (${lane.id})`
+    },
+    {
+      title: "Issue",
+      content: `#${issue.number}: ${issue.title}\n\n${issue.body.trim() || "No issue body provided."}`
+    },
+    {
+      title: "Lane plan summary",
+      content: laneResult.summary
+    },
+    {
+      title: "Lane relay",
+      content: parseDataString(laneResult.data?.transcript_reply)
+    },
+    {
+      title: "Proposed child issues",
+      content:
+        proposedIssues.length > 0
+          ? proposedIssues
+              .map(
+                (task) =>
+                  `- ${task.title} [${task.kind}/${task.execution_mode}]\n${summarizeText(task.body, 400)}`
+              )
+              .join("\n\n")
+          : "No child issues proposed."
+    }
+  ]);
+
+  const turn = await runCodexSessionAgent(
+    {
+      role: "chief_of_staff",
+      cwd: session.project.repoPath,
+      model: session.project.model,
+      allowWrite: false,
+      prompt,
+      sessionId: router.chiefOfStaff.sessionId
+    },
+    {
+      status: "ok",
+      summary: `Lane ${lane.name} produced a plan for issue #${issue.number}.`,
+      recommended_next_action: "Route the issue into implementation or decompose it into child GitHub issues.",
+      artifact_refs: [],
+      blocking_questions: [],
+      data: {
+        decision: "implement",
+        guidance: laneResult.summary,
+        transcript_reply:
+          parseDataString(laneResult.data?.transcript_reply) ??
+          `Lane ${lane.name} produced a plan for issue #${issue.number}.`
+      }
+    }
+  );
+
+  const nextRouter = applyChiefOfStaffTurn(session, router, {
+    sessionId: turn.sessionId,
+    phase: "plan_review",
+    result: turn.result,
+    issueNumber: issue.number
+  });
+  handoff.status = "completed";
+  handoff.updatedAt = nowIso();
+
+  const decision = parseDataString(turn.result.data?.decision) ?? "implement";
+  const transcriptReply =
+    parseDataString(turn.result.data?.transcript_reply) ?? turn.result.summary;
+  const guidance = parseDataString(turn.result.data?.guidance) ?? laneResult.summary;
+
+  if (decision === "ask_human") {
+    handoff.status = "blocked";
+    handoff.updatedAt = nowIso();
+    lane.status = "blocked";
+    lane.lastSummary = transcriptReply;
+    lane.updatedAt = nowIso();
+
+    const questionSeed = blockedQuestionForLane(
+      issue,
+      turn.result.summary,
+      parseDataString(turn.result.data?.question) ??
+        `I need a product decision before I decide how to break down issue #${issue.number}.`,
+      parseDataString(turn.result.data?.why_it_matters),
+      parseDataString(turn.result.data?.recommendation)
+    );
+    const timestamp = nowIso();
+    nextRouter.openQuestion = {
+      id: `question_${Date.now()}`,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+      ...questionSeed,
+      runId: assertPresent(
+        nextRouter.recentRuns.at(-1),
+        "Chief of Staff plan review run should have been recorded."
+      ).id
+    };
+    nextRouter.orchestrator = {
+      ...nextRouter.orchestrator,
+      lastLoopAt: nowIso(),
+      lastSummary: `Chief of Staff needs human guidance before routing issue #${issue.number}.`
+    };
+
+    await saveRouterState(session.paths, nextRouter);
+    await appendConversationMessage(session, {
+      role: "chief_of_staff",
+      kind: "cos_question",
+      content: formatHumanQuestionContent(
+        nextRouter.openQuestion.question,
+        nextRouter.openQuestion.whyItMatters,
+        nextRouter.openQuestion.recommendation
+      ),
+      summary: summarizeText(nextRouter.openQuestion.question),
+      linkedIssueNumber: issue.number,
+      linkedPrNumber: null,
+      linkedPullRequestNumber: null,
+      isOpenQuestion: true
+    });
+    return nextRouter;
+  }
+
+  if (decision === "decompose" || decision === "hold") {
+    assignIssueToChiefOfStaff(nextRouter, issue.number);
+    lane.lastSummary = transcriptReply;
+    lane.updatedAt = nowIso();
+
+    const tasks =
+      decision === "decompose"
+        ? (() => {
+            const explicitTasks = parseIssueTasks(turn.result.data?.new_issues);
+            return explicitTasks.length > 0 ? explicitTasks : proposedIssues;
+          })()
+        : [];
+    const createdIssues =
+      tasks.length > 0 ? await createIssuesFromPlan(session, lane, issue, tasks) : [];
+
+    nextRouter.orchestrator = {
+      ...nextRouter.orchestrator,
+      lastLoopAt: nowIso(),
+      lastSummary:
+        createdIssues.length > 0
+          ? `Chief of Staff decomposed issue #${issue.number} into ${createdIssues.length} child issues.`
+          : `Chief of Staff is holding issue #${issue.number} after reviewing the lane plan.`
+    };
+
+    await saveRouterState(session.paths, nextRouter);
+    await appendConversationMessage(session, {
+      role: "chief_of_staff",
+      kind: "status_update",
+      content:
+        createdIssues.length > 0
+          ? `I decomposed issue #${issue.number} into child GitHub issues and kept the parent with the Chief of Staff.`
+          : `I kept issue #${issue.number} with the Chief of Staff after reviewing the lane plan.`,
+      summary:
+        createdIssues.length > 0
+          ? `Decomposed #${issue.number} into ${createdIssues.length} child issues`
+          : `Held #${issue.number} with Chief of Staff`,
+      linkedIssueNumber: issue.number,
+      linkedPrNumber: null,
+      linkedPullRequestNumber: null,
+      isOpenQuestion: false
+    });
+    return nextRouter;
+  }
+
+  const targetLaneId = slugify(parseDataString(turn.result.data?.lane_id) ?? lane.id);
+  const targetLaneName = parseDataString(turn.result.data?.lane_name) ?? lane.name;
+  const targetLane = assignIssueToLane(nextRouter, issue.number, targetLaneId, targetLaneName);
+  targetLane.status = "implementing";
+  targetLane.lastSummary = transcriptReply;
+  targetLane.updatedAt = nowIso();
+
+  enqueueHandoff(nextRouter, {
+    laneId: targetLane.id,
+    issueNumber: issue.number,
+    kind: "implement",
+    status: "pending",
+    summary: guidance,
+    prNumber: null,
+    branchName: null,
+    worktreePath: null,
+    reviewWindowEndsAt: null,
+    lastHandledCommentAt: null,
+    details: {
+      guidance,
+      plan_summary: lane.lastPlanSummary ?? laneResult.summary
+    }
+  });
+  nextRouter.orchestrator = {
+    ...nextRouter.orchestrator,
+    lastLoopAt: nowIso(),
+    lastSummary: `Chief of Staff routed issue #${issue.number} to lane ${targetLane.name} for implementation.`
+  };
+
+  await saveRouterState(session.paths, nextRouter);
+  await appendConversationMessage(session, {
+    role: "chief_of_staff",
+    kind: "status_update",
+    content: `I reviewed the lane plan for issue #${issue.number} and routed implementation to lane ${targetLane.name}.`,
+    summary: `Reviewed plan for #${issue.number}`,
+    linkedIssueNumber: issue.number,
+    linkedPrNumber: null,
+    linkedPullRequestNumber: null,
+    isOpenQuestion: false
+  });
   return nextRouter;
 }
 
@@ -1785,30 +2198,99 @@ async function dispatchPendingHandoff(session: ProjectSession): Promise<boolean>
     return true;
   }
 
+  if (handoff.kind === "plan") {
+    const nativePlanTurn = await runCodexSessionTurn({
+      role: "lane_owner",
+      cwd: session.project.repoPath,
+      model: session.project.model,
+      allowWrite: false,
+      prompt: buildLaneNativePlanPrompt(session, lane, issue, handoff),
+      sessionId: lane.sessionId
+    });
+
+    const turn = await runCodexSessionAgent(
+      {
+        role: "lane_owner",
+        cwd: session.project.repoPath,
+        model: session.project.model,
+        allowWrite: false,
+        prompt: buildLanePlanSummaryPrompt(lane, issue, nativePlanTurn.rawMessage),
+        sessionId: nativePlanTurn.sessionId
+      },
+      {
+        status: "ok",
+        summary: `Lane ${lane.name} completed a native planning pass for issue #${issue.number}.`,
+        recommended_next_action: "Route the issue into implementation or decompose it into child GitHub issues.",
+        artifact_refs: [],
+        blocking_questions: [],
+        data: {
+          transcript_reply: `Lane ${lane.name} finished a native plan for issue #${issue.number}.`,
+          new_issues: []
+        },
+        raw_model_output: nativePlanTurn.rawMessage
+      }
+    );
+
+    const laneResult = {
+      ...turn.result,
+      raw_model_output: nativePlanTurn.rawMessage
+    };
+    const nextRouter = applyLaneTurn(session, router, lane, {
+      sessionId: turn.sessionId ?? nativePlanTurn.sessionId,
+      phase: "planning",
+      result: laneResult,
+      issueNumber: issue.number
+    });
+    const relay = parseDataString(laneResult.data?.transcript_reply) ?? laneResult.summary;
+
+    if (laneResult.status === "needs_input" || laneResult.blocking_questions.length > 0) {
+      handoff.summary = relay;
+      handoff.updatedAt = nowIso();
+      await mediateLaneBlocker(session, nextRouter, lane, issue, handoff, laneResult);
+      return true;
+    }
+
+    handoff.summary = relay;
+    handoff.updatedAt = nowIso();
+    await reviewLanePlan(session, nextRouter, lane, issue, handoff, laneResult);
+    return true;
+  }
+
+  const ensuredWorktree = await ensureIssueWorktree(
+    session.project,
+    issue.number,
+    handoff.branchName ?? branchNameForIssue(issue),
+    handoff.worktreePath ?? path.join(session.project.worktreeRoot, `issue-${issue.number}`)
+  );
+  handoff.branchName = ensuredWorktree.branchName;
+  handoff.worktreePath = ensuredWorktree.worktreePath;
+  handoff.updatedAt = nowIso();
+
   const turn = await runCodexSessionAgent(
     {
       role: "lane_owner",
       cwd: session.project.repoPath,
       model: session.project.model,
-      allowWrite: false,
-      prompt: buildLanePrompt(session, lane, issue, handoff),
+      allowWrite: true,
+      addDirs: [session.project.worktreeRoot],
+      prompt: buildLaneImplementationPrompt(session, lane, issue, handoff),
       sessionId: lane.sessionId
     },
     {
       status: "ok",
-      summary: `Lane ${lane.name} acknowledged issue #${issue.number}.`,
-      recommended_next_action: "Keep routing follow-up work through the lane session.",
-      artifact_refs: [],
+      summary: `Lane ${lane.name} implemented issue #${issue.number}.`,
+      recommended_next_action: "Validate the worktree, commit the changes, and open a real pull request.",
+      artifact_refs: [ensuredWorktree.worktreePath],
       blocking_questions: [],
       data: {
-        transcript_reply: `Lane ${lane.name} is attached to issue #${issue.number}.`
+        transcript_reply: `Lane ${lane.name} finished implementation for issue #${issue.number}.`
       }
     }
   );
 
   const nextRouter = applyLaneTurn(session, router, lane, {
     sessionId: turn.sessionId,
-    phase: handoff.kind === "plan" ? "planning" : handoff.kind,
+    phase: handoff.kind,
     result: turn.result,
     issueNumber: issue.number
   });
@@ -1821,27 +2303,134 @@ async function dispatchPendingHandoff(session: ProjectSession): Promise<boolean>
     return true;
   }
 
+  try {
+    await maybeRunPackageScript(ensuredWorktree.worktreePath, "typecheck");
+    await maybeRunPackageScript(ensuredWorktree.worktreePath, "build");
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    handoff.status = "blocked";
+    handoff.summary = message;
+    handoff.updatedAt = nowIso();
+    lane.status = "blocked";
+    lane.updatedAt = nowIso();
+    nextRouter.orchestrator = {
+      ...nextRouter.orchestrator,
+      lastLoopAt: nowIso(),
+      lastSummary: `Validation failed for issue #${issue.number}.`
+    };
+    await saveRouterState(session.paths, nextRouter);
+    await appendConversationMessage(session, {
+      role: "chief_of_staff",
+      kind: "status_update",
+      content: `Lane ${lane.name} hit a local validation failure on issue #${issue.number}: ${message}`,
+      summary: `Validation failed for #${issue.number}`,
+      linkedIssueNumber: issue.number,
+      linkedPrNumber: null,
+      linkedPullRequestNumber: null,
+      isOpenQuestion: false
+    });
+    return true;
+  }
+
+  const gitStatus = await runCommandOrThrow("git", ["status", "--short"], {
+    cwd: ensuredWorktree.worktreePath
+  });
+  if (!gitStatus.trim()) {
+    handoff.status = "blocked";
+    handoff.summary = "Lane implementation completed without producing file changes.";
+    handoff.updatedAt = nowIso();
+    lane.status = "blocked";
+    lane.updatedAt = nowIso();
+    nextRouter.orchestrator = {
+      ...nextRouter.orchestrator,
+      lastLoopAt: nowIso(),
+      lastSummary: `Lane ${lane.name} produced no file changes for issue #${issue.number}.`
+    };
+    await saveRouterState(session.paths, nextRouter);
+    await appendConversationMessage(session, {
+      role: "chief_of_staff",
+      kind: "status_update",
+      content: `Lane ${lane.name} completed issue #${issue.number} without producing any file changes.`,
+      summary: `No file changes for #${issue.number}`,
+      linkedIssueNumber: issue.number,
+      linkedPrNumber: null,
+      linkedPullRequestNumber: null,
+      isOpenQuestion: false
+    });
+    return true;
+  }
+
+  await runCommandOrThrow("git", ["add", "-A"], { cwd: ensuredWorktree.worktreePath });
+  await runCommandOrThrow(
+    "git",
+    [
+      "commit",
+      "-m",
+      `${handoff.prNumber ? "Refine" : "Implement"} #${issue.number}: ${summarizeText(issue.title, 60)}`
+    ],
+    { cwd: ensuredWorktree.worktreePath }
+  );
+  await runCommandOrThrow("git", ["push", "-u", "origin", ensuredWorktree.branchName], {
+    cwd: ensuredWorktree.worktreePath
+  });
+
+  let prNumber = handoff.prNumber;
+  let prUrl: string | null = null;
+  if (!prNumber) {
+    const createdPullRequest = await createPullRequest(ensuredWorktree.worktreePath, {
+      baseBranch: session.project.defaultBranch,
+      headBranch: ensuredWorktree.branchName,
+      title: issue.title,
+      body: [`Fixes #${issue.number}`, "", turn.result.summary].join("\n")
+    });
+    prNumber = createdPullRequest.number;
+    prUrl = createdPullRequest.url;
+  }
+
+  const livePullRequest = await viewPullRequest(
+    ensuredWorktree.worktreePath,
+    assertPresent(prNumber, "PR number missing after lane implementation.")
+  );
   handoff.status = "completed";
+  handoff.prNumber = livePullRequest.number;
+  handoff.reviewWindowEndsAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
   handoff.summary = relay;
   handoff.updatedAt = nowIso();
-  lane.status = handoff.kind === "plan" ? "planning" : "implementing";
+  lane.status = "waiting_review";
   lane.currentIssueNumber = issue.number;
+  lane.activePullRequestNumber = livePullRequest.number;
   lane.updatedAt = nowIso();
   nextRouter.orchestrator = {
     ...nextRouter.orchestrator,
     lastLoopAt: nowIso(),
-    lastSummary: `Lane ${lane.name} updated issue #${issue.number}.`
+    lastSummary: `Lane ${lane.name} opened PR #${livePullRequest.number} for issue #${issue.number}.`
   };
 
   await saveRouterState(session.paths, nextRouter);
+  await syncProjectInternal(session);
+
+  const refreshedRouter = await loadRouterState(session.paths, session.project.slug);
+  await saveRouterState(session.paths, {
+    ...refreshedRouter,
+    orchestrator: {
+      ...refreshedRouter.orchestrator,
+      lastSummary: `Lane ${lane.name} opened PR #${livePullRequest.number} for issue #${issue.number}.`
+    }
+  });
   await appendConversationMessage(session, {
     role: "chief_of_staff",
     kind: "status_update",
-    content: `Lane ${lane.name} took ownership of issue #${issue.number}. ${relay}`,
-    summary: `Lane ${lane.name} updated #${issue.number}`,
+    content: [
+      `Lane ${lane.name} finished implementation for issue #${issue.number}.`,
+      relay,
+      `I opened PR #${livePullRequest.number}${prUrl ? ` (${prUrl})` : ""}.`
+    ]
+      .filter(Boolean)
+      .join(" "),
+    summary: `Opened PR #${livePullRequest.number} for #${issue.number}`,
     linkedIssueNumber: issue.number,
-    linkedPrNumber: null,
-    linkedPullRequestNumber: null,
+    linkedPrNumber: livePullRequest.number,
+    linkedPullRequestNumber: livePullRequest.number,
     isOpenQuestion: false
   });
   return true;
@@ -2122,15 +2711,6 @@ export async function getDirectorStatus(): Promise<DirectorStatusResponse> {
   });
 }
 
-export async function listDecisions(): Promise<DecisionsResponse> {
-  return withProject(async (session) => {
-    const router = await loadRouterState(session.paths, session.project.slug);
-    return {
-      decisions: router.openQuestion ? [toHumanQuestionRecord(router.openQuestion)] : []
-    };
-  });
-}
-
 export async function getConversation(): Promise<ConversationResponse> {
   return withProject(async (session) => getConversationResponse(session));
 }
@@ -2168,7 +2748,7 @@ export async function sendConversationMessage(content: string): Promise<Conversa
             title: "Chief of Staff question",
             summary: reply.reply,
             question: reply.question ?? "I need a little more direction before I continue.",
-            whyItMatters: reply.reply,
+            whyItMatters: reply.rationale ?? reply.reply,
             recommendation:
               reply.recommendation ?? "Reply here with the direction you want me to take.",
             issueNumber: null,
@@ -2189,7 +2769,7 @@ export async function sendConversationMessage(content: string): Promise<Conversa
           kind: "cos_question",
           content: formatHumanQuestionContent(
             reply.question ?? "I need a little more direction before I continue.",
-            reply.reply,
+            reply.rationale ?? reply.reply,
             reply.recommendation ?? "Reply here with the direction you want me to take."
           ),
           summary: summarizeText(reply.question ?? reply.reply),
@@ -2218,59 +2798,6 @@ export async function sendConversationMessage(content: string): Promise<Conversa
     }
 
     return getConversationResponse(session);
-  });
-}
-
-export async function submitDirectorNote(content: string): Promise<DirectorNoteRecord> {
-  const trimmed = content.trim();
-  if (!trimmed) {
-    throw new Error("Director note cannot be empty.");
-  }
-
-  return withProject(async (session) => {
-    const note = await addDirectorNote(session, trimmed);
-    await appendConversationMessage(session, {
-      role: "director",
-      kind: "human_message",
-      content: trimmed,
-      summary: summarizeText(trimmed),
-      linkedIssueNumber: null,
-      linkedPrNumber: null,
-      linkedPullRequestNumber: null,
-      isOpenQuestion: false
-    });
-
-    const router = await loadRouterState(session.paths, session.project.slug);
-    if (router.orchestrator.status === "running" && !orchestratorRunning) {
-      scheduleOrchestratorLoop(0);
-    }
-
-    return note;
-  });
-}
-
-export async function resolveDecision(
-  decisionId: string,
-  resolution: string
-): Promise<HumanQuestionRecord> {
-  const trimmed = resolution.trim();
-  if (!trimmed) {
-    throw new Error("Resolution cannot be empty.");
-  }
-
-  return withProject(async (session) => {
-    const router = await loadRouterState(session.paths, session.project.slug);
-    if (!router.openQuestion || router.openQuestion.id !== decisionId) {
-      throw new Error(`Decision ${decisionId} was not found.`);
-    }
-
-    const resolved = await resolveOpenQuestion(session, router, trimmed);
-    const refreshedRouter = await loadRouterState(session.paths, session.project.slug);
-    if (refreshedRouter.orchestrator.status === "running" && !orchestratorRunning) {
-      scheduleOrchestratorLoop(0);
-    }
-
-    return resolved;
   });
 }
 

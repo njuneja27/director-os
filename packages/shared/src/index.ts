@@ -79,6 +79,7 @@ export const LANE_STATUSES = [
 ] as const;
 export const ISSUE_ROUTING_STATUSES = [
   "unassigned",
+  "owned",
   "planned",
   "implementing",
   "waiting_review",
@@ -293,6 +294,8 @@ export interface IssueOwnershipRecord {
   url: string;
   state: string;
   workflowState: string;
+  ownerKind: "chief_of_staff" | "lane" | null;
+  ownerName: string | null;
   laneId: string | null;
   laneName: string | null;
   executionIntent: "plan" | "implement" | null;
@@ -392,10 +395,6 @@ export interface ConversationResponse {
   openQuestionRun?: RunRecord | null;
 }
 
-export interface DecisionsResponse {
-  decisions: HumanQuestionRecord[];
-}
-
 export interface DirectorOperationResponse {
   ok: boolean;
   message?: string;
@@ -413,8 +412,6 @@ export interface DirectorClient {
   start(): Promise<DirectorOperationResponse>;
   pause(reason?: string): Promise<DirectorOperationResponse>;
   sync(): Promise<DirectorOperationResponse>;
-  listDecisions(): Promise<DecisionsResponse>;
-  resolveDecision(decisionId: string, resolution: string): Promise<HumanQuestionRecord>;
 }
 
 export interface DirectorDesktopBridge {
@@ -433,8 +430,6 @@ export interface DirectorDesktopBridge {
     start(): Promise<DirectorOperationResponse>;
     pause(reason?: string): Promise<DirectorOperationResponse>;
     sync(): Promise<DirectorOperationResponse>;
-    listDecisions(): Promise<DecisionsResponse>;
-    resolveDecision(decisionId: string, resolution: string): Promise<HumanQuestionRecord>;
   };
 }
 

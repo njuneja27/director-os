@@ -4,7 +4,6 @@ import path from "node:path";
 import type {
   ConversationMessageRecord,
   ConversationThreadRecord,
-  DirectorNoteRecord,
   OrchestratorStatus,
   RunRecord
 } from "@director-os/shared";
@@ -76,7 +75,6 @@ export interface RouterState {
   pendingHandoffs: RouterHandoffState[];
   openQuestion: RouterQuestionState | null;
   recentRuns: RunRecord[];
-  notes: DirectorNoteRecord[];
   lastSyncAt: string | null;
   updatedAt: string;
 }
@@ -164,7 +162,6 @@ export function createDefaultRouterState(projectSlug: string): RouterState {
     pendingHandoffs: [],
     openQuestion: null,
     recentRuns: [],
-    notes: [],
     lastSyncAt: null,
     updatedAt: timestamp
   };
@@ -256,8 +253,7 @@ export async function loadRouterState(paths: RuntimePaths, projectSlug: string):
           details: handoff.details ?? null
         }))
       : [],
-    recentRuns: Array.isArray(state.recentRuns) ? state.recentRuns : [],
-    notes: Array.isArray(state.notes) ? state.notes : []
+    recentRuns: Array.isArray(state.recentRuns) ? state.recentRuns : []
   };
 }
 
@@ -269,7 +265,6 @@ export async function saveRouterState(
   const nextState: RouterState = {
     ...state,
     recentRuns: state.recentRuns.slice(-20),
-    notes: state.notes.slice(-20),
     updatedAt: nowIso()
   };
   await writeJsonFile(routerStatePath(paths, state.projectSlug), nextState);

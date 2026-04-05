@@ -7,9 +7,7 @@ import {
   getConversation,
   getDirectorStatus,
   initDirector,
-  listDecisions,
   pauseOrchestrator,
-  resolveDecision,
   startOrchestrator,
   sendConversationMessage,
   syncProject
@@ -110,7 +108,8 @@ program
   });
 
 program
-  .command("conversation")
+  .command("chat")
+  .alias("conversation")
   .description("Print the current Chief of Staff conversation thread")
   .action(async () => {
     console.log(JSON.stringify(await getConversation(), null, 2));
@@ -122,32 +121,6 @@ program
   .argument("<content...>", "The message to send")
   .action(async (contentParts) => {
     const result = await sendConversationMessage(contentParts.join(" "));
-    console.log(JSON.stringify(result, null, 2));
-  });
-
-program
-  .command("submit-note")
-  .description("[debug] Alias for `message`")
-  .argument("<content...>", "The note or product direction")
-  .action(async (contentParts: string[]) => {
-    const result = await sendConversationMessage(contentParts.join(" "));
-    console.log(JSON.stringify(result, null, 2));
-  });
-
-program
-  .command("list-decisions")
-  .description("[debug] View open escalation decisions")
-  .action(async () => {
-    console.log(JSON.stringify(await listDecisions(), null, 2));
-  });
-
-program
-  .command("resolve-decision")
-  .description("[debug] Resolve an escalation decision and resume work")
-  .argument("<decisionId>", "Local decision id")
-  .argument("<resolution...>", "Resolution text")
-  .action(async (decisionId: string, resolutionParts: string[]) => {
-    const result = await resolveDecision(String(decisionId), resolutionParts.join(" "));
     console.log(JSON.stringify(result, null, 2));
   });
 
