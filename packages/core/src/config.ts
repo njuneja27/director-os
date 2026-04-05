@@ -9,6 +9,7 @@ export interface StoredProjectConfig {
   repoPath: string;
   repoSlug: string;
   defaultBranch: string;
+  defaultBranchStrategy: "repo_default" | "custom" | null;
   worktreeRoot: string;
   agentRunner: string;
   createdAt: string;
@@ -95,6 +96,12 @@ function normalizeStoredProject(
     repoPath: project.repoPath ?? "",
     repoSlug: project.repoSlug ?? "",
     defaultBranch: project.defaultBranch ?? "main",
+    defaultBranchStrategy:
+      project.defaultBranchStrategy === "custom"
+        ? "custom"
+        : project.defaultBranchStrategy === "repo_default"
+          ? "repo_default"
+          : null,
     worktreeRoot: project.worktreeRoot ?? path.join(paths.worktreesDir, slug),
     agentRunner: project.agentRunner ?? "codex",
     createdAt: project.createdAt ?? updatedAt,

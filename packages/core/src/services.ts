@@ -346,7 +346,10 @@ function projectToSetupDraft(project: ProjectRecord): SetupRepositoryDraft {
 
 function draftToStoredProjectConfig(
   config: DirectorConfigFile,
-  draft: SetupRepositoryDraft
+  draft: SetupRepositoryDraft,
+  options?: {
+    defaultBranchStrategy?: StoredProjectConfig["defaultBranchStrategy"];
+  }
 ): StoredProjectConfig {
   const slug = slugify(draft.projectName);
   const existing = config.projects.find((candidate) => candidate.slug === slug);
@@ -361,12 +364,152 @@ function draftToStoredProjectConfig(
     repoPath: draft.repoPath,
     repoSlug: draft.repoSlug,
     defaultBranch: draft.defaultBranch,
+    defaultBranchStrategy: options?.defaultBranchStrategy ?? existing?.defaultBranchStrategy ?? null,
     worktreeRoot: draft.worktreeRoot,
     agentRunner: draft.agentRunner,
     createdAt: existing?.createdAt ?? timestamp,
     model: draft.model,
     updatedAt: timestamp
   };
+}
+
+type ProjectRepositoryResolution = {
+  repoSlug?: string | null;
+  repoDefaultBranch?: string | null;
+  currentBranch?: string | null;
+};
+
+export function reconcileProjectConfigWithRepository(
+  projectConfig: StoredProjectConfig,
+  resolution: ProjectRepositoryResolution
+): {
+  nextProjectConfig: StoredProjectConfig;
+  changes: string[];
+} {
+  const nextRepoSlug = resolution.repoSlug?.trim() || projectConfig.repoSlug;
+  const repoDefaultBranch = resolution.repoDefaultBranch?.trim() || null;
+  const currentBranch = resolution.currentBranch?.trim() || null;
+  const nextDefaultBranchStrategy =
+    projectConfig.defaultBranchStrategy ??
+    (repoDefaultBranch &&
+    projectConfig.defaultBranch.trim() &&
+    projectConfig.defaultBranch !== repoDefaultBranch &&
+    currentBranch === projectConfig.defaultBranch
+      ? "custom"
+      : "repo_default");
+
+  let nextDefaultBranch = projectConfig.defaultBranch;
+  if (!projectConfig.defaultBranch.trim() && repoDefaultBranch) {
+    nextDefaultBranch = repoDefaultBranch;
+  } else if (repoDefaultBranch && nextDefaultBranchStrategy === "repo_default") {
+    nextDefaultBranch = repoDefaultBranch;
+  }
+
+  const changes: string[] = [];
+  if (nextRepoSlug !== projectConfig.repoSlug) {
+    changes.push(`Updated repo slug from ${projectConfig.repoSlug} to ${nextRepoSlug}.`);
+  }
+  if (nextDefaultBranch !== projectConfig.defaultBranch) {
+    changes.push(`Updated base branch from ${projectConfig.defaultBranch} to ${nextDefaultBranch}.`);
+  }
+
+  if (
+    !changes.length &&
+    nextDefaultBranchStrategy === projectConfig.defaultBranchStrategy
+  ) {
+    return {
+      nextProjectConfig: projectConfig,
+      changes
+    };
+  }
+
+  return {
+    nextProjectConfig: {
+      ...projectConfig,
+      repoSlug: nextRepoSlug,
+      defaultBranch: nextDefaultBranch,
+      defaultBranchStrategy: nextDefaultBranchStrategy,
+      updatedAt: nowIso()
+    },
+    changes
+  };
+}
+
+async function getCurrentGitBranch(repoPath: string): Promise<string | null> {
+  try {
+    const branch = await runCommandOrThrow("git", ["rev-parse", "--abbrev-ref", "HEAD"], {
+      cwd: repoPath
+    });
+    const trimmed = branch.trim();
+    return trimmed && trimmed !== "HEAD" ? trimmed : null;
+  } catch {
+    return null;
+  }
+}
+
+async function resolveProjectRepositoryMetadata(
+  projectConfig: StoredProjectConfig
+): Promise<ProjectRepositoryResolution> {
+  const currentBranch = await getCurrentGitBranch(projectConfig.repoPath);
+  let detected:
+    | Awaited<ReturnType<typeof detectRepoFromPath>>
+    | Awaited<ReturnType<typeof fetchRepoDetails>>
+    | null = null;
+  let probed: Awaited<ReturnType<typeof probeRepositoryPath>> | null = null;
+
+  try {
+    detected = await detectRepoFromPath(projectConfig.repoPath);
+  } catch {
+    try {
+      probed = await probeRepositoryPath(projectConfig.repoPath);
+    } catch {
+      probed = null;
+    }
+
+    const fallbackRepoSlug = projectConfig.repoSlug.trim() || probed?.repoSlug || "";
+    if (fallbackRepoSlug) {
+      try {
+        detected = await fetchRepoDetails(fallbackRepoSlug);
+      } catch {
+        detected = null;
+      }
+    }
+  }
+
+  if (!probed && (!detected?.repoSlug || !detected?.defaultBranch)) {
+    try {
+      probed = await probeRepositoryPath(projectConfig.repoPath);
+    } catch {
+      probed = null;
+    }
+  }
+
+  return {
+    repoSlug: detected?.repoSlug || probed?.repoSlug || projectConfig.repoSlug,
+    repoDefaultBranch: detected?.defaultBranch || probed?.defaultBranch || null,
+    currentBranch
+  };
+}
+
+async function refreshProjectMetadata(session: ProjectSession): Promise<string[]> {
+  const resolution = await resolveProjectRepositoryMetadata(session.projectConfig);
+  const { nextProjectConfig, changes } = reconcileProjectConfigWithRepository(
+    session.projectConfig,
+    resolution
+  );
+
+  if (nextProjectConfig === session.projectConfig) {
+    return changes;
+  }
+
+  const nextConfig = upsertProjectConfig(session.config, nextProjectConfig);
+  nextConfig.activeProjectSlug = session.config.activeProjectSlug;
+  await saveConfig(nextConfig, session.paths);
+  session.config = nextConfig;
+  session.projectConfig = nextProjectConfig;
+  session.project = projectFromConfig(nextProjectConfig);
+
+  return changes;
 }
 
 async function withRuntime<TValue>(
@@ -566,14 +709,32 @@ async function buildRepositoryDraft(
   try {
     const resolvedRepo = resolveRepoPath(rawPath);
     const probed = await probeRepositoryPath(resolvedRepo);
-    const projectName = input.projectName?.trim() || probed.name || path.basename(resolvedRepo);
+    let detected:
+      | Awaited<ReturnType<typeof detectRepoFromPath>>
+      | Awaited<ReturnType<typeof fetchRepoDetails>>
+      | null = null;
+
+    try {
+      detected = await detectRepoFromPath(resolvedRepo);
+    } catch {
+      if (probed.repoSlug) {
+        try {
+          detected = await fetchRepoDetails(probed.repoSlug);
+        } catch {
+          detected = null;
+        }
+      }
+    }
+
+    const projectName =
+      input.projectName?.trim() || detected?.name || probed.name || path.basename(resolvedRepo);
 
     return {
       draft: {
         repoPath: resolvedRepo,
         projectName,
-        repoSlug: probed.repoSlug,
-        defaultBranch: probed.defaultBranch || "main",
+        repoSlug: detected?.repoSlug || probed.repoSlug,
+        defaultBranch: detected?.defaultBranch || probed.defaultBranch || "main",
         worktreeRoot:
           input.worktreeRoot?.trim() || path.join(paths.worktreesDir, slugify(projectName)),
         agentRunner: "codex",
@@ -706,9 +867,12 @@ async function evaluateSetupState(
 
 async function persistProjectRegistration(
   session: RuntimeSession,
-  repositoryDraft: SetupRepositoryDraft
+  repositoryDraft: SetupRepositoryDraft,
+  options?: {
+    defaultBranchStrategy?: StoredProjectConfig["defaultBranchStrategy"];
+  }
 ): Promise<ProjectRecord> {
-  const storedProject = draftToStoredProjectConfig(session.config, repositoryDraft);
+  const storedProject = draftToStoredProjectConfig(session.config, repositoryDraft, options);
   const nextConfig = upsertProjectConfig(session.config, storedProject);
   nextConfig.activeProjectSlug = storedProject.slug;
   await saveConfig(nextConfig, session.paths);
@@ -1629,6 +1793,7 @@ async function createIssuesFromPlan(
 }
 
 async function syncProjectInternal(session: ProjectSession): Promise<DirectorOperationResponse> {
+  const metadataChanges = await refreshProjectMetadata(session);
   const [issues, pullRequests, comments] = await Promise.all([
     listIssues(session.project.repoSlug),
     listPullRequests(session.project.repoSlug),
@@ -1636,6 +1801,10 @@ async function syncProjectInternal(session: ProjectSession): Promise<DirectorOpe
   ]);
 
   const syncedAt = nowIso();
+  const summary = [
+    `Synced ${issues.length} issues and ${pullRequests.length} pull requests.`,
+    ...metadataChanges
+  ].join(" ");
   const cache: GitHubCacheState = {
     version: 1,
     syncedAt,
@@ -1651,7 +1820,7 @@ async function syncProjectInternal(session: ProjectSession): Promise<DirectorOpe
     lastSyncAt: syncedAt,
     orchestrator: {
       ...router.orchestrator,
-      lastSummary: `Synced ${issues.length} issues and ${pullRequests.length} pull requests.`,
+      lastSummary: summary,
       lastLoopAt: syncedAt
     }
   };
@@ -1659,10 +1828,11 @@ async function syncProjectInternal(session: ProjectSession): Promise<DirectorOpe
 
   return {
     ok: true,
-    message: `Synced ${issues.length} issues and ${pullRequests.length} pull requests.`,
+    message: summary,
     syncedAt,
     issueCount: issues.length,
-    pullRequestCount: pullRequests.length
+    pullRequestCount: pullRequests.length,
+    project: session.project
   };
 }
 
@@ -2640,6 +2810,7 @@ async function dispatchPendingHandoff(session: ProjectSession): Promise<boolean>
   let prNumber = handoff.prNumber;
   let prUrl: string | null = null;
   if (!prNumber) {
+    await refreshProjectMetadata(session);
     const createdPullRequest = await createPullRequest(ensuredWorktree.worktreePath, {
       baseBranch: session.project.defaultBranch,
       headBranch: ensuredWorktree.branchName,
@@ -2849,7 +3020,9 @@ export async function completeSetup(
       throw new Error(blocking || "Setup is not ready to complete yet.");
     }
 
-    const storedProject = await persistProjectRegistration(session, resolvedDraft);
+    const storedProject = await persistProjectRegistration(session, resolvedDraft, {
+      defaultBranchStrategy: "repo_default"
+    });
     return evaluateSetupState(session, {
       activeProject: storedProject,
       repositoryDraft: projectToSetupDraft(storedProject),
@@ -2932,7 +3105,17 @@ export async function initDirector(options: InitCommandOptions = {}) {
       throw new Error(blocking || "Director OS could not be initialized.");
     }
 
-    const project = await persistProjectRegistration(session, finalDraft);
+    const explicitDefaultBranch = options.defaultBranch?.trim() || null;
+    const authoritativeDefaultBranch =
+      detected?.defaultBranch || discoveredDraft?.defaultBranch || finalDraft.defaultBranch;
+    const defaultBranchStrategy =
+      explicitDefaultBranch && explicitDefaultBranch !== authoritativeDefaultBranch
+        ? "custom"
+        : "repo_default";
+
+    const project = await persistProjectRegistration(session, finalDraft, {
+      defaultBranchStrategy
+    });
     return {
       ok: true,
       paths,
