@@ -2109,15 +2109,6 @@ export async function getDirectorStatus(): Promise<DirectorStatusResponse> {
       .filter((pullRequest) => pullRequest.state.toLowerCase() === "open")
       .sort((left, right) => left.number - right.number);
 
-    const workItems = issues
-      .filter((issue) => issue.state.toLowerCase() === "open")
-      .map((issue) => {
-        const linkedPullRequest =
-          pullRequests.find((pullRequest) => pullRequest.linkedIssueNumbers.includes(issue.number)) ??
-          null;
-        return synthesizeWorkItem(session.project, issue, linkedPullRequest, router);
-      });
-
     return {
       project: session.project,
       orchestrator: synthesizeOrchestratorStatus(session.project, router, owner),
@@ -2126,20 +2117,7 @@ export async function getDirectorStatus(): Promise<DirectorStatusResponse> {
       issues: issues.map((issue) => synthesizeIssueOwnership(issue, router, pullRequests)),
       openQuestion: router.openQuestion ? toHumanQuestionRecord(router.openQuestion) : null,
       recentActivity: synthesizeActivity(router),
-      openPullRequests,
-      queue: workItems
-        .filter((workItem) => ["queued", "ready", "planning"].includes(workItem.status))
-        .sort((left, right) => left.priorityBucket - right.priorityBucket || left.issueNumber - right.issueNumber),
-      activeWork: workItems
-        .filter((workItem) => ["running", "waiting_review", "waiting_decision"].includes(workItem.status))
-        .sort((left, right) => left.issueNumber - right.issueNumber),
-      decisions: router.openQuestion ? [toHumanQuestionRecord(router.openQuestion)] : [],
-      prCycles: openPullRequests.map((pullRequest) => synthesizePrCycle(session.project, pullRequest)),
-      recentRuns: router.recentRuns.slice(-12),
-      notes: router.notes
-        .slice()
-        .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
-        .slice(0, 10)
+      openPullRequests
     };
   });
 }
