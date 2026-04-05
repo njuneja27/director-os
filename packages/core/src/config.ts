@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 
 export interface StoredProjectConfig {
+  id: number;
   name: string;
   slug: string;
   repoPath: string;
@@ -10,6 +11,7 @@ export interface StoredProjectConfig {
   defaultBranch: string;
   worktreeRoot: string;
   agentRunner: string;
+  createdAt: string;
   model: string;
   updatedAt: string;
 }
@@ -24,10 +26,11 @@ export interface DirectorConfigFile {
 export interface RuntimePaths {
   homeDir: string;
   configPath: string;
-  databasePath: string;
+  runtimeDir: string;
   logsDir: string;
   worktreesDir: string;
   tmpDir: string;
+  orchestratorLockPath: string;
 }
 
 export function nowIso(): string {
@@ -35,28 +38,32 @@ export function nowIso(): string {
 }
 
 export function slugify(value: string): string {
-  return value
-    .toLowerCase()
-    .trim()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "")
-    .slice(0, 64) || "project";
+  return (
+    value
+      .toLowerCase()
+      .trim()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "")
+      .slice(0, 64) || "project"
+  );
 }
 
 export function resolveRuntimePaths(homeDir = path.join(os.homedir(), ".director-os")): RuntimePaths {
   return {
     homeDir,
     configPath: path.join(homeDir, "config.json"),
-    databasePath: path.join(homeDir, "director.sqlite"),
+    runtimeDir: path.join(homeDir, "runtime"),
     logsDir: path.join(homeDir, "logs"),
     worktreesDir: path.join(homeDir, "worktrees"),
-    tmpDir: path.join(homeDir, "tmp")
+    tmpDir: path.join(homeDir, "tmp"),
+    orchestratorLockPath: path.join(homeDir, "orchestrator.lock.json")
   };
 }
 
 export async function ensureRuntimeDirectories(paths = resolveRuntimePaths()): Promise<RuntimePaths> {
   await fs.mkdir(paths.homeDir, { recursive: true });
   await Promise.all([
+    fs.mkdir(paths.runtimeDir, { recursive: true }),
     fs.mkdir(paths.logsDir, { recursive: true }),
     fs.mkdir(paths.worktreesDir, { recursive: true }),
     fs.mkdir(paths.tmpDir, { recursive: true })
@@ -73,6 +80,29 @@ function defaultConfig(): DirectorConfigFile {
   };
 }
 
+function normalizeStoredProject(
+  project: Partial<StoredProjectConfig>,
+  index: number,
+  paths: RuntimePaths
+): StoredProjectConfig {
+  const updatedAt = project.updatedAt ?? nowIso();
+  const slug = project.slug ?? "project";
+
+  return {
+    id: project.id ?? index + 1,
+    name: project.name ?? "Project",
+    slug,
+    repoPath: project.repoPath ?? "",
+    repoSlug: project.repoSlug ?? "",
+    defaultBranch: project.defaultBranch ?? "main",
+    worktreeRoot: project.worktreeRoot ?? path.join(paths.worktreesDir, slug),
+    agentRunner: project.agentRunner ?? "codex",
+    createdAt: project.createdAt ?? updatedAt,
+    model: project.model ?? "gpt-5.4",
+    updatedAt
+  };
+}
+
 export async function loadConfig(paths = resolveRuntimePaths()): Promise<DirectorConfigFile> {
   await ensureRuntimeDirectories(paths);
 
@@ -83,7 +113,11 @@ export async function loadConfig(paths = resolveRuntimePaths()): Promise<Directo
     return {
       version: parsed.version ?? 1,
       activeProjectSlug: parsed.activeProjectSlug ?? null,
-      projects: Array.isArray(parsed.projects) ? parsed.projects : [],
+      projects: Array.isArray(parsed.projects)
+        ? parsed.projects.map((project, index) =>
+            normalizeStoredProject(project as Partial<StoredProjectConfig>, index, paths)
+          )
+        : [],
       updatedAt: parsed.updatedAt ?? nowIso()
     };
   } catch (error) {
@@ -101,6 +135,7 @@ export async function saveConfig(config: DirectorConfigFile, paths = resolveRunt
   await ensureRuntimeDirectories(paths);
   const nextConfig: DirectorConfigFile = {
     ...config,
+    projects: config.projects.map((project, index) => normalizeStoredProject(project, index, paths)),
     updatedAt: nowIso()
   };
   await fs.writeFile(paths.configPath, `${JSON.stringify(nextConfig, null, 2)}\n`, "utf8");

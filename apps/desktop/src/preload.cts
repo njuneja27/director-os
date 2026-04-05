@@ -37,9 +37,8 @@ const api: DirectorDesktopBridge = {
     start: () => invoke(IPC_CHANNELS.director.start),
     pause: (reason?: string) => invoke(IPC_CHANNELS.director.pause, reason),
     sync: () => invoke(IPC_CHANNELS.director.sync),
-    submitNote: (content: string) => invoke(IPC_CHANNELS.director.submitNote, content),
     listDecisions: () => invoke(IPC_CHANNELS.director.listDecisions),
-    resolveDecision: (decisionId: number, resolution: string) =>
+    resolveDecision: (decisionId: string, resolution: string) =>
       invoke(IPC_CHANNELS.director.resolveDecision, decisionId, resolution)
   }
 };

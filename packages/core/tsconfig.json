@@ -6,17 +6,16 @@
     "composite": true
   },
   "include": [
-    "src/config.ts",
     "src/agents.ts",
+    "src/config.ts",
     "src/cos.ts",
     "src/commands.ts",
-    "src/db.ts",
     "src/git-worktrees.ts",
     "src/github.ts",
     "src/index.ts",
+    "src/runtime-state.ts",
     "src/server.ts",
-    "src/services.ts",
-    "src/work-items.ts"
+    "src/services.ts"
   ],
   "references": [
     {

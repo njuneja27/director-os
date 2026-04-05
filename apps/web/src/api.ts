@@ -2,13 +2,12 @@ import type {
   ConversationMessageRecord,
   ConversationResponse,
   ConversationThreadRecord,
-  DecisionRecord,
   DecisionsResponse,
   DirectorClient,
   DirectorDesktopBridge,
-  DirectorNoteRecord,
   DirectorOperationResponse,
   DirectorStatusResponse,
+  HumanQuestionRecord,
   PrCycleRecord,
   RunRecord,
   SetupCheck,
@@ -22,10 +21,9 @@ export type {
   ConversationMessageRecord,
   ConversationResponse,
   ConversationThreadRecord,
-  DecisionRecord,
   DecisionsResponse,
-  DirectorNoteRecord,
   DirectorStatusResponse,
+  HumanQuestionRecord,
   PrCycleRecord,
   RunRecord,
   SetupCheck,
@@ -112,14 +110,9 @@ function createHttpDirectorClient(): WebDirectorClient {
       requestJson<DirectorOperationResponse>("/api/sync", {
         method: "POST"
       }),
-    submitNote: (content: string) =>
-      requestJson<DirectorNoteRecord>("/api/notes", {
-        method: "POST",
-        body: JSON.stringify({ content })
-      }),
     listDecisions: () => requestJson<DecisionsResponse>("/api/decisions"),
-    resolveDecision: (decisionId: number, resolution: string) =>
-      requestJson<DecisionRecord>(`/api/decisions/${decisionId}/resolve`, {
+    resolveDecision: (decisionId: string, resolution: string) =>
+      requestJson<HumanQuestionRecord>(`/api/decisions/${decisionId}/resolve`, {
         method: "POST",
         body: JSON.stringify({ resolution })
       })
@@ -139,9 +132,8 @@ function createIpcDirectorClient(bridge: DirectorDesktopBridge): WebDirectorClie
     start: () => bridge.director.start(),
     pause: (reason?: string) => bridge.director.pause(reason),
     sync: () => bridge.director.sync(),
-    submitNote: (content: string) => bridge.director.submitNote(content),
     listDecisions: () => bridge.director.listDecisions(),
-    resolveDecision: (decisionId: number, resolution: string) =>
+    resolveDecision: (decisionId: string, resolution: string) =>
       bridge.director.resolveDecision(decisionId, resolution)
   };
 }
@@ -206,17 +198,13 @@ export async function syncNow(): Promise<DirectorOperationResponse> {
   return getDirectorClient().sync();
 }
 
-export async function submitNote(content: string): Promise<DirectorNoteRecord> {
-  return getDirectorClient().submitNote(content);
-}
-
 export async function fetchDecisions(): Promise<DecisionsResponse> {
   return getDirectorClient().listDecisions();
 }
 
 export async function resolveEscalation(
-  decisionId: number,
+  decisionId: string,
   resolution: string
-): Promise<DecisionRecord> {
+): Promise<HumanQuestionRecord> {
   return getDirectorClient().resolveDecision(decisionId, resolution);
 }

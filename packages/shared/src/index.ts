@@ -47,12 +47,7 @@ export const PR_CYCLE_STATUSES = [
   "merged",
   "blocked"
 ] as const;
-export const SETUP_CHECK_KINDS = [
-  "repository",
-  "github",
-  "codex",
-  "workspace"
-] as const;
+export const SETUP_CHECK_KINDS = ["repository", "github", "codex", "workspace"] as const;
 export const SETUP_CHECK_STATUSES = [
   "ready",
   "needs_action",
@@ -75,6 +70,21 @@ export const SETUP_PROBLEM_CODES = [
   "workspace_unwritable",
   "workspace_probe_failed"
 ] as const;
+export const LANE_STATUSES = [
+  "idle",
+  "planning",
+  "implementing",
+  "waiting_review",
+  "blocked"
+] as const;
+export const ISSUE_ROUTING_STATUSES = [
+  "unassigned",
+  "planned",
+  "implementing",
+  "waiting_review",
+  "blocked",
+  "completed"
+] as const;
 
 export type WorkItemKind = (typeof WORK_ITEM_KINDS)[number];
 export type WorkItemStatus = (typeof WORK_ITEM_STATUSES)[number];
@@ -91,6 +101,8 @@ export type PrCycleStatus = (typeof PR_CYCLE_STATUSES)[number];
 export type SetupCheckKind = (typeof SETUP_CHECK_KINDS)[number];
 export type SetupCheckStatus = (typeof SETUP_CHECK_STATUSES)[number];
 export type SetupProblemCode = (typeof SETUP_PROBLEM_CODES)[number];
+export type LaneStatus = (typeof LANE_STATUSES)[number];
+export type IssueRoutingStatus = (typeof ISSUE_ROUTING_STATUSES)[number];
 
 export const DIRECTOR_LABEL_PREFIX = "director:";
 
@@ -227,6 +239,7 @@ export interface ConversationMessageRecord {
   summary: string | null;
   linkedIssueNumber: number | null;
   linkedPrNumber: number | null;
+  linkedPullRequestNumber: number | null;
   isOpenQuestion: boolean;
   createdAt: string;
   updatedAt: string;
@@ -255,8 +268,64 @@ export interface OrchestratorStatusRecord {
   activeRunIds: number[];
   lastLoopAt: string | null;
   lastSummary: string | null;
+  ownerPid: number | null;
+  ownerToken: string | null;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface LaneRecord {
+  id: string;
+  name: string;
+  sessionId: string | null;
+  status: LaneStatus;
+  currentIssueNumber: number | null;
+  ownedIssueNumbers: number[];
+  activePullRequestNumber: number | null;
+  lastSummary: string | null;
+  lastPlanSummary: string | null;
+  updatedAt: string;
+}
+
+export interface IssueOwnershipRecord {
+  issueNumber: number;
+  title: string;
+  url: string;
+  state: string;
+  workflowState: string;
+  laneId: string | null;
+  laneName: string | null;
+  executionIntent: "plan" | "implement" | null;
+  status: IssueRoutingStatus;
+  linkedPullRequestNumber: number | null;
+  linkedPullRequestUrl: string | null;
+  automationWindowEndsAt: string | null;
+  lastHandledCommentAt: string | null;
+  lastSummary: string | null;
+  updatedAt: string;
+}
+
+export interface HumanQuestionRecord {
+  id: string;
+  title: string;
+  question: string;
+  whyItMatters: string;
+  recommendation: string;
+  linkedIssueNumber: number | null;
+  linkedPullRequestNumber: number | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ActivityRecord {
+  id: string;
+  kind: string;
+  summary: string;
+  laneId: string | null;
+  laneName: string | null;
+  issueNumber: number | null;
+  pullRequestNumber: number | null;
+  createdAt: string;
 }
 
 export interface AgentResultEnvelope {
@@ -265,7 +334,7 @@ export interface AgentResultEnvelope {
   recommended_next_action: string;
   artifact_refs: string[];
   blocking_questions: string[];
-  data?: Record<string, unknown>;
+  data?: Record<string, unknown> | null;
   raw_model_output?: string | null;
 }
 
@@ -307,25 +376,30 @@ export interface SetupStatusResponse {
 export interface DirectorStatusResponse {
   project: ProjectRecord | null;
   orchestrator: OrchestratorStatusRecord | null;
-  queue: WorkItemRecord[];
-  activeWork: WorkItemRecord[];
-  decisions: DecisionRecord[];
-  prCycles: PrCycleRecord[];
-  recentRuns: RunRecord[];
-  notes: DirectorNoteRecord[];
+  lastSuccessfulSyncAt: string | null;
+  lanes: LaneRecord[];
+  issues: IssueOwnershipRecord[];
+  openQuestion: HumanQuestionRecord | null;
+  recentActivity: ActivityRecord[];
   openPullRequests: GitHubPullRequestRecord[];
+  queue?: WorkItemRecord[];
+  activeWork?: WorkItemRecord[];
+  decisions?: HumanQuestionRecord[];
+  prCycles?: PrCycleRecord[];
+  recentRuns?: RunRecord[];
+  notes?: DirectorNoteRecord[];
 }
 
 export interface ConversationResponse {
   thread: ConversationThreadRecord | null;
   messages: ConversationMessageRecord[];
-  openQuestion: ConversationMessageRecord | null;
-  openQuestionRun: RunRecord | null;
+  openQuestion: HumanQuestionRecord | null;
   latestSummary: string | null;
+  openQuestionRun?: RunRecord | null;
 }
 
 export interface DecisionsResponse {
-  decisions: DecisionRecord[];
+  decisions: HumanQuestionRecord[];
 }
 
 export interface DirectorOperationResponse {
@@ -345,9 +419,8 @@ export interface DirectorClient {
   start(): Promise<DirectorOperationResponse>;
   pause(reason?: string): Promise<DirectorOperationResponse>;
   sync(): Promise<DirectorOperationResponse>;
-  submitNote(content: string): Promise<DirectorNoteRecord>;
   listDecisions(): Promise<DecisionsResponse>;
-  resolveDecision(decisionId: number, resolution: string): Promise<DecisionRecord>;
+  resolveDecision(decisionId: string, resolution: string): Promise<HumanQuestionRecord>;
 }
 
 export interface DirectorDesktopBridge {
@@ -366,9 +439,8 @@ export interface DirectorDesktopBridge {
     start(): Promise<DirectorOperationResponse>;
     pause(reason?: string): Promise<DirectorOperationResponse>;
     sync(): Promise<DirectorOperationResponse>;
-    submitNote(content: string): Promise<DirectorNoteRecord>;
     listDecisions(): Promise<DecisionsResponse>;
-    resolveDecision(decisionId: number, resolution: string): Promise<DecisionRecord>;
+    resolveDecision(decisionId: string, resolution: string): Promise<HumanQuestionRecord>;
   };
 }
 

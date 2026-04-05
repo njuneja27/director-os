@@ -14,7 +14,8 @@ export const COS_TASK_APPENDICES = {
   chooseNextIssue: [
     "Task: choose the next GitHub issue to work on.",
     "Prefer the highest-leverage bounded slice that is explicitly ready.",
-    "Return `data.selected_issue_number` and `data.execution_intent` where the intent is `plan` or `implement`."
+    "Return `data.selected_issue_number`, `data.execution_intent`, and optionally `data.lane_id` / `data.lane_name`.",
+    "Use `data.execution_intent` as `plan` or `implement`."
   ].join("\n"),
   mediateBlocker: [
     "Task: mediate a blocked Codex run before any human escalation is created.",

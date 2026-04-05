@@ -1,44 +1,41 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
-import type Database from "better-sqlite3";
-import { desc, eq } from "drizzle-orm";
-
-import {
-  DIRECTOR_LABEL_PREFIX,
-  type AgentResultEnvelope,
-  type ConversationMessageRecord,
-  type ConversationResponse,
-  type ConversationThreadRecord,
-  type DecisionRecord,
-  type DecisionsResponse,
-  type DirectorNoteRecord,
-  type DirectorOperationResponse,
-  type DirectorStatusResponse,
-  type ExecutionMode,
-  type GitHubIssueRecord,
-  type GitHubPullRequestRecord,
-  type InitCommandOptions,
-  type OrchestratorStatus,
-  type OrchestratorStatusRecord,
-  type PrCycleRecord,
-  type ProjectRecord,
-  type RunRecord,
-  type RunRole,
-  type SetupCheck,
-  type SetupCheckKind,
-  type SetupProblemCode,
-  type SetupProbeRepositoryInput,
-  type SetupRepositoryDraft,
-  type SetupStatusResponse,
-  type WorkItemKind,
-  type WorkItemRecord,
-  type WorkItemStatus
+import type {
+  ActivityRecord,
+  ConversationMessageRecord,
+  ConversationResponse,
+  DecisionRecord,
+  DecisionsResponse,
+  DirectorNoteRecord,
+  DirectorOperationResponse,
+  DirectorStatusResponse,
+  ExecutionMode,
+  GitHubIssueRecord,
+  GitHubPullRequestRecord,
+  HumanQuestionRecord,
+  InitCommandOptions,
+  IssueOwnershipRecord,
+  LaneRecord,
+  OrchestratorStatusRecord,
+  PrCycleRecord,
+  ProjectRecord,
+  RunRecord,
+  SetupCheck,
+  SetupCheckKind,
+  SetupProblemCode,
+  SetupProbeRepositoryInput,
+  SetupRepositoryDraft,
+  SetupStatusResponse,
+  WorkItemKind,
+  WorkItemRecord,
+  WorkItemStatus
 } from "@director-os/shared";
 
-import { probeCodexCli, runCodexAgent } from "./agents.js";
+import { probeCodexCli, runCodexSessionAgent } from "./agents.js";
 import {
   ensureRuntimeDirectories,
   getProjectConfig,
@@ -52,76 +49,65 @@ import {
   type StoredProjectConfig,
   upsertProjectConfig
 } from "./config.js";
+import { COS_TASK_APPENDICES, buildChiefOfStaffPrompt } from "./cos.js";
 import {
-  asJson,
-  conversationMessagesTable,
-  conversationThreadsTable,
-  decisionsTable,
-  directorNotesTable,
-  eventsTable,
-  fromJson,
-  githubCommentsTable,
-  githubIssuesTable,
-  githubPullRequestsTable,
-  migrateDatabase,
-  openDatabase,
-  orchestratorStateTable,
-  prCyclesTable,
-  projectsTable,
-  runsTable,
-  type DirectorDatabase,
-  workItemsTable,
-  worktreesTable
-} from "./db.js";
-import {
-  createIssue,
-  createPullRequest,
   detectRepoFromPath,
   ensureGhAuthenticated,
   fetchRepoDetails,
   listComments,
   listIssues,
   listPullRequests,
-  mergePullRequest,
   probeGhCli,
   probeRepositoryPath,
-  pullRequestChecks,
-  pullRequestDiff,
-  resolveRepoPath,
-  viewPullRequest
+  resolveRepoPath
 } from "./github.js";
 import {
-  parseGitWorktreeList,
-  selectReusableGitWorktree
-} from "./git-worktrees.js";
-import {
-  inferWorkItemStatus,
-  selectActiveWorkItems,
-  selectQueuedWorkItems
-} from "./work-items.js";
-import {
-  COS_TASK_APPENDICES,
-  buildChiefOfStaffPrompt
-} from "./cos.js";
+  createDefaultConversationState,
+  initializeProjectRuntime,
+  loadConversationState,
+  loadGitHubCacheState,
+  loadRouterState,
+  saveConversationState,
+  saveGitHubCacheState,
+  saveRouterState,
+  type GitHubCacheState,
+  type RouterHandoffState,
+  type RouterLaneState,
+  type RouterQuestionState,
+  type RouterState
+} from "./runtime-state.js";
 
 const execFileAsync = promisify(execFile);
 
-const AUTOMATION_WAIT_MS = 10 * 60 * 1000;
-const LOOP_INTERVAL_MS = 5 * 1000;
+const LOOP_INTERVAL_MS = 30 * 1000;
+const ORCHESTRATOR_OWNER_TOKEN = `${process.pid}:${randomUUID()}`;
 
 let orchestratorTimer: NodeJS.Timeout | null = null;
 let orchestratorRunning = false;
 
+type OrchestratorLockRecord = {
+  pid: number;
+  token: string;
+  acquiredAt: string;
+};
+
 type RuntimeSession = {
   paths: RuntimePaths;
   config: DirectorConfigFile;
-  sqlite: Database.Database;
-  db: DirectorDatabase;
 };
 
 type ProjectSession = RuntimeSession & {
   project: ProjectRecord;
   projectConfig: StoredProjectConfig;
+};
+
+type CoSChatReply = {
+  kind: "cos_reply" | "cos_question";
+  reply: string;
+  question: string | null;
+  recommendation: string | null;
+  rationale: string | null;
+  run: RunRecord;
 };
 
 function assertPresent<TValue>(value: TValue | null | undefined, message: string): TValue {
@@ -132,285 +118,38 @@ function assertPresent<TValue>(value: TValue | null | undefined, message: string
   return value;
 }
 
-async function runCommand(command: string, args: string[], cwd: string): Promise<string> {
-  const result = await execFileAsync(command, args, {
-    cwd,
-    maxBuffer: 20 * 1024 * 1024
-  });
-
-  return result.stdout.trim();
+function summarizeText(value: string, maxLength = 240): string {
+  const trimmed = value.replace(/\s+/g, " ").trim();
+  return trimmed.length > maxLength ? `${trimmed.slice(0, maxLength - 1)}…` : trimmed;
 }
 
-async function pathExists(targetPath: string): Promise<boolean> {
-  try {
-    await fs.access(targetPath);
-    return true;
-  } catch {
-    return false;
+function parseDataString(value: unknown): string | null {
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function parseDataNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function mapAgentStatusToRunStatus(status: "ok" | "needs_input" | "failed"): RunRecord["status"] {
+  switch (status) {
+    case "ok":
+      return "succeeded";
+    case "needs_input":
+      return "needs_input";
+    case "failed":
+    default:
+      return "failed";
   }
 }
 
-async function listGitWorktrees(repoPath: string) {
-  const porcelain = await runCommand(
-    "git",
-    ["-C", repoPath, "worktree", "list", "--porcelain"],
-    repoPath
-  );
-
-  return parseGitWorktreeList(porcelain);
-}
-
-async function pruneGitWorktrees(repoPath: string): Promise<void> {
-  await runCommand("git", ["-C", repoPath, "worktree", "prune"], repoPath);
-}
-
-async function withRuntime<TValue>(
-  callback: (session: RuntimeSession) => Promise<TValue>
-): Promise<TValue> {
-  const paths = await ensureRuntimeDirectories(resolveRuntimePaths());
-  const config = await loadConfig(paths);
-  const store = await openDatabase(paths);
-  migrateDatabase(store.sqlite);
-
-  try {
-    return await callback({
-      paths: store.paths,
-      config,
-      sqlite: store.sqlite,
-      db: store.db
-    });
-  } finally {
-    store.sqlite.close();
+function truncatePromptSection(value: string | null | undefined, maxLength = 8_000): string | null {
+  const trimmed = value?.trim();
+  if (!trimmed) {
+    return null;
   }
-}
 
-async function withProject<TValue>(
-  callback: (session: ProjectSession) => Promise<TValue>
-): Promise<TValue> {
-  return withRuntime(async (session) => {
-    const slug = session.config.activeProjectSlug;
-    if (!slug) {
-      throw new Error("No active project is configured. Run `director init` first.");
-    }
-
-    const rows = await session.db
-      .select()
-      .from(projectsTable)
-      .where(eq(projectsTable.slug, slug))
-      .limit(1);
-    const row = rows[0];
-
-    if (!row) {
-      throw new Error(`Active project '${slug}' is missing from the local database.`);
-    }
-
-    const projectConfig = getProjectConfig(session.config, slug);
-
-    if (!projectConfig) {
-      throw new Error(`Active project '${slug}' is missing from the runtime config.`);
-    }
-
-    return callback({
-      ...session,
-      project: mapProjectRow(row),
-      projectConfig
-    });
-  });
-}
-
-function mapProjectRow(row: typeof projectsTable.$inferSelect): ProjectRecord {
-  return {
-    id: row.id,
-    name: row.name,
-    slug: row.slug,
-    repoPath: row.repoPath,
-    repoSlug: row.repoSlug,
-    defaultBranch: row.defaultBranch,
-    worktreeRoot: row.worktreeRoot,
-    agentRunner: row.agentRunner,
-    model: row.model,
-    createdAt: row.createdAt,
-    updatedAt: row.updatedAt
-  };
-}
-
-function mapGitHubIssueRow(row: typeof githubIssuesTable.$inferSelect): GitHubIssueRecord {
-  return {
-    id: row.id,
-    projectId: row.projectId,
-    number: row.number,
-    title: row.title,
-    body: row.body,
-    state: row.state,
-    workflowState: row.workflowState,
-    labels: fromJson(row.labels as string[]),
-    url: row.url,
-    updatedAt: row.updatedAt,
-    syncedAt: row.syncedAt
-  };
-}
-
-function mapGitHubPullRequestRow(
-  row: typeof githubPullRequestsTable.$inferSelect
-): GitHubPullRequestRecord {
-  return {
-    id: row.id,
-    projectId: row.projectId,
-    number: row.number,
-    title: row.title,
-    body: row.body,
-    state: row.state,
-    isDraft: row.isDraft,
-    reviewDecision: row.reviewDecision ?? null,
-    checksBucket: row.checksBucket ?? null,
-    headRefName: row.headRefName,
-    baseRefName: row.baseRefName,
-    url: row.url,
-    linkedIssueNumbers: fromJson(row.linkedIssueNumbers as number[]),
-    updatedAt: row.updatedAt,
-    syncedAt: row.syncedAt
-  };
-}
-
-function mapWorkItemRow(row: typeof workItemsTable.$inferSelect): WorkItemRecord {
-  return {
-    id: row.id,
-    projectId: row.projectId,
-    issueNumber: row.issueNumber,
-    parentIssueNumber: row.parentIssueNumber ?? null,
-    title: row.title,
-    summary: row.summary,
-    kind: row.kind as WorkItemKind,
-    executionMode: row.executionMode as ExecutionMode,
-    ownerRole: row.ownerRole,
-    status: row.status as WorkItemStatus,
-    priorityBucket: row.priorityBucket,
-    activeRunId: row.activeRunId ?? null,
-    activePrNumber: row.activePrNumber ?? null,
-    lastSummary: row.lastSummary ?? null,
-    createdAt: row.createdAt,
-    updatedAt: row.updatedAt
-  };
-}
-
-function mapRunRow(row: typeof runsTable.$inferSelect): RunRecord {
-  return {
-    id: row.id,
-    projectId: row.projectId,
-    workItemId: row.workItemId ?? null,
-    issueNumber: row.issueNumber ?? null,
-    prNumber: row.prNumber ?? null,
-    role: row.role as RunRole,
-    status: row.status as RunRecord["status"],
-    phase: row.phase,
-    summary: row.summary,
-    recommendedNextAction: row.recommendedNextAction ?? null,
-    artifacts: fromJson(row.artifacts as string[]),
-    blockingQuestions: fromJson(row.blockingQuestions as string[]),
-    outputJson: row.outputJson ? fromJson(row.outputJson as Record<string, unknown>) : null,
-    rawModelOutput: row.rawModelOutput ?? null,
-    worktreePath: row.worktreePath ?? null,
-    createdAt: row.createdAt,
-    updatedAt: row.updatedAt
-  };
-}
-
-function mapDecisionRow(row: typeof decisionsTable.$inferSelect): DecisionRecord {
-  return {
-    id: row.id,
-    projectId: row.projectId,
-    workItemId: row.workItemId ?? null,
-    issueNumber: row.issueNumber ?? null,
-    prNumber: row.prNumber ?? null,
-    requestedByRunId: row.requestedByRunId ?? null,
-    questionMessageId: row.questionMessageId ?? null,
-    resolutionMessageId: row.resolutionMessageId ?? null,
-    target: row.target as DecisionRecord["target"],
-    title: row.title,
-    summary: row.summary,
-    recommendation: row.recommendation,
-    rationale: row.rationale,
-    status: row.status as DecisionRecord["status"],
-    resolution: row.resolution ?? null,
-    createdAt: row.createdAt,
-    updatedAt: row.updatedAt
-  };
-}
-
-function mapConversationThreadRow(
-  row: typeof conversationThreadsTable.$inferSelect
-): ConversationThreadRecord {
-  return {
-    id: row.id,
-    projectId: row.projectId,
-    title: row.title,
-    status: row.status as ConversationThreadRecord["status"],
-    createdAt: row.createdAt,
-    updatedAt: row.updatedAt
-  };
-}
-
-function mapConversationMessageRow(
-  row: typeof conversationMessagesTable.$inferSelect
-): ConversationMessageRecord {
-  return {
-    id: row.id,
-    threadId: row.threadId,
-    projectId: row.projectId,
-    role: row.role as ConversationMessageRecord["role"],
-    kind: row.kind as ConversationMessageRecord["kind"],
-    content: row.content,
-    summary: row.summary ?? summarizeText(row.content),
-    linkedIssueNumber: row.linkedIssueNumber ?? row.issueNumber ?? null,
-    linkedPrNumber: row.linkedPrNumber ?? row.prNumber ?? null,
-    isOpenQuestion: row.isOpenQuestion ?? false,
-    createdAt: row.createdAt,
-    updatedAt: row.updatedAt
-  };
-}
-
-function mapNoteRow(row: typeof directorNotesTable.$inferSelect): DirectorNoteRecord {
-  return {
-    id: row.id,
-    projectId: row.projectId,
-    content: row.content,
-    status: row.status as DirectorNoteRecord["status"],
-    createdAt: row.createdAt,
-    updatedAt: row.updatedAt
-  };
-}
-
-function mapPrCycleRow(row: typeof prCyclesTable.$inferSelect): PrCycleRecord {
-  return {
-    id: row.id,
-    projectId: row.projectId,
-    issueNumber: row.issueNumber,
-    prNumber: row.prNumber,
-    status: row.status as PrCycleRecord["status"],
-    summary: row.summary,
-    automationWindowEndsAt: row.automationWindowEndsAt ?? null,
-    lastCheckedAt: row.lastCheckedAt ?? null,
-    lastHandledCommentAt: row.lastHandledCommentAt ?? null,
-    mergedAt: row.mergedAt ?? null,
-    createdAt: row.createdAt,
-    updatedAt: row.updatedAt
-  };
-}
-
-function mapOrchestratorRow(
-  row: typeof orchestratorStateTable.$inferSelect
-): OrchestratorStatusRecord {
-  return {
-    id: row.id,
-    projectId: row.projectId,
-    status: row.status as OrchestratorStatus,
-    pauseReason: row.pauseReason ?? null,
-    activeRunIds: fromJson(row.activeRunIds as number[]),
-    lastLoopAt: row.lastLoopAt ?? null,
-    lastSummary: row.lastSummary ?? null,
-    createdAt: row.createdAt,
-    updatedAt: row.updatedAt
-  };
+  return trimmed.length > maxLength ? `${trimmed.slice(0, maxLength - 1)}…` : trimmed;
 }
 
 function setupTitle(kind: SetupCheckKind): string {
@@ -420,9 +159,9 @@ function setupTitle(kind: SetupCheckKind): string {
     case "github":
       return "GitHub CLI";
     case "codex":
-      return "Coding engine";
+      return "Codex CLI";
     case "workspace":
-      return "Workspace test";
+      return "Workspace";
     default:
       return "Setup";
   }
@@ -432,25 +171,41 @@ function makeSetupCheck(
   kind: SetupCheckKind,
   status: SetupCheck["status"],
   detail: string,
-  options: {
+  options?: {
     code?: SetupProblemCode | null;
     recommendedAction?: string | null;
     advancedDetail?: string | null;
-  } = {}
+  }
 ): SetupCheck {
   return {
     kind,
     status,
     title: setupTitle(kind),
     detail,
-    code: options.code ?? null,
-    recommendedAction: options.recommendedAction ?? null,
-    advancedDetail: options.advancedDetail ?? null
+    code: options?.code ?? null,
+    recommendedAction: options?.recommendedAction ?? null,
+    advancedDetail: options?.advancedDetail ?? null
   };
 }
 
 function waitingSetupCheck(kind: SetupCheckKind, detail: string): SetupCheck {
   return makeSetupCheck(kind, "waiting", detail);
+}
+
+function projectFromConfig(projectConfig: StoredProjectConfig): ProjectRecord {
+  return {
+    id: projectConfig.id,
+    name: projectConfig.name,
+    slug: projectConfig.slug,
+    repoPath: projectConfig.repoPath,
+    repoSlug: projectConfig.repoSlug,
+    defaultBranch: projectConfig.defaultBranch,
+    worktreeRoot: projectConfig.worktreeRoot,
+    agentRunner: projectConfig.agentRunner,
+    model: projectConfig.model,
+    createdAt: projectConfig.createdAt,
+    updatedAt: projectConfig.updatedAt
+  };
 }
 
 function projectToSetupDraft(project: ProjectRecord): SetupRepositoryDraft {
@@ -465,61 +220,219 @@ function projectToSetupDraft(project: ProjectRecord): SetupRepositoryDraft {
   };
 }
 
-function draftToStoredProjectConfig(draft: SetupRepositoryDraft): StoredProjectConfig {
+function draftToStoredProjectConfig(
+  config: DirectorConfigFile,
+  draft: SetupRepositoryDraft
+): StoredProjectConfig {
+  const slug = slugify(draft.projectName);
+  const existing = config.projects.find((candidate) => candidate.slug === slug);
+  const timestamp = nowIso();
+
   return {
+    id:
+      existing?.id ??
+      (config.projects.reduce((maxId, candidate) => Math.max(maxId, candidate.id), 0) + 1),
     name: draft.projectName,
-    slug: slugify(draft.projectName),
+    slug,
     repoPath: draft.repoPath,
     repoSlug: draft.repoSlug,
     defaultBranch: draft.defaultBranch,
     worktreeRoot: draft.worktreeRoot,
     agentRunner: draft.agentRunner,
+    createdAt: existing?.createdAt ?? timestamp,
     model: draft.model,
-    updatedAt: nowIso()
+    updatedAt: timestamp
   };
 }
 
-async function getActiveProjectFromRuntime(session: RuntimeSession): Promise<ProjectRecord | null> {
-  const slug = session.config.activeProjectSlug;
+async function withRuntime<TValue>(
+  callback: (session: RuntimeSession) => Promise<TValue>
+): Promise<TValue> {
+  const paths = await ensureRuntimeDirectories(resolveRuntimePaths());
+  const config = await loadConfig(paths);
+  return callback({
+    paths,
+    config
+  });
+}
 
-  if (!slug) {
-    return null;
+async function withProject<TValue>(
+  callback: (session: ProjectSession) => Promise<TValue>
+): Promise<TValue> {
+  return withRuntime(async (session) => {
+    const slug = session.config.activeProjectSlug;
+    if (!slug) {
+      throw new Error("No active project is configured. Run `director init` first.");
+    }
+
+    const projectConfig = getProjectConfig(session.config, slug);
+    if (!projectConfig) {
+      throw new Error(`The active project '${slug}' is missing from config.json.`);
+    }
+
+    await initializeProjectRuntime(session.paths, projectConfig);
+
+    return callback({
+      ...session,
+      project: projectFromConfig(projectConfig),
+      projectConfig
+    });
+  });
+}
+
+async function runCommand(command: string, args: string[], cwd: string): Promise<string> {
+  const result = await execFileAsync(command, args, {
+    cwd,
+    maxBuffer: 20 * 1024 * 1024
+  });
+
+  return result.stdout.trim();
+}
+
+function isProcessAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) {
+    return false;
   }
 
-  const rows = await session.db
-    .select()
-    .from(projectsTable)
-    .where(eq(projectsTable.slug, slug))
-    .limit(1);
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
-  return rows[0] ? mapProjectRow(rows[0]) : null;
+async function readOrchestratorLock(paths: RuntimePaths): Promise<OrchestratorLockRecord | null> {
+  try {
+    const raw = await fs.readFile(paths.orchestratorLockPath, "utf8");
+    const parsed = JSON.parse(raw) as Partial<OrchestratorLockRecord>;
+    if (
+      typeof parsed.pid === "number" &&
+      typeof parsed.token === "string" &&
+      typeof parsed.acquiredAt === "string"
+    ) {
+      return {
+        pid: parsed.pid,
+        token: parsed.token,
+        acquiredAt: parsed.acquiredAt
+      };
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return null;
+    }
+  }
+
+  return null;
+}
+
+async function writeOrchestratorLock(paths: RuntimePaths): Promise<void> {
+  await fs.writeFile(
+    paths.orchestratorLockPath,
+    `${JSON.stringify(
+      {
+        pid: process.pid,
+        token: ORCHESTRATOR_OWNER_TOKEN,
+        acquiredAt: nowIso()
+      } satisfies OrchestratorLockRecord,
+      null,
+      2
+    )}\n`,
+    {
+      encoding: "utf8",
+      flag: "wx"
+    }
+  );
+}
+
+async function acquireOrchestratorLock(
+  paths: RuntimePaths
+): Promise<"owned" | "acquired" | "busy"> {
+  const current = await readOrchestratorLock(paths);
+  if (current?.token === ORCHESTRATOR_OWNER_TOKEN) {
+    return "owned";
+  }
+
+  try {
+    await writeOrchestratorLock(paths);
+    return "acquired";
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
+      throw error;
+    }
+  }
+
+  const existing = await readOrchestratorLock(paths);
+  if (existing?.token === ORCHESTRATOR_OWNER_TOKEN) {
+    return "owned";
+  }
+
+  if (existing && isProcessAlive(existing.pid)) {
+    return "busy";
+  }
+
+  try {
+    await fs.unlink(paths.orchestratorLockPath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      throw error;
+    }
+  }
+
+  try {
+    await writeOrchestratorLock(paths);
+    return "acquired";
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+      return "busy";
+    }
+    throw error;
+  }
+}
+
+async function releaseOrchestratorLock(paths: RuntimePaths): Promise<void> {
+  const current = await readOrchestratorLock(paths);
+  if (current?.token !== ORCHESTRATOR_OWNER_TOKEN) {
+    return;
+  }
+
+  try {
+    await fs.unlink(paths.orchestratorLockPath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      throw error;
+    }
+  }
+}
+
+async function getActiveProjectFromRuntime(session: RuntimeSession): Promise<ProjectRecord | null> {
+  const activeProjectConfig = getProjectConfig(session.config, session.config.activeProjectSlug);
+  return activeProjectConfig ? projectFromConfig(activeProjectConfig) : null;
 }
 
 async function buildRepositoryDraft(
   input: SetupProbeRepositoryInput,
   paths: RuntimePaths
-): Promise<{ draft: SetupRepositoryDraft | null; check: SetupCheck }> {
-  const rawPath = input.repoPath.trim();
+): Promise<{
+  draft: SetupRepositoryDraft | null;
+  repositoryCheck: SetupCheck;
+}> {
+  const rawPath = input.repoPath?.trim();
 
   if (!rawPath) {
     return {
       draft: null,
-      check: makeSetupCheck(
-        "repository",
-        "needs_action",
-        "Choose the local repository Director OS should operate on.",
-        {
-          code: "repo_missing",
-          recommendedAction: "Enter the absolute path to a local git checkout."
-        }
-      )
+      repositoryCheck: makeSetupCheck("repository", "needs_action", "Choose the repository Director OS should operate on.", {
+        code: "repo_missing",
+        recommendedAction: "Enter the absolute path to a local repository."
+      })
     };
   }
 
   if (!path.isAbsolute(rawPath)) {
     return {
       draft: null,
-      check: makeSetupCheck("repository", "needs_action", "Repository path must be absolute.", {
+      repositoryCheck: makeSetupCheck("repository", "needs_action", "Repository path must be absolute.", {
         code: "repo_not_absolute",
         recommendedAction: "Use the full local path, starting with `/`."
       })
@@ -527,104 +440,66 @@ async function buildRepositoryDraft(
   }
 
   try {
-    const detected = await probeRepositoryPath(rawPath);
-    const projectName = input.projectName?.trim() || detected.name || path.basename(detected.repoPath);
-    const draft: SetupRepositoryDraft = {
-      repoPath: detected.repoPath,
-      projectName,
-      repoSlug: detected.repoSlug,
-      defaultBranch: detected.defaultBranch,
-      worktreeRoot: path.resolve(
-        input.worktreeRoot?.trim() || path.join(paths.worktreesDir, slugify(projectName))
-      ),
-      agentRunner: "codex",
-      model: input.model?.trim() || "gpt-5.4"
-    };
-
-    if (!draft.repoSlug) {
-      return {
-        draft,
-        check: makeSetupCheck(
-          "repository",
-          "needs_action",
-          "The repository is valid, but the GitHub remote could not be inferred.",
-          {
-            code: "repo_slug_missing",
-            recommendedAction: "Add an `origin` remote that points at GitHub, then re-check.",
-            advancedDetail: `Checked repo path: ${draft.repoPath}`
-          }
-        )
-      };
-    }
-
-    if (!draft.defaultBranch) {
-      return {
-        draft,
-        check: makeSetupCheck(
-          "repository",
-          "needs_action",
-          "The repository is valid, but the default branch could not be inferred.",
-          {
-            code: "default_branch_missing",
-            recommendedAction:
-              "Set the repo's default branch locally or fetch the remote HEAD, then re-check.",
-            advancedDetail: `Repository: ${draft.repoPath}`
-          }
-        )
-      };
-    }
+    const resolvedRepo = resolveRepoPath(rawPath);
+    const probed = await probeRepositoryPath(resolvedRepo);
+    const projectName = input.projectName?.trim() || probed.name || path.basename(resolvedRepo);
 
     return {
-      draft,
-      check: makeSetupCheck(
-        "repository",
-        "ready",
-        `${draft.repoSlug} on ${draft.defaultBranch} is ready for setup.`,
-        {
-          recommendedAction: "Continue to the environment checks."
-        }
-      )
+      draft: {
+        repoPath: resolvedRepo,
+        projectName,
+        repoSlug: probed.repoSlug,
+        defaultBranch: probed.defaultBranch || "main",
+        worktreeRoot:
+          input.worktreeRoot?.trim() || path.join(paths.worktreesDir, slugify(projectName)),
+        agentRunner: "codex",
+        model: input.model?.trim() || "gpt-5.4"
+      },
+      repositoryCheck: makeSetupCheck("repository", "ready", `Using ${resolvedRepo}.`)
     };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    const errno = error as NodeJS.ErrnoException;
-
-    if (errno.code === "ENOENT") {
-      return {
-        draft: null,
-        check: makeSetupCheck("repository", "needs_action", "That repository path does not exist.", {
-          code: "repo_not_found",
-          recommendedAction: "Confirm the path and try again.",
-          advancedDetail: message
-        })
-      };
-    }
-
-    if (/not a directory/i.test(message)) {
-      return {
-        draft: null,
-        check: makeSetupCheck("repository", "needs_action", "That path is not a directory.", {
-          code: "repo_not_found",
-          recommendedAction: "Point Director OS at a local repository folder.",
-          advancedDetail: message
-        })
-      };
-    }
-
     return {
       draft: null,
-      check: makeSetupCheck("repository", "needs_action", "That folder is not a git repository.", {
-        code: "repo_not_git",
-        recommendedAction: "Choose a local git checkout with a GitHub remote.",
-        advancedDetail: message
+      repositoryCheck: makeSetupCheck("repository", "blocked", message, {
+        code: /ENOENT/.test(message) ? "repo_not_found" : "repo_not_git",
+        recommendedAction: "Point Director OS at a local Git repository."
       })
     };
   }
 }
 
+async function buildWorkspaceCheck(
+  repositoryDraft: SetupRepositoryDraft | null,
+  runWorkspace: boolean
+): Promise<SetupCheck> {
+  if (!repositoryDraft) {
+    return waitingSetupCheck("workspace", "Probe a repository before testing workspace access.");
+  }
+
+  if (!runWorkspace) {
+    return waitingSetupCheck("workspace", "Workspace test has not run yet.");
+  }
+
+  try {
+    await fs.mkdir(repositoryDraft.worktreeRoot, { recursive: true });
+    await fs.access(repositoryDraft.repoPath);
+    return makeSetupCheck(
+      "workspace",
+      "ready",
+      `Worktree root is writable at ${repositoryDraft.worktreeRoot}.`
+    );
+  } catch (error) {
+    return makeSetupCheck("workspace", "blocked", error instanceof Error ? error.message : String(error), {
+      code: "workspace_probe_failed",
+      recommendedAction: "Choose a writable worktree root."
+    });
+  }
+}
+
 async function evaluateSetupState(
   session: RuntimeSession,
-  options: {
+  input: {
     activeProject: ProjectRecord | null;
     repositoryDraft: SetupRepositoryDraft | null;
     repositoryCheck?: SetupCheck;
@@ -632,55 +507,48 @@ async function evaluateSetupState(
   }
 ): Promise<SetupStatusResponse> {
   const repositoryCheck =
-    options.repositoryCheck ??
-    (options.repositoryDraft
-      ? makeSetupCheck(
-          "repository",
-          "ready",
-          `${options.repositoryDraft.repoSlug} on ${options.repositoryDraft.defaultBranch} is ready for setup.`
-        )
-      : makeSetupCheck("repository", "needs_action", "Choose the repository Director OS should operate on.", {
+    input.repositoryCheck ??
+    (input.repositoryDraft
+      ? makeSetupCheck("repository", "ready", `Using ${input.repositoryDraft.repoPath}.`)
+      : makeSetupCheck("repository", "needs_action", "Choose a Git repository to initialize Director OS.", {
           code: "repo_missing",
-          recommendedAction: "Enter the absolute path to a local repository."
+          recommendedAction: "Provide an absolute repository path."
         }));
 
-  const githubProbe = await probeGhCli();
-  const githubCheck =
-    repositoryCheck.status !== "ready"
-      ? waitingSetupCheck("github", "Repository details are required before GitHub can be verified.")
-      : githubProbe.ok
-        ? makeSetupCheck("github", "ready", githubProbe.detail)
-        : makeSetupCheck(
-            "github",
-            githubProbe.reason === "missing" || githubProbe.reason === "auth_required"
-              ? "needs_action"
-              : "blocked",
-            githubProbe.detail,
-            {
-              code:
-                githubProbe.reason === "missing"
-                  ? "gh_missing"
-                  : githubProbe.reason === "auth_required"
-                    ? "gh_auth_required"
-                    : "gh_probe_failed",
-              recommendedAction:
-                githubProbe.reason === "missing"
-                  ? "Install GitHub CLI and sign in."
-                  : githubProbe.reason === "auth_required"
-                    ? "Run `gh auth login`, then re-check."
-                    : "Inspect the diagnostic details, then re-check.",
-              advancedDetail: githubProbe.advancedDetail
-            }
-          );
+  const [ghProbe, codexProbe, workspaceCheck] = await Promise.all([
+    probeGhCli(),
+    probeCodexCli(input.repositoryDraft?.model ?? "gpt-5.4-mini"),
+    buildWorkspaceCheck(input.repositoryDraft, input.runWorkspace)
+  ]);
 
-  const codexProbe = await probeCodexCli(options.repositoryDraft?.model ?? "gpt-5.4");
+  const ghCheck = ghProbe.ok
+    ? makeSetupCheck("github", "ready", ghProbe.detail)
+    : makeSetupCheck(
+        "github",
+        ghProbe.reason === "auth_required" ? "needs_action" : "blocked",
+        ghProbe.detail,
+        {
+          code:
+            ghProbe.reason === "missing"
+              ? "gh_missing"
+              : ghProbe.reason === "auth_required"
+                ? "gh_auth_required"
+                : "gh_probe_failed",
+          recommendedAction:
+            ghProbe.reason === "missing"
+              ? "Install the GitHub CLI."
+              : ghProbe.reason === "auth_required"
+                ? "Run `gh auth login`."
+                : null,
+          advancedDetail: ghProbe.advancedDetail ?? null
+        }
+      );
+
   const codexCheck = codexProbe.ok
     ? makeSetupCheck("codex", "ready", codexProbe.detail)
     : makeSetupCheck(
         "codex",
-        codexProbe.reason === "missing" || codexProbe.reason === "auth_required"
-          ? "needs_action"
-          : "blocked",
+        codexProbe.reason === "auth_required" ? "needs_action" : "blocked",
         codexProbe.detail,
         {
           code:
@@ -691,195 +559,210 @@ async function evaluateSetupState(
                 : "codex_probe_failed",
           recommendedAction:
             codexProbe.reason === "missing"
-              ? "Install Codex, then re-check."
+              ? "Install Codex CLI."
               : codexProbe.reason === "auth_required"
-                ? "Sign in to Codex, then re-check."
-                : "Inspect the diagnostic details, then re-check.",
-          advancedDetail: codexProbe.advancedDetail
+                ? "Sign in to Codex."
+                : null,
+          advancedDetail: codexProbe.advancedDetail ?? null
         }
       );
 
-  let workspaceCheck = waitingSetupCheck(
-    "workspace",
-    "Run the local workspace test after the repository and integrations are ready."
-  );
-
-  if (
-    options.runWorkspace &&
-    options.repositoryDraft &&
-    repositoryCheck.status === "ready" &&
-    githubCheck.status === "ready" &&
-    codexCheck.status === "ready"
-  ) {
-    try {
-      await ensureRuntimeDirectories(session.paths);
-      await fs.mkdir(options.repositoryDraft.worktreeRoot, { recursive: true });
-      await fs.access(options.repositoryDraft.repoPath);
-      await fs.access(session.paths.databasePath).catch(async () => {
-        await fs.writeFile(session.paths.databasePath, "", "utf8");
-      });
-      workspaceCheck = makeSetupCheck(
-        "workspace",
-        "ready",
-        "Runtime storage, SQLite, repository access, and the local worktree root are ready."
-      );
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      workspaceCheck = makeSetupCheck(
-        "workspace",
-        "blocked",
-        "The local workspace test failed.",
-        {
-          code: "workspace_probe_failed",
-          recommendedAction: "Inspect the diagnostic details, fix the local environment, then re-check.",
-          advancedDetail: message
-        }
-      );
-    }
-  }
-
-  const checks = [repositoryCheck, githubCheck, codexCheck, workspaceCheck];
+  const checks = [repositoryCheck, ghCheck, codexCheck, workspaceCheck];
+  const canComplete =
+    Boolean(input.repositoryDraft) && checks.every((check) => check.status === "ready");
 
   return {
-    activeProject: options.activeProject,
+    activeProject: input.activeProject,
     checks,
-    repositoryDraft: options.repositoryDraft,
-    canComplete: checks.every((check) => check.status === "ready"),
-    completed:
-      Boolean(options.activeProject) && checks.every((check) => check.status === "ready")
+    repositoryDraft: input.repositoryDraft,
+    canComplete,
+    completed: Boolean(input.activeProject) && canComplete
   };
 }
 
 async function persistProjectRegistration(
   session: RuntimeSession,
-  draft: SetupRepositoryDraft
+  repositoryDraft: SetupRepositoryDraft
 ): Promise<ProjectRecord> {
-  const storedProject = draftToStoredProjectConfig(draft);
-  const timestamp = nowIso();
-  const existingRows = await session.db
-    .select()
-    .from(projectsTable)
-    .where(eq(projectsTable.slug, storedProject.slug))
-    .limit(1);
-
-  if (existingRows[0]) {
-    await session.db
-      .update(projectsTable)
-      .set({
-        name: storedProject.name,
-        repoPath: storedProject.repoPath,
-        repoSlug: storedProject.repoSlug,
-        defaultBranch: storedProject.defaultBranch,
-        worktreeRoot: storedProject.worktreeRoot,
-        agentRunner: storedProject.agentRunner,
-        model: storedProject.model,
-        updatedAt: timestamp
-      })
-      .where(eq(projectsTable.id, existingRows[0].id));
-  } else {
-    await session.db.insert(projectsTable).values({
-      name: storedProject.name,
-      slug: storedProject.slug,
-      repoPath: storedProject.repoPath,
-      repoSlug: storedProject.repoSlug,
-      defaultBranch: storedProject.defaultBranch,
-      worktreeRoot: storedProject.worktreeRoot,
-      agentRunner: storedProject.agentRunner,
-      model: storedProject.model,
-      createdAt: timestamp,
-      updatedAt: timestamp
-    });
-  }
-
+  const storedProject = draftToStoredProjectConfig(session.config, repositoryDraft);
   const nextConfig = upsertProjectConfig(session.config, storedProject);
   nextConfig.activeProjectSlug = storedProject.slug;
   await saveConfig(nextConfig, session.paths);
-
-  const rows = await session.db
-    .select()
-    .from(projectsTable)
-    .where(eq(projectsTable.slug, storedProject.slug))
-    .limit(1);
-  const project = mapProjectRow(assertPresent(rows[0], "Registered project row is missing."));
-
-  await ensureOrchestratorRow({
-    ...session,
-    project,
-    projectConfig: storedProject
-  });
-
-  return project;
+  await initializeProjectRuntime(session.paths, storedProject);
+  return projectFromConfig(storedProject);
 }
 
-function summarizeText(value: string, maxLength = 280): string {
-  const trimmed = value.replace(/\s+/g, " ").trim();
-  return trimmed.length > maxLength ? `${trimmed.slice(0, maxLength - 1)}…` : trimmed;
+function mapRemoteIssue(project: ProjectRecord, issue: GitHubCacheState["issues"][number]): GitHubIssueRecord {
+  const workflowState =
+    issue.state.toLowerCase() !== "open"
+      ? "done"
+      : issue.labels.includes("director:ready")
+        ? "ready"
+        : issue.labels.includes("director:blocked")
+          ? "blocked"
+          : issue.labels.includes("director:in-review")
+            ? "in_review"
+            : "queued";
+
+  return {
+    id: issue.number,
+    projectId: project.id,
+    number: issue.number,
+    title: issue.title,
+    body: issue.body,
+    state: issue.state,
+    workflowState,
+    labels: issue.labels,
+    url: issue.url,
+    updatedAt: issue.updatedAt,
+    syncedAt: issue.updatedAt
+  };
 }
 
-function truncatePromptSection(value: string | null | undefined, maxLength = 8_000): string | null {
-  const trimmed = value?.trim();
-  if (!trimmed) {
-    return null;
+function mapRemotePullRequest(
+  project: ProjectRecord,
+  pullRequest: GitHubCacheState["pullRequests"][number],
+  syncedAt: string | null
+): GitHubPullRequestRecord {
+  return {
+    id: pullRequest.number,
+    projectId: project.id,
+    number: pullRequest.number,
+    title: pullRequest.title,
+    body: pullRequest.body,
+    state: pullRequest.state,
+    isDraft: pullRequest.isDraft,
+    reviewDecision: pullRequest.reviewDecision,
+    checksBucket: pullRequest.checksBucket,
+    headRefName: pullRequest.headRefName,
+    baseRefName: pullRequest.baseRefName,
+    url: pullRequest.url,
+    linkedIssueNumbers: pullRequest.linkedIssueNumbers,
+    updatedAt: pullRequest.updatedAt,
+    syncedAt: syncedAt ?? pullRequest.updatedAt
+  };
+}
+
+function findIssueLane(router: RouterState, issueNumber: number): RouterState["lanes"][number] | null {
+  return router.lanes.find((lane) => lane.issueNumbers.includes(issueNumber)) ?? null;
+}
+
+function findLaneById(router: RouterState, laneId: string): RouterLaneState | null {
+  return router.lanes.find((lane) => lane.id === laneId) ?? null;
+}
+
+function ensureLane(router: RouterState, laneId: string, laneName: string): RouterLaneState {
+  const existing = findLaneById(router, laneId);
+  if (existing) {
+    existing.name = existing.name || laneName;
+    return existing;
   }
 
-  return trimmed.length > maxLength ? `${trimmed.slice(0, maxLength - 1)}…` : trimmed;
+  const lane: RouterLaneState = {
+    id: laneId,
+    name: laneName,
+    sessionId: null,
+    issueNumbers: [],
+    status: "idle",
+    currentIssueNumber: null,
+    activePullRequestNumber: null,
+    lastSummary: null,
+    lastPlanSummary: null,
+    updatedAt: nowIso()
+  };
+  router.lanes.push(lane);
+  return lane;
 }
 
-function formatHumanQuestionContent(question: string, summary: string, recommendation: string): string {
-  const sections = [
-    question.trim(),
-    summary.trim()
-      ? ["Why this matters", summary.trim()].join("\n")
-      : null,
-    ["Recommendation", (recommendation.trim() || "Reply with the direction you want me to take.")].join("\n")
-  ].filter((value): value is string => Boolean(value && value.trim().length > 0));
-
-  return sections.join("\n\n");
-}
-
-function labelFor(suffix: string): string {
-  return `${DIRECTOR_LABEL_PREFIX}${suffix}`;
-}
-
-function inferWorkflowState(labels: string[], state: string): string {
-  if (state.toLowerCase() !== "open") {
-    return "done";
+function defaultLaneForIssue(issue: GitHubIssueRecord): { id: string; name: string } {
+  const explicitLabel = issue.labels.find((label) => label.startsWith("director:lane:"));
+  if (explicitLabel) {
+    const rawName = explicitLabel.slice("director:lane:".length).trim();
+    const normalized = rawName || "delivery";
+    return {
+      id: slugify(normalized),
+      name: normalized
+        .split(/[-_\s]+/)
+        .map((part) => (part ? `${part[0]?.toUpperCase() ?? ""}${part.slice(1)}` : part))
+        .join(" ")
+    };
   }
 
-  if (labels.includes(labelFor("ready"))) {
-    return "ready";
+  return {
+    id: "delivery",
+    name: "Delivery"
+  };
+}
+
+function defaultExecutionIntentForIssue(issue: GitHubIssueRecord): "plan" | "implement" {
+  return issue.labels.includes("director:lane") ? "plan" : "implement";
+}
+
+function hasPendingLaneWork(router: RouterState, issueNumber: number): boolean {
+  return (
+    Boolean(findIssueLane(router, issueNumber)) ||
+    router.pendingHandoffs.some(
+      (handoff) => handoff.issueNumber === issueNumber && handoff.status === "pending"
+    )
+  );
+}
+
+function enqueueHandoff(
+  router: RouterState,
+  input: Omit<RouterHandoffState, "id" | "createdAt" | "updatedAt">
+): RouterHandoffState {
+  const timestamp = nowIso();
+  const handoff: RouterHandoffState = {
+    id: `handoff_${randomUUID()}`,
+    createdAt: timestamp,
+    updatedAt: timestamp,
+    ...input
+  };
+  router.pendingHandoffs.push(handoff);
+  return handoff;
+}
+
+function pendingHandoff(router: RouterState): RouterHandoffState | null {
+  return router.pendingHandoffs.find((handoff) => handoff.status === "pending") ?? null;
+}
+
+function synthesizeWorkItemStatus(
+  issue: GitHubIssueRecord,
+  linkedPullRequest: GitHubPullRequestRecord | null,
+  router: RouterState
+): WorkItemStatus {
+  if (issue.state.toLowerCase() !== "open") {
+    return "completed";
   }
 
-  if (labels.includes(labelFor("blocked"))) {
+  if (router.openQuestion?.issueNumber === issue.number) {
+    return "waiting_decision";
+  }
+
+  if (linkedPullRequest && linkedPullRequest.state.toLowerCase() === "open") {
+    return "waiting_review";
+  }
+
+  const lane = findIssueLane(router, issue.number);
+  if (lane?.status === "blocked") {
     return "blocked";
   }
-
-  if (labels.includes(labelFor("in-review"))) {
-    return "in_review";
+  if (lane?.status === "planning") {
+    return "planning";
   }
-
+  if (lane?.status === "implementing") {
+    return "running";
+  }
+  if (issue.workflowState === "blocked") {
+    return "blocked";
+  }
+  if (issue.workflowState === "ready") {
+    return "ready";
+  }
   return "queued";
 }
 
-function inferWorkItemKind(issue: GitHubIssueRecord): WorkItemKind {
-  return issue.labels.includes(labelFor("workstream")) || /^epic:/i.test(issue.title)
-    ? "workstream"
-    : "task";
-}
-
-function inferExecutionMode(kind: WorkItemKind, issue: GitHubIssueRecord): ExecutionMode {
-  if (issue.labels.includes(labelFor("lane"))) {
-    return "lane";
-  }
-
-  if (issue.labels.includes(labelFor("worker"))) {
-    return "worker";
-  }
-
-  return kind === "workstream" ? "lane" : "worker";
-}
-
-function inferPriorityBucket(status: WorkItemStatus): number {
+function priorityBucketFromStatus(status: WorkItemStatus): number {
   switch (status) {
     case "ready":
       return 0;
@@ -893,294 +776,327 @@ function inferPriorityBucket(status: WorkItemStatus): number {
       return 3;
     case "blocked":
       return 4;
-    case "completed":
-      return 5;
     default:
-      return 3;
+      return 99;
   }
 }
 
-async function recordEvent(
-  db: DirectorDatabase,
-  projectId: number,
-  kind: string,
-  payload: Record<string, unknown>
-): Promise<void> {
-  await db.insert(eventsTable).values({
-    projectId,
-    kind,
-    payload: asJson(payload),
-    createdAt: nowIso()
-  });
-}
-
-async function maybeRunPackageScript(cwd: string, script: string): Promise<void> {
-  try {
-    await fs.access(path.join(cwd, "package.json"));
-  } catch {
-    return;
-  }
-
-  await runCommand("npm", ["run", script, "--if-present"], cwd);
-}
-
-async function ensureWorktree(
+function synthesizeWorkItem(
   project: ProjectRecord,
-  issueNumber: number,
-  branchName: string,
-  worktreePath: string
-): Promise<{ branchName: string; worktreePath: string }> {
-  await fs.mkdir(project.worktreeRoot, { recursive: true });
-  await pruneGitWorktrees(project.repoPath);
-
-  const reusable = selectReusableGitWorktree(
-    await listGitWorktrees(project.repoPath),
-    worktreePath,
-    branchName
-  );
-
-  if (reusable && (await pathExists(reusable.path))) {
-    return {
-      branchName: reusable.branchName ?? branchName,
-      worktreePath: reusable.path
-    };
-  }
-
-  if (await pathExists(worktreePath)) {
-    await fs.rm(worktreePath, { recursive: true, force: true });
-  }
-
-  await runCommand(
-    "git",
-    ["-C", project.repoPath, "worktree", "add", "-B", branchName, worktreePath, project.defaultBranch],
-    project.repoPath
-  );
+  issue: GitHubIssueRecord,
+  linkedPullRequest: GitHubPullRequestRecord | null,
+  router: RouterState
+): WorkItemRecord {
+  const lane = findIssueLane(router, issue.number);
+  const status = synthesizeWorkItemStatus(issue, linkedPullRequest, router);
+  const kind: WorkItemKind = issue.labels.includes("director:task") ? "task" : "workstream";
+  const executionMode: ExecutionMode = lane ? "lane" : kind === "workstream" ? "lane" : "worker";
 
   return {
-    branchName,
-    worktreePath
+    id: issue.number,
+    projectId: project.id,
+    issueNumber: issue.number,
+    parentIssueNumber: null,
+    title: issue.title,
+    summary: summarizeText(issue.body || issue.title),
+    kind,
+    executionMode,
+    ownerRole: lane?.name ?? "chief_of_staff",
+    status,
+    priorityBucket: priorityBucketFromStatus(status),
+    activeRunId: null,
+    activePrNumber: linkedPullRequest?.number ?? null,
+    lastSummary: lane?.lastSummary ?? null,
+    createdAt: issue.updatedAt,
+    updatedAt: issue.updatedAt
   };
 }
 
-async function upsertGitHubIssueMirror(
-  db: DirectorDatabase,
-  projectId: number,
-  input: Omit<GitHubIssueRecord, "id" | "projectId">
-): Promise<void> {
-  const existing = await db
-    .select()
-    .from(githubIssuesTable)
-    .where(eq(githubIssuesTable.projectId, projectId));
-  const row = existing.find((candidate) => candidate.number === input.number);
-
-  if (row) {
-    await db
-      .update(githubIssuesTable)
-      .set({
-        title: input.title,
-        body: input.body,
-        state: input.state,
-        workflowState: input.workflowState,
-        labels: asJson(input.labels),
-        url: input.url,
-        updatedAt: input.updatedAt,
-        syncedAt: input.syncedAt
-      })
-      .where(eq(githubIssuesTable.id, row.id));
-    return;
-  }
-
-  await db.insert(githubIssuesTable).values({
-    projectId,
-    number: input.number,
-    title: input.title,
-    body: input.body,
-    state: input.state,
-    workflowState: input.workflowState,
-    labels: asJson(input.labels),
-    url: input.url,
-    updatedAt: input.updatedAt,
-    syncedAt: input.syncedAt
-  });
+function toHumanQuestionRecord(question: RouterQuestionState): HumanQuestionRecord {
+  return {
+    id: question.id,
+    title: question.title,
+    question: question.question,
+    whyItMatters: question.whyItMatters,
+    recommendation: question.recommendation,
+    linkedIssueNumber: question.issueNumber,
+    linkedPullRequestNumber: question.prNumber,
+    createdAt: question.createdAt,
+    updatedAt: question.updatedAt
+  };
 }
 
-async function upsertGitHubPullRequestMirror(
-  db: DirectorDatabase,
-  projectId: number,
-  input: Omit<GitHubPullRequestRecord, "id" | "projectId">
-): Promise<void> {
-  const existing = await db
-    .select()
-    .from(githubPullRequestsTable)
-    .where(eq(githubPullRequestsTable.projectId, projectId));
-  const row = existing.find((candidate) => candidate.number === input.number);
+function synthesizeLaneRecord(
+  lane: RouterState["lanes"][number],
+  pullRequests: GitHubPullRequestRecord[]
+): LaneRecord {
+  const activePullRequest =
+    pullRequests.find((pullRequest) =>
+      lane.issueNumbers.some((issueNumber) => pullRequest.linkedIssueNumbers.includes(issueNumber))
+    ) ?? null;
 
-  if (row) {
-    await db
-      .update(githubPullRequestsTable)
-      .set({
-        title: input.title,
-        body: input.body,
-        state: input.state,
-        isDraft: input.isDraft,
-        reviewDecision: input.reviewDecision,
-        checksBucket: input.checksBucket,
-        headRefName: input.headRefName,
-        baseRefName: input.baseRefName,
-        url: input.url,
-        linkedIssueNumbers: asJson(input.linkedIssueNumbers),
-        updatedAt: input.updatedAt,
-        syncedAt: input.syncedAt
-      })
-      .where(eq(githubPullRequestsTable.id, row.id));
-    return;
-  }
-
-  await db.insert(githubPullRequestsTable).values({
-    projectId,
-    number: input.number,
-    title: input.title,
-    body: input.body,
-    state: input.state,
-    isDraft: input.isDraft,
-    reviewDecision: input.reviewDecision,
-    checksBucket: input.checksBucket,
-    headRefName: input.headRefName,
-    baseRefName: input.baseRefName,
-    url: input.url,
-    linkedIssueNumbers: asJson(input.linkedIssueNumbers),
-    updatedAt: input.updatedAt,
-    syncedAt: input.syncedAt
-  });
+  return {
+    id: lane.id,
+    name: lane.name,
+    sessionId: lane.sessionId,
+    status: lane.status,
+    currentIssueNumber: lane.currentIssueNumber,
+    ownedIssueNumbers: lane.issueNumbers,
+    activePullRequestNumber: activePullRequest?.number ?? lane.activePullRequestNumber,
+    lastSummary: lane.lastSummary,
+    lastPlanSummary: lane.lastPlanSummary,
+    updatedAt: lane.updatedAt
+  };
 }
 
-async function upsertGitHubCommentMirror(
-  db: DirectorDatabase,
-  projectId: number,
-  input: {
-    githubId: string;
-    parentType: "issue" | "pr";
-    parentNumber: number;
-    author: string;
-    body: string;
-    url: string;
-    createdAt: string;
-    updatedAt: string;
-    syncedAt: string;
-  }
-): Promise<void> {
-  const rows = await db
-    .select()
-    .from(githubCommentsTable)
-    .where(eq(githubCommentsTable.projectId, projectId));
-  const row = rows.find((candidate) => candidate.githubId === input.githubId);
+function synthesizeIssueOwnership(
+  issue: GitHubIssueRecord,
+  router: RouterState,
+  pullRequests: GitHubPullRequestRecord[]
+): IssueOwnershipRecord {
+  const lane = findIssueLane(router, issue.number);
+  const linkedPullRequest =
+    pullRequests.find((pullRequest) => pullRequest.linkedIssueNumbers.includes(issue.number)) ?? null;
 
-  if (row) {
-    await db
-      .update(githubCommentsTable)
-      .set({
-        parentType: input.parentType,
-        parentNumber: input.parentNumber,
-        author: input.author,
-        body: input.body,
-        url: input.url,
-        createdAt: input.createdAt,
-        updatedAt: input.updatedAt,
-        syncedAt: input.syncedAt
-      })
-      .where(eq(githubCommentsTable.id, row.id));
-    return;
-  }
-
-  await db.insert(githubCommentsTable).values({
-    projectId,
-    githubId: input.githubId,
-    parentType: input.parentType,
-    parentNumber: input.parentNumber,
-    author: input.author,
-    body: input.body,
-    url: input.url,
-    createdAt: input.createdAt,
-    updatedAt: input.updatedAt,
-    syncedAt: input.syncedAt
-  });
+  return {
+    issueNumber: issue.number,
+    title: issue.title,
+    url: issue.url,
+    state: issue.state,
+    workflowState: issue.workflowState,
+    laneId: lane?.id ?? null,
+    laneName: lane?.name ?? null,
+    executionIntent: lane?.status === "planning" ? "plan" : lane ? "implement" : null,
+    status:
+      issue.state.toLowerCase() !== "open"
+        ? "completed"
+        : linkedPullRequest
+          ? "waiting_review"
+          : lane?.status === "blocked"
+            ? "blocked"
+          : issue.workflowState === "blocked"
+            ? "blocked"
+            : lane
+              ? lane.status === "planning"
+                ? "planned"
+                : "implementing"
+              : "unassigned",
+    linkedPullRequestNumber: linkedPullRequest?.number ?? null,
+    linkedPullRequestUrl: linkedPullRequest?.url ?? null,
+    automationWindowEndsAt: null,
+    lastHandledCommentAt: null,
+    lastSummary: lane?.lastSummary ?? null,
+    updatedAt: issue.updatedAt
+  };
 }
 
-async function getWorkItemByIssueNumber(
-  db: DirectorDatabase,
-  projectId: number,
-  issueNumber: number
-): Promise<WorkItemRecord | null> {
-  const rows = await db
-    .select()
-    .from(workItemsTable)
-    .where(eq(workItemsTable.projectId, projectId));
-  const row = rows.find((candidate) => candidate.issueNumber === issueNumber);
-  return row ? mapWorkItemRow(row) : null;
-}
+function synthesizePrCycle(
+  project: ProjectRecord,
+  pullRequest: GitHubPullRequestRecord
+): PrCycleRecord {
+  let status: PrCycleRecord["status"] = "opened";
 
-async function upsertWorkItem(
-  db: DirectorDatabase,
-  projectId: number,
-  input: Omit<WorkItemRecord, "id" | "projectId" | "createdAt" | "updatedAt">
-): Promise<WorkItemRecord> {
-  const rows = await db
-    .select()
-    .from(workItemsTable)
-    .where(eq(workItemsTable.projectId, projectId));
-  const row = rows.find((candidate) => candidate.issueNumber === input.issueNumber);
-  const timestamp = nowIso();
-
-  if (row) {
-    await db
-      .update(workItemsTable)
-      .set({
-        parentIssueNumber: input.parentIssueNumber,
-        title: input.title,
-        summary: input.summary,
-        kind: input.kind,
-        executionMode: input.executionMode,
-        ownerRole: input.ownerRole,
-        status: input.status,
-        priorityBucket: input.priorityBucket,
-        activeRunId: input.activeRunId,
-        activePrNumber: input.activePrNumber,
-        lastSummary: input.lastSummary,
-        updatedAt: timestamp
-      })
-      .where(eq(workItemsTable.id, row.id));
-  } else {
-    await db.insert(workItemsTable).values({
-      projectId,
-      issueNumber: input.issueNumber,
-      parentIssueNumber: input.parentIssueNumber,
-      title: input.title,
-      summary: input.summary,
-      kind: input.kind,
-      executionMode: input.executionMode,
-      ownerRole: input.ownerRole,
-      status: input.status,
-      priorityBucket: input.priorityBucket,
-      activeRunId: input.activeRunId,
-      activePrNumber: input.activePrNumber,
-      lastSummary: input.lastSummary,
-      createdAt: timestamp,
-      updatedAt: timestamp
-    });
+  if (pullRequest.state.toLowerCase() === "merged") {
+    status = "merged";
+  } else if (pullRequest.reviewDecision === "CHANGES_REQUESTED") {
+    status = "changes_requested";
+  } else if (pullRequest.checksBucket === "pending") {
+    status = "waiting_automation";
+  } else if (pullRequest.checksBucket === "pass") {
+    status = "merge_ready";
   }
 
-  return assertPresent(
-    await getWorkItemByIssueNumber(db, projectId, input.issueNumber),
-    `Work item for issue #${input.issueNumber} is missing after upsert.`
-  );
+  return {
+    id: pullRequest.number,
+    projectId: project.id,
+    issueNumber: pullRequest.linkedIssueNumbers[0] ?? 0,
+    prNumber: pullRequest.number,
+    status,
+    summary: pullRequest.title,
+    automationWindowEndsAt: null,
+    lastCheckedAt: pullRequest.updatedAt,
+    lastHandledCommentAt: null,
+    mergedAt: pullRequest.state.toLowerCase() === "merged" ? pullRequest.updatedAt : null,
+    createdAt: pullRequest.updatedAt,
+    updatedAt: pullRequest.updatedAt
+  };
 }
 
-async function insertRun(
+function synthesizeActivity(router: RouterState): ActivityRecord[] {
+  const noteActivity = router.notes.map<ActivityRecord>((note) => ({
+    id: `note_${note.id}`,
+    kind: "note",
+    summary: note.content,
+    laneId: null,
+    laneName: null,
+    issueNumber: null,
+    pullRequestNumber: null,
+    createdAt: note.createdAt
+  }));
+
+  const runActivity = router.recentRuns.map<ActivityRecord>((run) => ({
+    id: `run_${run.id}`,
+    kind: run.role,
+    summary: run.summary,
+    laneId: null,
+    laneName: null,
+    issueNumber: run.issueNumber,
+    pullRequestNumber: run.prNumber,
+    createdAt: run.createdAt
+  }));
+
+  const questionActivity = router.openQuestion
+    ? [
+        {
+          id: `question_${router.openQuestion.id}`,
+          kind: "human_question",
+          summary: router.openQuestion.question,
+          laneId: null,
+          laneName: null,
+          issueNumber: router.openQuestion.issueNumber,
+          pullRequestNumber: router.openQuestion.prNumber,
+          createdAt: router.openQuestion.createdAt
+        } satisfies ActivityRecord
+      ]
+    : [];
+
+  return [...questionActivity, ...runActivity, ...noteActivity]
+    .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
+    .slice(0, 12);
+}
+
+function synthesizeOrchestratorStatus(
+  project: ProjectRecord,
+  router: RouterState,
+  owner: OrchestratorLockRecord | null
+): OrchestratorStatusRecord {
+  return {
+    id: 1,
+    projectId: project.id,
+    status: router.orchestrator.status,
+    pauseReason: router.orchestrator.pauseReason,
+    activeRunIds: [],
+    lastLoopAt: router.orchestrator.lastLoopAt,
+    lastSummary: router.orchestrator.lastSummary,
+    ownerPid: owner?.pid ?? null,
+    ownerToken: owner?.token ?? null,
+    createdAt: router.updatedAt,
+    updatedAt: router.updatedAt
+  };
+}
+
+function formatHumanQuestionContent(question: string, whyItMatters: string, recommendation: string): string {
+  return [
+    question.trim(),
+    whyItMatters.trim() ? `Why it matters: ${whyItMatters.trim()}` : null,
+    recommendation.trim() ? `Recommendation: ${recommendation.trim()}` : null
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+}
+
+function formatResolutionMessage(question: RouterQuestionState, resolution: string): string {
+  return [
+    `Resolution recorded for: ${question.title}`,
+    question.recommendation ? `Chief of Staff recommendation: ${question.recommendation}` : null,
+    resolution.trim() ? `Director response: ${resolution.trim()}` : null
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+}
+
+async function recentConversationPrompt(session: ProjectSession, limit = 10): Promise<string> {
+  const conversation = await loadConversationState(session.paths, session.project);
+  const messages = conversation.messages.slice(-limit);
+  if (!messages.length) {
+    return "No prior conversation.";
+  }
+
+  return messages.map((message) => `[${message.role}/${message.kind}] ${message.content}`).join("\n");
+}
+
+function nextNumericId(values: Array<{ id: number }>): number {
+  return values.reduce((max, value) => Math.max(max, value.id), 0) + 1;
+}
+
+async function appendConversationMessage(
   session: ProjectSession,
-  input: Omit<RunRecord, "id" | "projectId" | "createdAt" | "updatedAt">
-): Promise<RunRecord> {
+  input: Omit<
+    ConversationMessageRecord,
+    "id" | "projectId" | "threadId" | "createdAt" | "updatedAt"
+  >
+): Promise<ConversationMessageRecord> {
+  const conversation = await loadConversationState(session.paths, session.project);
   const timestamp = nowIso();
-  const result = await session.db.insert(runsTable).values({
+  const threadId = conversation.thread?.id ?? 1;
+  const message: ConversationMessageRecord = {
+    id: nextNumericId(conversation.messages),
+    projectId: session.project.id,
+    threadId,
+    createdAt: timestamp,
+    updatedAt: timestamp,
+    ...input
+  };
+
+  conversation.messages.push(message);
+  if (conversation.thread) {
+    conversation.thread.projectId = session.project.id;
+    conversation.thread.updatedAt = timestamp;
+  }
+  await saveConversationState(session.paths, conversation, session.project.slug);
+  return message;
+}
+
+async function getConversationResponse(session: ProjectSession): Promise<ConversationResponse> {
+  const [conversation, router] = await Promise.all([
+    loadConversationState(session.paths, session.project),
+    loadRouterState(session.paths, session.project.slug)
+  ]);
+
+  const latestMessage = conversation.messages.at(-1) ?? null;
+
+  return {
+    thread: conversation.thread
+      ? {
+          ...conversation.thread,
+          projectId: session.project.id
+        }
+      : null,
+    messages: conversation.messages,
+    openQuestion: router.openQuestion ? toHumanQuestionRecord(router.openQuestion) : null,
+    latestSummary: latestMessage?.summary ?? null,
+    openQuestionRun: null
+  };
+}
+
+async function addDirectorNote(session: ProjectSession, content: string): Promise<DirectorNoteRecord> {
+  const router = await loadRouterState(session.paths, session.project.slug);
+  const timestamp = nowIso();
+  const note: DirectorNoteRecord = {
+    id: nextNumericId(router.notes),
+    projectId: session.project.id,
+    content,
+    status: "active",
+    createdAt: timestamp,
+    updatedAt: timestamp
+  };
+
+  await saveRouterState(session.paths, {
+    ...router,
+    notes: [...router.notes, note]
+  });
+
+  return note;
+}
+
+function recordRun(
+  session: ProjectSession,
+  router: RouterState,
+  input: Omit<RunRecord, "id" | "projectId" | "createdAt" | "updatedAt">
+): RouterState {
+  const timestamp = nowIso();
+  const run: RunRecord = {
+    id: nextNumericId(router.recentRuns),
     projectId: session.project.id,
     workItemId: input.workItemId,
     issueNumber: input.issueNumber,
@@ -1190,642 +1106,166 @@ async function insertRun(
     phase: input.phase,
     summary: input.summary,
     recommendedNextAction: input.recommendedNextAction,
-    artifacts: asJson(input.artifacts),
-    blockingQuestions: asJson(input.blockingQuestions),
-    outputJson: input.outputJson ? asJson(input.outputJson) : null,
+    artifacts: input.artifacts,
+    blockingQuestions: input.blockingQuestions,
+    outputJson: input.outputJson,
     rawModelOutput: input.rawModelOutput,
     worktreePath: input.worktreePath,
     createdAt: timestamp,
     updatedAt: timestamp
-  });
-
-  const row = await session.db
-    .select()
-    .from(runsTable)
-    .where(eq(runsTable.id, Number(result.lastInsertRowid)))
-    .limit(1);
-  const mapped = mapRunRow(assertPresent(row[0], "Run row missing after insert."));
-  await syncOrchestratorActiveRuns(session);
-  return mapped;
-}
-
-async function updateRun(
-  session: ProjectSession,
-  runId: number,
-  patch: Partial<Omit<RunRecord, "id" | "projectId" | "createdAt">>
-): Promise<RunRecord> {
-  await session.db
-    .update(runsTable)
-    .set({
-      workItemId: patch.workItemId,
-      issueNumber: patch.issueNumber,
-      prNumber: patch.prNumber,
-      role: patch.role,
-      status: patch.status,
-      phase: patch.phase,
-      summary: patch.summary,
-      recommendedNextAction: patch.recommendedNextAction,
-      artifacts: patch.artifacts ? asJson(patch.artifacts) : undefined,
-      blockingQuestions: patch.blockingQuestions ? asJson(patch.blockingQuestions) : undefined,
-      outputJson: patch.outputJson ? asJson(patch.outputJson) : patch.outputJson === null ? null : undefined,
-      rawModelOutput:
-        patch.rawModelOutput !== undefined ? patch.rawModelOutput : undefined,
-      worktreePath: patch.worktreePath,
-      updatedAt: nowIso()
-    })
-    .where(eq(runsTable.id, runId));
-
-  const row = await session.db.select().from(runsTable).where(eq(runsTable.id, runId)).limit(1);
-  const mapped = mapRunRow(assertPresent(row[0], `Run ${runId} is missing after update.`));
-  await syncOrchestratorActiveRuns(session);
-  return mapped;
-}
-
-async function ensureConversationThread(
-  session: ProjectSession
-): Promise<ConversationThreadRecord> {
-  const existingRows = await session.db
-    .select()
-    .from(conversationThreadsTable)
-    .where(eq(conversationThreadsTable.projectId, session.project.id))
-    .limit(1);
-
-  let thread = existingRows[0] ? mapConversationThreadRow(existingRows[0]) : null;
-  if (!thread) {
-    const timestamp = nowIso();
-    const result = await session.db.insert(conversationThreadsTable).values({
-      projectId: session.project.id,
-      title: `${session.project.name} Chief of Staff`,
-      status: "active",
-      createdAt: timestamp,
-      updatedAt: timestamp
-    });
-    const row = await session.db
-      .select()
-      .from(conversationThreadsTable)
-      .where(eq(conversationThreadsTable.id, Number(result.lastInsertRowid)))
-      .limit(1);
-    thread = mapConversationThreadRow(assertPresent(row[0], "Conversation thread missing after insert."));
-  }
-
-  const messageRows = await session.db
-    .select()
-    .from(conversationMessagesTable)
-    .where(eq(conversationMessagesTable.threadId, thread.id))
-    .limit(1);
-  if (messageRows[0]) {
-    return thread;
-  }
-
-  const noteRows = await session.db
-    .select()
-    .from(directorNotesTable)
-    .where(eq(directorNotesTable.projectId, session.project.id));
-  for (const note of noteRows.map(mapNoteRow).sort((left, right) => left.createdAt.localeCompare(right.createdAt))) {
-    await session.db.insert(conversationMessagesTable).values({
-      threadId: thread.id,
-      projectId: session.project.id,
-      role: "director",
-      kind: "human_message",
-      content: note.content,
-      summary: summarizeText(note.content),
-      linkedIssueNumber: null,
-      linkedPrNumber: null,
-      isOpenQuestion: false,
-      workItemId: null,
-      issueNumber: null,
-      prNumber: null,
-      decisionId: null,
-      runId: null,
-      createdAt: note.createdAt,
-      updatedAt: note.updatedAt
-    });
-  }
-
-  return thread;
-}
-
-type ConversationMessageWriteInput = {
-  threadId?: number;
-  role: ConversationMessageRecord["role"];
-  kind: ConversationMessageRecord["kind"];
-  content: string;
-  summary?: string | null;
-  linkedIssueNumber?: number | null;
-  linkedPrNumber?: number | null;
-  isOpenQuestion?: boolean;
-  workItemId?: number | null;
-  issueNumber?: number | null;
-  prNumber?: number | null;
-  decisionId?: number | null;
-  runId?: number | null;
-};
-
-async function appendConversationMessage(
-  session: ProjectSession,
-  input: ConversationMessageWriteInput
-): Promise<ConversationMessageRecord> {
-  const thread =
-    input.threadId !== undefined
-      ? mapConversationThreadRow(
-          assertPresent(
-            (
-              await session.db
-                .select()
-                .from(conversationThreadsTable)
-                .where(eq(conversationThreadsTable.id, input.threadId))
-                .limit(1)
-            )[0],
-            `Conversation thread ${input.threadId} was not found.`
-          )
-        )
-      : await ensureConversationThread(session);
-  const timestamp = nowIso();
-  const result = await session.db.insert(conversationMessagesTable).values({
-    threadId: thread.id,
-    projectId: session.project.id,
-    role: input.role,
-    kind: input.kind,
-    content: input.content,
-    summary: input.summary ?? summarizeText(input.content),
-    linkedIssueNumber: input.linkedIssueNumber ?? input.issueNumber ?? null,
-    linkedPrNumber: input.linkedPrNumber ?? input.prNumber ?? null,
-    isOpenQuestion: input.isOpenQuestion ?? input.kind === "cos_question",
-    workItemId: input.workItemId,
-    issueNumber: input.issueNumber,
-    prNumber: input.prNumber,
-    decisionId: input.decisionId,
-    runId: input.runId,
-    createdAt: timestamp,
-    updatedAt: timestamp
-  });
-
-  await session.db
-    .update(conversationThreadsTable)
-    .set({
-      updatedAt: timestamp
-    })
-    .where(eq(conversationThreadsTable.id, thread.id));
-
-  const row = await session.db
-    .select()
-    .from(conversationMessagesTable)
-    .where(eq(conversationMessagesTable.id, Number(result.lastInsertRowid)))
-    .limit(1);
-  return mapConversationMessageRow(assertPresent(row[0], "Conversation message missing after insert."));
-}
-
-async function getOpenHumanDecision(session: ProjectSession): Promise<DecisionRecord | null> {
-  const rows = await session.db
-    .select()
-    .from(decisionsTable)
-    .where(eq(decisionsTable.projectId, session.project.id));
-  return (
-    rows
-      .map(mapDecisionRow)
-      .filter((decision) => decision.status === "open" && decision.target === "human_director")
-      .sort((left, right) => left.createdAt.localeCompare(right.createdAt))
-      .at(0) ?? null
-  );
-}
-
-function formatQuestionContentFromDecision(decision: DecisionRecord): string {
-  const prompt =
-    decision.issueNumber !== null
-      ? `I need your direction on issue #${decision.issueNumber} before I resume the work.`
-      : decision.title.trim() || "I need your direction before I can continue.";
-
-  return formatHumanQuestionContent(prompt, decision.summary, decision.recommendation);
-}
-
-async function backfillOpenDecisionQuestions(session: ProjectSession): Promise<void> {
-  const thread = await ensureConversationThread(session);
-  const rows = await session.db
-    .select()
-    .from(decisionsTable)
-    .where(eq(decisionsTable.projectId, session.project.id));
-  const openHumanDecisions = rows
-    .map(mapDecisionRow)
-    .filter((decision) => decision.status === "open" && decision.target === "human_director")
-    .filter((decision) => decision.questionMessageId === null)
-    .sort((left, right) => left.createdAt.localeCompare(right.createdAt));
-
-  for (const decision of openHumanDecisions) {
-    const content = formatQuestionContentFromDecision(decision);
-    const questionMessage = await appendConversationMessage(session, {
-      threadId: thread.id,
-      role: "chief_of_staff",
-      kind: "cos_question",
-      content,
-      summary: summarizeText(content.split("\n\n")[0] ?? content),
-      linkedIssueNumber: decision.issueNumber ?? null,
-      linkedPrNumber: decision.prNumber ?? null,
-      isOpenQuestion: true,
-      workItemId: decision.workItemId ?? null,
-      issueNumber: decision.issueNumber ?? null,
-      prNumber: decision.prNumber ?? null,
-      decisionId: decision.id,
-      runId: decision.requestedByRunId ?? null
-    });
-
-    await session.db
-      .update(decisionsTable)
-      .set({
-        questionMessageId: questionMessage.id,
-        updatedAt: nowIso()
-      })
-      .where(eq(decisionsTable.id, decision.id));
-  }
-}
-
-async function getConversationQuestionMessage(
-  session: ProjectSession,
-  decision: DecisionRecord | null
-): Promise<ConversationMessageRecord | null> {
-  if (!decision?.questionMessageId) {
-    return null;
-  }
-
-  const rows = await session.db
-    .select()
-    .from(conversationMessagesTable)
-    .where(eq(conversationMessagesTable.id, decision.questionMessageId))
-    .limit(1);
-
-  return rows[0] ? mapConversationMessageRow(rows[0]) : null;
-}
-
-async function getConversationResponse(session: ProjectSession): Promise<ConversationResponse> {
-  const thread = await ensureConversationThread(session);
-  await backfillOpenDecisionQuestions(session);
-  const messageRows = await session.db
-    .select()
-    .from(conversationMessagesTable)
-    .where(eq(conversationMessagesTable.threadId, thread.id));
-  const messages = messageRows
-    .map(mapConversationMessageRow)
-    .sort((left, right) =>
-      left.createdAt === right.createdAt ? left.id - right.id : left.createdAt.localeCompare(right.createdAt)
-    );
-  const openDecision = await getOpenHumanDecision(session);
-  const openQuestion =
-    (await getConversationQuestionMessage(session, openDecision)) ??
-    messages.find((message) => message.isOpenQuestion && message.kind === "cos_question") ??
-    null;
-  let openQuestionRun: RunRecord | null = null;
-
-  if (openDecision?.requestedByRunId) {
-    const runRows = await session.db
-      .select()
-      .from(runsTable)
-      .where(eq(runsTable.id, openDecision.requestedByRunId))
-      .limit(1);
-    openQuestionRun = runRows[0] ? mapRunRow(runRows[0]) : null;
-  }
+  };
 
   return {
-    thread,
-    messages,
-    openQuestion,
-    openQuestionRun,
-    latestSummary: messages.at(-1)?.summary ?? null
+    ...router,
+    recentRuns: [...router.recentRuns, run].slice(-20)
   };
 }
 
-function formatResolutionMessage(decision: DecisionRecord, resolution: string): string {
-  const lines = [
-    `Resolution recorded for: ${decision.title}`,
-    resolution.trim(),
-    decision.recommendation ? `Chief of Staff recommendation: ${decision.recommendation}` : null,
-    decision.summary ? `Context: ${decision.summary}` : null
-  ].filter((line): line is string => Boolean(line && line.trim().length > 0));
-
-  return lines.join("\n");
+function applyChiefOfStaffTurn(
+  session: ProjectSession,
+  router: RouterState,
+  input: {
+    sessionId: string | null;
+    phase: string;
+    result: {
+      status: "ok" | "needs_input" | "failed";
+      summary: string;
+      recommended_next_action: string;
+      artifact_refs: string[];
+      blocking_questions: string[];
+      data?: Record<string, unknown> | null;
+      raw_model_output?: string | null;
+    };
+    issueNumber?: number | null;
+    prNumber?: number | null;
+  }
+): RouterState {
+  return recordRun(session, {
+    ...router,
+    chiefOfStaff: {
+      sessionId: input.sessionId ?? router.chiefOfStaff.sessionId,
+      lastSummary: input.result.summary,
+      updatedAt: nowIso()
+    }
+  }, {
+    workItemId: null,
+    issueNumber: input.issueNumber ?? null,
+    prNumber: input.prNumber ?? null,
+    role: "chief_of_staff",
+    status: mapAgentStatusToRunStatus(input.result.status),
+    phase: input.phase,
+    summary: input.result.summary,
+    recommendedNextAction: input.result.recommended_next_action,
+    artifacts: input.result.artifact_refs,
+    blockingQuestions: input.result.blocking_questions,
+    outputJson: input.result.data ?? null,
+    rawModelOutput: input.result.raw_model_output ?? null,
+    worktreePath: null
+  });
 }
 
-async function createDecision(
+function applyLaneTurn(
   session: ProjectSession,
-  input: Omit<DecisionRecord, "id" | "projectId" | "createdAt" | "updatedAt" | "status" | "resolution">
-): Promise<DecisionRecord> {
-  const timestamp = nowIso();
-  const result = await session.db.insert(decisionsTable).values({
-    projectId: session.project.id,
-    workItemId: input.workItemId,
+  router: RouterState,
+  lane: RouterLaneState,
+  input: {
+    sessionId: string | null;
+    phase: string;
+    result: {
+      status: "ok" | "needs_input" | "failed";
+      summary: string;
+      recommended_next_action: string;
+      artifact_refs: string[];
+      blocking_questions: string[];
+      data?: Record<string, unknown> | null;
+      raw_model_output?: string | null;
+    };
+    issueNumber: number;
+  }
+): RouterState {
+  lane.sessionId = input.sessionId ?? lane.sessionId;
+  lane.lastSummary = input.result.summary;
+  if (input.phase === "planning") {
+    lane.lastPlanSummary = input.result.summary;
+  }
+  lane.updatedAt = nowIso();
+
+  return recordRun(session, router, {
+    workItemId: null,
     issueNumber: input.issueNumber,
-    prNumber: input.prNumber,
-    requestedByRunId: input.requestedByRunId,
-    questionMessageId: input.questionMessageId,
-    resolutionMessageId: input.resolutionMessageId,
-    target: input.target,
-    title: input.title,
-    summary: input.summary,
-    recommendation: input.recommendation,
-    rationale: input.rationale,
-    status: "open",
-    resolution: null,
-    createdAt: timestamp,
-    updatedAt: timestamp
+    prNumber: null,
+    role: "lane_owner",
+    status: mapAgentStatusToRunStatus(input.result.status),
+    phase: input.phase,
+    summary: input.result.summary,
+    recommendedNextAction: input.result.recommended_next_action,
+    artifacts: input.result.artifact_refs,
+    blockingQuestions: input.result.blocking_questions,
+    outputJson: input.result.data ?? null,
+    rawModelOutput: input.result.raw_model_output ?? null,
+    worktreePath: null
   });
-
-  const row = await session.db
-    .select()
-    .from(decisionsTable)
-    .where(eq(decisionsTable.id, Number(result.lastInsertRowid)))
-    .limit(1);
-  return mapDecisionRow(assertPresent(row[0], "Decision row missing after insert."));
 }
 
-async function upsertPrCycle(
-  db: DirectorDatabase,
-  projectId: number,
-  input: Omit<PrCycleRecord, "id" | "projectId" | "createdAt" | "updatedAt">
-): Promise<PrCycleRecord> {
-  const rows = await db.select().from(prCyclesTable).where(eq(prCyclesTable.projectId, projectId));
-  const row = rows.find((candidate) => candidate.prNumber === input.prNumber);
-  const timestamp = nowIso();
-
-  if (row) {
-    await db
-      .update(prCyclesTable)
-      .set({
-        issueNumber: input.issueNumber,
-        status: input.status,
-        summary: input.summary,
-        automationWindowEndsAt: input.automationWindowEndsAt,
-        lastCheckedAt: input.lastCheckedAt,
-        lastHandledCommentAt: input.lastHandledCommentAt,
-        mergedAt: input.mergedAt,
-        updatedAt: timestamp
-      })
-      .where(eq(prCyclesTable.id, row.id));
-  } else {
-    await db.insert(prCyclesTable).values({
-      projectId,
-      issueNumber: input.issueNumber,
-      prNumber: input.prNumber,
-      status: input.status,
-      summary: input.summary,
-      automationWindowEndsAt: input.automationWindowEndsAt,
-      lastCheckedAt: input.lastCheckedAt,
-      lastHandledCommentAt: input.lastHandledCommentAt,
-      mergedAt: input.mergedAt,
-      createdAt: timestamp,
-      updatedAt: timestamp
-    });
-  }
-
-  const currentRows = await db.select().from(prCyclesTable).where(eq(prCyclesTable.projectId, projectId));
-  return mapPrCycleRow(
-    assertPresent(
-      currentRows.find((candidate) => candidate.prNumber === input.prNumber),
-      `PR cycle ${input.prNumber} is missing after upsert.`
-    )
-  );
-}
-
-async function ensureOrchestratorRow(session: ProjectSession): Promise<OrchestratorStatusRecord> {
-  const rows = await session.db
-    .select()
-    .from(orchestratorStateTable)
-    .where(eq(orchestratorStateTable.projectId, session.project.id))
-    .limit(1);
-  const existing = rows[0];
-
-  if (existing) {
-    return mapOrchestratorRow(existing);
-  }
-
-  const timestamp = nowIso();
-  await session.db.insert(orchestratorStateTable).values({
-    projectId: session.project.id,
-    status: "idle",
-    pauseReason: null,
-    activeRunIds: asJson([]),
-    lastLoopAt: null,
-    lastSummary: "Orchestrator has not started yet.",
-    createdAt: timestamp,
-    updatedAt: timestamp
-  });
-
-  const current = await session.db
-    .select()
-    .from(orchestratorStateTable)
-    .where(eq(orchestratorStateTable.projectId, session.project.id))
-    .limit(1);
-  return mapOrchestratorRow(assertPresent(current[0], "Orchestrator row missing after insert."));
-}
-
-async function syncOrchestratorActiveRuns(session: ProjectSession): Promise<void> {
-  const orchestrator = await ensureOrchestratorRow(session);
-  const runningRows = await session.db
-    .select()
-    .from(runsTable)
-    .where(eq(runsTable.projectId, session.project.id));
-  const activeRunIds = runningRows
-    .filter((candidate) => candidate.status === "running")
-    .map((candidate) => candidate.id);
-
-  await session.db
-    .update(orchestratorStateTable)
-    .set({
-      activeRunIds: asJson(activeRunIds),
-      updatedAt: nowIso()
-    })
-    .where(eq(orchestratorStateTable.id, orchestrator.id));
-}
-
-async function setOrchestratorState(
+function buildLanePrompt(
   session: ProjectSession,
-  status: OrchestratorStatus,
-  options: {
-    pauseReason?: string | null;
-    lastSummary?: string | null;
-    lastLoopAt?: string | null;
-  } = {}
-): Promise<OrchestratorStatusRecord> {
-  const current = await ensureOrchestratorRow(session);
-  await session.db
-    .update(orchestratorStateTable)
-    .set({
-      status,
-      pauseReason: options.pauseReason === undefined ? current.pauseReason : options.pauseReason,
-      lastSummary: options.lastSummary === undefined ? current.lastSummary : options.lastSummary,
-      lastLoopAt: options.lastLoopAt === undefined ? current.lastLoopAt : options.lastLoopAt,
-      updatedAt: nowIso()
-    })
-    .where(eq(orchestratorStateTable.id, current.id));
+  lane: RouterLaneState,
+  issue: GitHubIssueRecord,
+  handoff: RouterHandoffState
+): string {
+  const handoffSummary = handoff.summary?.trim() || "Chief of Staff routed this issue to your lane.";
+  const priorGuidance = parseDataString(handoff.details?.guidance) ?? null;
+  const humanGuidance = parseDataString(handoff.details?.human_guidance) ?? null;
 
-  const row = await session.db
-    .select()
-    .from(orchestratorStateTable)
-    .where(eq(orchestratorStateTable.id, current.id))
-    .limit(1);
-  return mapOrchestratorRow(assertPresent(row[0], "Orchestrator row missing after update."));
+  return [
+    "You are a persistent lane Codex session owned by the Chief of Staff in Director OS.",
+    "Stay within your lane context. Do not address the human directly. The Chief of Staff handles all human-facing communication.",
+    handoff.kind === "plan"
+      ? "Task: take ownership of this issue and produce a concise lane plan using Codex's native planning mindset."
+      : "Task: take ownership of this issue and produce a concise implementation handoff for the Chief of Staff.",
+    "Return structured output only.",
+    "If you are blocked on product or taste judgment, set `status` to `needs_input` and put the exact blocker in `blocking_questions`.",
+    "Use `data.transcript_reply` for the short update the Chief of Staff should relay back up.",
+    "",
+    `Lane: ${lane.name} (${lane.id})`,
+    `Issue: #${issue.number} ${issue.title}`,
+    "",
+    "Chief of Staff handoff:",
+    handoffSummary,
+    "",
+    "Issue body:",
+    issue.body.trim() || "No issue body provided.",
+    "",
+    "Recent CoS conversation:",
+    "Use the existing session context plus this explicit handoff. Focus on next-step routing, not generic analysis."
+  ]
+    .concat(
+      priorGuidance ? ["", "Chief of Staff guidance:", priorGuidance] : [],
+      humanGuidance ? ["", "Human guidance:", humanGuidance] : [],
+      lane.lastPlanSummary ? ["", "Existing lane plan summary:", lane.lastPlanSummary] : [],
+      lane.lastSummary ? ["", "Latest lane summary:", lane.lastSummary] : []
+    )
+    .join("\n");
 }
 
-async function getOpenPullRequests(
-  session: ProjectSession
-): Promise<GitHubPullRequestRecord[]> {
-  const rows = await session.db
-    .select()
-    .from(githubPullRequestsTable)
-    .where(eq(githubPullRequestsTable.projectId, session.project.id));
-  return rows
-    .map(mapGitHubPullRequestRow)
-    .filter((pullRequest) => pullRequest.state.toLowerCase() === "open");
-}
-
-async function seedWorkItemsFromGitHub(session: ProjectSession): Promise<void> {
-  const issueRows = await session.db
-    .select()
-    .from(githubIssuesTable)
-    .where(eq(githubIssuesTable.projectId, session.project.id));
-  const issues = issueRows.map(mapGitHubIssueRow);
-  const pullRequests = await getOpenPullRequests(session);
-  const existingRows = await session.db
-    .select()
-    .from(workItemsTable)
-    .where(eq(workItemsTable.projectId, session.project.id));
-  const existingMap = new Map(existingRows.map((row) => [row.issueNumber, mapWorkItemRow(row)]));
-
-  for (const issue of issues) {
-    const linkedPr =
-      pullRequests.find((pullRequest) => pullRequest.linkedIssueNumbers.includes(issue.number)) ?? null;
-    const existing = existingMap.get(issue.number) ?? null;
-    const kind = existing?.kind ?? inferWorkItemKind(issue);
-    const executionMode = existing?.executionMode ?? inferExecutionMode(kind, issue);
-    const status = inferWorkItemStatus(issue, existing, linkedPr);
-    await upsertWorkItem(session.db, session.project.id, {
-      issueNumber: issue.number,
-      parentIssueNumber: existing?.parentIssueNumber ?? null,
-      title: issue.title,
-      summary: summarizeText(issue.body || issue.title),
-      kind,
-      executionMode,
-      ownerRole: executionMode === "lane" ? "lane_owner" : "worker",
-      status,
-      priorityBucket: inferPriorityBucket(status),
-      activeRunId: existing?.activeRunId ?? null,
-      activePrNumber: linkedPr?.number ?? null,
-      lastSummary: existing?.lastSummary ?? null
-    });
-  }
-
-  await refreshWorkstreamStatuses(session);
-}
-
-async function refreshWorkstreamStatuses(session: ProjectSession): Promise<void> {
-  const rows = await session.db
-    .select()
-    .from(workItemsTable)
-    .where(eq(workItemsTable.projectId, session.project.id));
-  const workItems = rows.map(mapWorkItemRow);
-  const parents = workItems.filter((workItem) => workItem.kind === "workstream");
-
-  for (const parent of parents) {
-    const children = workItems.filter((workItem) => workItem.parentIssueNumber === parent.issueNumber);
-    if (!children.length) {
-      continue;
-    }
-
-    let status: WorkItemStatus = "running";
-    if (children.every((child) => child.status === "completed")) {
-      status = "completed";
-    } else if (children.some((child) => child.status === "waiting_decision")) {
-      status = "waiting_decision";
-    } else if (children.some((child) => child.status === "blocked")) {
-      status = "blocked";
-    }
-
-    await upsertWorkItem(session.db, session.project.id, {
-      issueNumber: parent.issueNumber,
-      parentIssueNumber: parent.parentIssueNumber,
-      title: parent.title,
-      summary: parent.summary,
-      kind: parent.kind,
-      executionMode: parent.executionMode,
-      ownerRole: parent.ownerRole,
-      status,
-      priorityBucket: inferPriorityBucket(status),
-      activeRunId: parent.activeRunId,
-      activePrNumber: parent.activePrNumber,
-      lastSummary: parent.lastSummary
-    });
-  }
-}
-
-async function syncPrCyclesFromGitHub(session: ProjectSession): Promise<void> {
-  const pullRequests = await getOpenPullRequests(session);
-  const workItems = (
-    await session.db
-      .select()
-      .from(workItemsTable)
-      .where(eq(workItemsTable.projectId, session.project.id))
-  ).map(mapWorkItemRow);
-  const activePrNumbers = new Set<number>();
-
-  for (const pullRequest of pullRequests) {
-    const issueNumber = pullRequest.linkedIssueNumbers[0];
-    if (!issueNumber) {
-      continue;
-    }
-    activePrNumbers.add(pullRequest.number);
-    const existingWorkItem = workItems.find((candidate) => candidate.issueNumber === issueNumber);
-    if (existingWorkItem) {
-      await upsertWorkItem(session.db, session.project.id, {
-        issueNumber: existingWorkItem.issueNumber,
-        parentIssueNumber: existingWorkItem.parentIssueNumber,
-        title: existingWorkItem.title,
-        summary: existingWorkItem.summary,
-        kind: existingWorkItem.kind,
-        executionMode: existingWorkItem.executionMode,
-        ownerRole: existingWorkItem.ownerRole,
-        status: "waiting_review",
-        priorityBucket: inferPriorityBucket("waiting_review"),
-        activeRunId: existingWorkItem.activeRunId,
-        activePrNumber: pullRequest.number,
-        lastSummary: existingWorkItem.lastSummary
-      });
-    }
-
-    const cycleRows = await session.db
-      .select()
-      .from(prCyclesTable)
-      .where(eq(prCyclesTable.projectId, session.project.id));
-    const existingCycle = cycleRows.find((candidate) => candidate.prNumber === pullRequest.number);
-    const existingCycleStatus = existingCycle
-      ? (existingCycle.status as PrCycleRecord["status"])
-      : null;
-    await upsertPrCycle(session.db, session.project.id, {
-      issueNumber,
-      prNumber: pullRequest.number,
-      status: pullRequest.checksBucket === "pass" ? "cos_review" : existingCycleStatus ?? "opened",
-      summary: summarizeText(pullRequest.title),
-      automationWindowEndsAt: existingCycle?.automationWindowEndsAt ?? null,
-      lastCheckedAt: existingCycle?.lastCheckedAt ?? null,
-      lastHandledCommentAt: existingCycle?.lastHandledCommentAt ?? null,
-      mergedAt: existingCycle?.mergedAt ?? null
-    });
-  }
-
-  const cycleRows = await session.db
-    .select()
-    .from(prCyclesTable)
-    .where(eq(prCyclesTable.projectId, session.project.id));
-  for (const cycle of cycleRows) {
-    if (!activePrNumbers.has(cycle.prNumber) && cycle.status !== "merged") {
-      await upsertPrCycle(session.db, session.project.id, {
-        issueNumber: cycle.issueNumber,
-        prNumber: cycle.prNumber,
-        status: cycle.mergedAt ? "merged" : "blocked",
-        summary: cycle.summary,
-        automationWindowEndsAt: cycle.automationWindowEndsAt,
-        lastCheckedAt: cycle.lastCheckedAt,
-        lastHandledCommentAt: cycle.lastHandledCommentAt,
-        mergedAt: cycle.mergedAt
-      });
-    }
-  }
+function blockedQuestionForLane(
+  issue: GitHubIssueRecord,
+  summary: string,
+  blockingQuestion: string,
+  recommendation: string | null
+): Omit<RouterQuestionState, "id" | "createdAt" | "updatedAt"> {
+  return {
+    title: `Chief of Staff question for #${issue.number}`,
+    summary,
+    question: blockingQuestion,
+    whyItMatters: summary,
+    recommendation:
+      recommendation ?? "Reply here with the decision you want me to take so I can resume the lane.",
+    issueNumber: issue.number,
+    prNumber: null,
+    runId: null,
+    requestedBy: "lane"
+  };
 }
 
 async function syncProjectInternal(session: ProjectSession): Promise<DirectorOperationResponse> {
@@ -1835,1626 +1275,624 @@ async function syncProjectInternal(session: ProjectSession): Promise<DirectorOpe
     listComments(session.project.repoSlug)
   ]);
 
-  for (const issue of issues) {
-    await upsertGitHubIssueMirror(session.db, session.project.id, {
-      number: issue.number,
-      title: issue.title,
-      body: issue.body,
-      state: issue.state,
-      workflowState: inferWorkflowState(issue.labels, issue.state),
-      labels: issue.labels,
-      url: issue.url,
-      updatedAt: issue.updatedAt,
-      syncedAt: nowIso()
-    });
-  }
+  const syncedAt = nowIso();
+  const cache: GitHubCacheState = {
+    version: 1,
+    syncedAt,
+    issues,
+    pullRequests,
+    comments
+  };
+  await saveGitHubCacheState(session.paths, cache, session.project.slug);
 
-  for (const pullRequest of pullRequests) {
-    await upsertGitHubPullRequestMirror(session.db, session.project.id, {
-      number: pullRequest.number,
-      title: pullRequest.title,
-      body: pullRequest.body,
-      state: pullRequest.state.toLowerCase(),
-      isDraft: pullRequest.isDraft,
-      reviewDecision: pullRequest.reviewDecision,
-      checksBucket: pullRequest.checksBucket,
-      headRefName: pullRequest.headRefName,
-      baseRefName: pullRequest.baseRefName,
-      url: pullRequest.url,
-      linkedIssueNumbers: pullRequest.linkedIssueNumbers,
-      updatedAt: pullRequest.updatedAt,
-      syncedAt: nowIso()
-    });
-  }
-
-  for (const comment of comments) {
-    await upsertGitHubCommentMirror(session.db, session.project.id, {
-      githubId: comment.githubId,
-      parentType: comment.parentType,
-      parentNumber: comment.parentNumber,
-      author: comment.author,
-      body: comment.body,
-      url: comment.url,
-      createdAt: comment.createdAt,
-      updatedAt: comment.updatedAt,
-      syncedAt: nowIso()
-    });
-  }
-
-  await seedWorkItemsFromGitHub(session);
-  await syncPrCyclesFromGitHub(session);
-  await recordEvent(session.db, session.project.id, "github.synced", {
-    issues: issues.length,
-    pullRequests: pullRequests.length,
-    comments: comments.length
-  });
+  const router = await loadRouterState(session.paths, session.project.slug);
+  const nextRouter = {
+    ...router,
+    lastSyncAt: syncedAt,
+    orchestrator: {
+      ...router.orchestrator,
+      lastSummary: `Synced ${issues.length} issues and ${pullRequests.length} pull requests.`,
+      lastLoopAt: syncedAt
+    }
+  };
+  await saveRouterState(session.paths, nextRouter);
 
   return {
     ok: true,
-    issues: issues.length,
-    pullRequests: pullRequests.length,
-    comments: comments.length
+    message: `Synced ${issues.length} issues and ${pullRequests.length} pull requests.`,
+    syncedAt,
+    issueCount: issues.length,
+    pullRequestCount: pullRequests.length
   };
 }
 
-function parseDataNumber(value: unknown): number | null {
-  return typeof value === "number" && Number.isFinite(value) ? value : null;
-}
-
-function parseDataString(value: unknown): string | null {
-  return typeof value === "string" && value.trim() ? value.trim() : null;
-}
-
-function parseDataArray(value: unknown): Array<Record<string, unknown>> {
-  return Array.isArray(value)
-    ? value.filter((candidate): candidate is Record<string, unknown> => Boolean(candidate) && typeof candidate === "object")
-    : [];
-}
-
-function guidancePromptSuffix(value: string | null): string | undefined {
-  if (!value) {
-    return undefined;
-  }
-
-  if (
-    value.startsWith("Decision resolved:") ||
-    value.startsWith("Chief of Staff guidance:") ||
-    value.startsWith("Human guidance:")
-  ) {
-    return value;
-  }
-
-  return undefined;
-}
-
-async function recentConversationPrompt(session: ProjectSession, limit = 10): Promise<string> {
-  const thread = await ensureConversationThread(session);
-  const rows = await session.db
-    .select()
-    .from(conversationMessagesTable)
-    .where(eq(conversationMessagesTable.threadId, thread.id));
-  const messages = rows
-    .map(mapConversationMessageRow)
-    .sort((left, right) =>
-      left.createdAt === right.createdAt ? left.id - right.id : left.createdAt.localeCompare(right.createdAt)
-    )
-    .slice(-limit);
-
-  if (!messages.length) {
-    return "No prior conversation.";
-  }
-
-  return messages
-    .map((message) => `[${message.role}/${message.kind}] ${message.content}`)
-    .join("\n");
-}
-
-async function createHumanQuestionDecision(
-  session: ProjectSession,
-  input: {
-    workItem: WorkItemRecord | null;
-    prNumber: number | null;
-    runId: number | null;
-    title: string;
-    summary: string;
-    question: string;
-    recommendation: string;
-    rationale: string;
-  }
-): Promise<DecisionRecord> {
-  const questionContent = formatHumanQuestionContent(
-    input.question,
-    input.summary,
-    input.recommendation
-  );
-  const questionMessage = await appendConversationMessage(session, {
-    role: "chief_of_staff",
-    kind: "cos_question",
-    content: questionContent,
-    summary: summarizeText(input.question),
-    linkedIssueNumber: input.workItem?.issueNumber ?? null,
-    linkedPrNumber: input.prNumber,
-    isOpenQuestion: true,
-    workItemId: input.workItem?.id ?? null,
-    issueNumber: input.workItem?.issueNumber ?? null,
-    prNumber: input.prNumber,
-    decisionId: null,
-    runId: input.runId
-  });
-
-  const decision = await createDecision(session, {
-    workItemId: input.workItem?.id ?? null,
-    issueNumber: input.workItem?.issueNumber ?? null,
-    prNumber: input.prNumber,
-    requestedByRunId: input.runId,
-    questionMessageId: questionMessage.id,
-    resolutionMessageId: null,
-    target: "human_director",
-    title: input.title,
-    summary: input.summary,
-    recommendation: input.recommendation,
-    rationale: input.rationale
-  });
-
-  await session.db
-    .update(conversationMessagesTable)
-    .set({
-      decisionId: decision.id,
-      isOpenQuestion: true,
-      updatedAt: nowIso()
-    })
-    .where(eq(conversationMessagesTable.id, questionMessage.id));
-
-  return decision;
-}
-
-async function mediateAgentBlock(
-  session: ProjectSession,
-  input: {
-    workItem: WorkItemRecord;
-    runId: number;
-    prNumber: number | null;
-    source: "lane_owner" | "worker";
-    summary: string;
-    recommendedNextAction: string;
-    blockingQuestions: string[];
-    artifacts: string[];
-    outputJson: Record<string, unknown> | null;
-    rawModelOutput: string | null;
-    allowInternalResolution: boolean;
-  }
-): Promise<
-  | { kind: "resume"; guidance: string; transcript: string }
-  | { kind: "ask_human"; decision: DecisionRecord }
-> {
-  const fallbackQuestion =
-    input.blockingQuestions[0] ??
-    `What decision should I take to keep issue #${input.workItem.issueNumber} moving?`;
-
-  if (!input.allowInternalResolution) {
-    const decision = await createHumanQuestionDecision(session, {
-      workItem: input.workItem,
-      prNumber: input.prNumber,
-      runId: input.runId,
-      title: `Chief of Staff question for #${input.workItem.issueNumber}`,
-      summary: input.summary,
-      question: fallbackQuestion,
-      recommendation: input.recommendedNextAction || "Reply with the direction you want me to take.",
-      rationale:
-        input.blockingQuestions.join("\n") ||
-        `${input.source} could not proceed safely without human product judgment.`
-    });
-    return {
-      kind: "ask_human",
-      decision
-    };
-  }
-
-  const result = await runCodexAgent(
+async function runCoSChatReply(session: ProjectSession, content: string): Promise<CoSChatReply> {
+  const prompt = buildChiefOfStaffPrompt(COS_TASK_APPENDICES.replyInChat, [
     {
-      role: "chief_of_staff",
-      cwd: session.project.repoPath,
-      model: session.project.model,
-      allowWrite: false,
-      prompt: buildChiefOfStaffPrompt(COS_TASK_APPENDICES.mediateBlocker, [
-        {
-          title: "Blocked run",
-          content: `A ${input.source.replace("_", " ")} is blocked on issue #${input.workItem.issueNumber}: ${input.workItem.title}.`
-        },
-        {
-          title: "Run summary",
-          content: input.summary
-        },
-        {
-          title: "Recommended next action",
-          content: input.recommendedNextAction
-        },
-        {
-          title: "Blocking questions",
-          content: input.blockingQuestions.length
-            ? input.blockingQuestions.map((question) => `- ${question}`).join("\n")
-            : "- No explicit blocking question was returned. Infer the real question from the run output."
-        },
-        {
-          title: "Structured run output",
-          content: input.outputJson ? JSON.stringify(input.outputJson, null, 2) : "No structured payload was stored."
-        },
-        {
-          title: "Raw Codex output",
-          content: truncatePromptSection(input.rawModelOutput, 12_000) ?? "No raw Codex output was stored."
-        },
-        {
-          title: "Artifacts",
-          content: input.artifacts.length ? input.artifacts.map((artifact) => `- ${artifact}`).join("\n") : "No artifacts were recorded."
-        },
-        {
-          title: "Recent project conversation",
-          content: await recentConversationPrompt(session)
-        }
-      ])
-    },
-    {
-      status: "ok",
-      summary: input.summary,
-      recommended_next_action: input.recommendedNextAction,
-      artifact_refs: [],
-      blocking_questions: [],
-      data: {
-        outcome: "ask_human",
-        question: fallbackQuestion,
-        why_it_matters: input.summary,
-        recommendation: input.recommendedNextAction
-      },
-      raw_model_output: input.rawModelOutput
-    }
-  );
-
-  const outcome = parseDataString(result.data?.outcome);
-  if (outcome === "answer_worker") {
-    return {
-      kind: "resume",
-      guidance:
-        parseDataString(result.data?.guidance) ??
-        (input.blockingQuestions.join("\n") || input.recommendedNextAction),
-      transcript:
-        parseDataString(result.data?.transcript_reply) ??
-        `I answered the blocker for #${input.workItem.issueNumber} internally and resumed the work.`
-    };
-  }
-
-  if (outcome === "reroute") {
-    const guidance =
-      parseDataString(result.data?.guidance) ??
-      parseDataString(result.data?.recommendation) ??
-      input.recommendedNextAction;
-
-    return {
-      kind: "resume",
-      guidance,
-      transcript:
-        parseDataString(result.data?.transcript_reply) ??
-        `I re-scoped issue #${input.workItem.issueNumber} and sent the run back out with narrower guidance.`
-    };
-  }
-
-  const decision = await createHumanQuestionDecision(session, {
-    workItem: input.workItem,
-    prNumber: input.prNumber,
-    runId: input.runId,
-    title: `Chief of Staff question for #${input.workItem.issueNumber}`,
-    summary: parseDataString(result.data?.why_it_matters) ?? input.summary,
-    question:
-      parseDataString(result.data?.question) ??
-      fallbackQuestion,
-    recommendation:
-      parseDataString(result.data?.recommendation) ??
-      (input.recommendedNextAction || "Reply with the direction you want me to take."),
-    rationale:
-      input.blockingQuestions.join("\n") ||
-      result.summary ||
-      `${input.source} could not proceed safely without human product judgment.`
-  });
-  return {
-    kind: "ask_human",
-    decision
-  };
-}
-
-async function appendCoSStatusUpdate(
-  session: ProjectSession,
-  input: {
-    content: string;
-    workItem: WorkItemRecord | null;
-    prNumber?: number | null;
-    runId?: number | null;
-    kind?: ConversationMessageRecord["kind"];
-  }
-): Promise<void> {
-  await appendConversationMessage(session, {
-    role: "chief_of_staff",
-    kind: input.kind ?? "status_update",
-    content: input.content,
-    summary: summarizeText(input.content),
-    workItemId: input.workItem?.id ?? null,
-    issueNumber: input.workItem?.issueNumber ?? null,
-    prNumber: input.prNumber ?? null,
-    decisionId: null,
-    runId: input.runId ?? null
-  });
-}
-
-
-async function chooseNextWorkItem(session: ProjectSession): Promise<WorkItemRecord | null> {
-  const workItems = (
-    await session.db
-      .select()
-      .from(workItemsTable)
-      .where(eq(workItemsTable.projectId, session.project.id))
-  )
-    .map(mapWorkItemRow)
-    .filter((workItem) =>
-      ["queued", "ready"].includes(workItem.status) &&
-      workItem.activePrNumber === null &&
-      workItem.activeRunId === null
-    )
-    .sort((left, right) =>
-      left.priorityBucket === right.priorityBucket
-        ? left.issueNumber - right.issueNumber
-        : left.priorityBucket - right.priorityBucket
-    );
-
-  if (!workItems.length) {
-    return null;
-  }
-
-  const fallbackWorkItem = assertPresent(
-    workItems[0],
-    "At least one queued work item should exist before selection."
-  );
-
-  if (workItems.length === 1) {
-    return fallbackWorkItem;
-  }
-
-  const prompt = buildChiefOfStaffPrompt(COS_TASK_APPENDICES.chooseNextIssue, [
-    {
-      title: "Selection guidance",
-      content:
-        "Prefer explicitly ready issues first. Pick the smallest high-leverage slice that can move cleanly toward a real PR."
-    },
-    {
-      title: "Recent project conversation",
+      title: "Recent conversation",
       content: await recentConversationPrompt(session)
     },
     {
-      title: "Candidates",
-      content: workItems
-        .slice(0, 8)
-        .map((workItem) =>
-          `- #${workItem.issueNumber} (${workItem.status}): ${workItem.title}\n  Summary: ${workItem.summary}`
-        )
-        .join("\n")
+      title: "Latest director message",
+      content
     }
   ]);
 
-  const result = await runCodexAgent(
+  const router = await loadRouterState(session.paths, session.project.slug);
+  const turn = await runCodexSessionAgent(
     {
       role: "chief_of_staff",
       cwd: session.project.repoPath,
       model: session.project.model,
       allowWrite: false,
-      prompt
+      prompt,
+      sessionId: router.chiefOfStaff.sessionId
     },
     {
       status: "ok",
-      summary: `Selected issue #${fallbackWorkItem.issueNumber} by fallback ordering.`,
-      recommended_next_action: "Dispatch the first locally ready or queued issue.",
+      summary: "Noted. I’ll use that direction to steer prioritization and execution.",
+      recommended_next_action: "Continue routing work through the Chief of Staff.",
       artifact_refs: [],
       blocking_questions: [],
       data: {
-        selected_issue_number: fallbackWorkItem.issueNumber,
-        execution_intent: fallbackWorkItem.executionMode === "lane" ? "plan" : "implement",
-        rationale: "Fallback ordering selected the first available issue."
+        kind: "cos_reply",
+        reply: "Noted. I’ll use that direction to steer prioritization and execution."
       }
     }
   );
 
-  const selection = parseDataNumber(result.data?.selected_issue_number) ?? fallbackWorkItem.issueNumber;
-  const chosen = workItems.find((candidate) => candidate.issueNumber === selection) ?? fallbackWorkItem;
-  const executionIntent = parseDataString(result.data?.execution_intent);
-  const rationale = parseDataString(result.data?.rationale) ?? result.summary;
-  const shouldPlan =
-    executionIntent === "plan" ||
-    chosen.executionMode === "lane" ||
-    chosen.kind === "workstream";
-  const nextStatus = shouldPlan ? "planning" : "ready";
-  return upsertWorkItem(session.db, session.project.id, {
-    issueNumber: chosen.issueNumber,
-    parentIssueNumber: chosen.parentIssueNumber,
-    title: chosen.title,
-    summary: chosen.summary,
-    kind: shouldPlan ? "workstream" : chosen.kind,
-    executionMode: shouldPlan ? "lane" : "worker",
-    ownerRole: shouldPlan ? "lane_owner" : "worker",
-    status: nextStatus,
-    priorityBucket: inferPriorityBucket(nextStatus),
-    activeRunId: chosen.activeRunId,
-    activePrNumber: chosen.activePrNumber,
-    lastSummary: rationale
+  const nextRouter = applyChiefOfStaffTurn(session, router, {
+    sessionId: turn.sessionId,
+    phase: "chat",
+    result: turn.result
   });
+  await saveRouterState(session.paths, nextRouter);
+  const run = assertPresent(nextRouter.recentRuns.at(-1), "Recent run was not recorded.");
+
+  const data = turn.result.data ?? undefined;
+  return {
+    kind: parseDataString(data?.kind) === "cos_question" ? "cos_question" : "cos_reply",
+    reply: parseDataString(data?.reply) ?? turn.result.summary,
+    question: parseDataString(data?.question) ?? null,
+    recommendation: parseDataString(data?.recommendation) ?? null,
+    rationale: parseDataString(data?.rationale) ?? null,
+    run
+  };
 }
 
-async function createIssuesFromPlan(
+async function resolveOpenQuestion(
   session: ProjectSession,
-  parentIssueNumber: number,
-  items: Array<Record<string, unknown>>,
-  executionMode: ExecutionMode
-): Promise<number[]> {
-  const created: number[] = [];
-
-  for (const item of items.slice(0, 5)) {
-    const title = parseDataString(item.title);
-    const body = parseDataString(item.body);
-    if (!title || !body) {
-      continue;
+  router: RouterState,
+  resolution: string
+): Promise<HumanQuestionRecord> {
+  const question = assertPresent(router.openQuestion, "No open question exists.");
+  const nextRouter: RouterState = {
+    ...router,
+    openQuestion: null,
+    orchestrator: {
+      ...router.orchestrator,
+      lastSummary: "Human guidance received."
     }
+  };
 
-    const issue = await createIssue(session.project.repoSlug, {
-      title,
-      body: `${body}\n\nParent workstream: #${parentIssueNumber}`,
-      labels: [labelFor("task"), labelFor("ready"), labelFor(executionMode === "lane" ? "lane" : "worker")]
-    });
+  if (question.issueNumber !== null) {
+    const blockedHandoff =
+      [...nextRouter.pendingHandoffs]
+        .reverse()
+        .find(
+          (handoff) => handoff.issueNumber === question.issueNumber && handoff.status === "blocked"
+        ) ?? null;
 
-    created.push(issue.number);
-    await upsertWorkItem(session.db, session.project.id, {
-      issueNumber: issue.number,
-      parentIssueNumber,
-      title,
-      summary: summarizeText(body),
-      kind: "task",
-      executionMode,
-      ownerRole: executionMode === "lane" ? "lane_owner" : "worker",
-      status: "ready",
-      priorityBucket: inferPriorityBucket("ready"),
-      activeRunId: null,
-      activePrNumber: null,
-      lastSummary: `Spawned from lane plan for #${parentIssueNumber}.`
-    });
+    if (blockedHandoff) {
+      blockedHandoff.status = "pending";
+      blockedHandoff.summary = `Human guidance: ${summarizeText(resolution)}`;
+      blockedHandoff.details = {
+        ...(blockedHandoff.details ?? {}),
+        human_guidance: resolution
+      };
+      blockedHandoff.updatedAt = nowIso();
+
+      const lane = findLaneById(nextRouter, blockedHandoff.laneId);
+      if (lane) {
+        lane.status =
+          blockedHandoff.kind === "plan"
+            ? "planning"
+            : blockedHandoff.kind === "review"
+              ? "waiting_review"
+              : "implementing";
+        lane.lastSummary = `Human guidance received for #${question.issueNumber}.`;
+        lane.updatedAt = nowIso();
+      }
+    }
   }
 
-  return created;
+  await saveRouterState(session.paths, recordRun(session, nextRouter, {
+      workItemId: null,
+      issueNumber: question.issueNumber,
+      prNumber: question.prNumber,
+      role: "chief_of_staff",
+      status: "succeeded",
+      phase: "question_resolution",
+      summary: "Human guidance received.",
+      recommendedNextAction: "Resume the router loop.",
+      artifacts: [],
+      blockingQuestions: [],
+      outputJson: {
+        resolution
+      },
+      rawModelOutput: null,
+      worktreePath: null
+    }));
+
+  await appendConversationMessage(session, {
+    role: "chief_of_staff",
+    kind: "resolution",
+    content: formatResolutionMessage(question, resolution),
+    summary: summarizeText(resolution),
+    linkedIssueNumber: question.issueNumber,
+    linkedPrNumber: question.prNumber,
+    linkedPullRequestNumber: question.prNumber,
+    isOpenQuestion: false
+  });
+
+  return toHumanQuestionRecord(question);
 }
 
-async function maybeExpandNotesIntoIssues(session: ProjectSession): Promise<boolean> {
-  const notes = (
-    await session.db
-      .select()
-      .from(directorNotesTable)
-      .where(eq(directorNotesTable.projectId, session.project.id))
-  )
-    .map(mapNoteRow)
-    .filter((note) => note.status === "active");
+async function chooseNextIssue(session: ProjectSession): Promise<void> {
+  const [router, cache] = await Promise.all([
+    loadRouterState(session.paths, session.project.slug),
+    loadGitHubCacheState(session.paths, session.project.slug)
+  ]);
 
-  if (!notes.length) {
-    return false;
+  if (router.openQuestion) {
+    await saveRouterState(session.paths, {
+      ...router,
+      orchestrator: {
+        ...router.orchestrator,
+        lastLoopAt: nowIso(),
+        lastSummary: "Waiting for the open Chief of Staff question to be resolved."
+      }
+    });
+    return;
   }
 
-  const primaryNote = assertPresent(notes[0], "At least one active director note is required.");
+  const issues = cache.issues
+    .map((issue) => mapRemoteIssue(session.project, issue))
+    .filter((issue) => issue.state.toLowerCase() === "open")
+    .filter((issue) => issue.workflowState === "ready" || issue.workflowState === "queued")
+    .filter((issue) => !hasPendingLaneWork(router, issue.number));
 
-  const prompt = buildChiefOfStaffPrompt(
-    [
-      "Task: the backlog is empty. Turn the director's most recent note into 1 to 3 concrete GitHub issues.",
-      "Return them in `data.new_issues` as objects with `title`, `body`, `kind`, and `execution_mode`.",
-      "Only create issues that are bounded enough to enter the queue immediately."
-    ].join("\n"),
-    [
-      {
-        title: "Active notes",
-        content: notes
-          .slice(0, 3)
-          .map((note) => `- ${note.content}`)
-          .join("\n")
+  if (!issues.length) {
+    await saveRouterState(session.paths, {
+      ...router,
+      orchestrator: {
+        ...router.orchestrator,
+        lastLoopAt: nowIso(),
+        lastSummary: "No unassigned ready GitHub issues are available right now."
       }
-    ]
-  );
+    });
+    return;
+  }
 
-  const result = await runCodexAgent(
+  const fallbackIssue = assertPresent(issues[0], "No queueable issue is available.");
+  const fallbackLane = defaultLaneForIssue(fallbackIssue);
+  const fallbackIntent = defaultExecutionIntentForIssue(fallbackIssue);
+
+  const prompt = buildChiefOfStaffPrompt(COS_TASK_APPENDICES.chooseNextIssue, [
+    {
+      title: "Existing lanes",
+      content:
+        router.lanes.length > 0
+          ? router.lanes
+              .map((lane) => `- ${lane.name} (${lane.id}): ${lane.issueNumbers.join(", ") || "no issues"}`)
+              .join("\n")
+          : "No lane sessions exist yet."
+    },
+    {
+      title: "Open issues",
+      content: truncatePromptSection(
+        issues.map((issue) => `#${issue.number} [${issue.workflowState}] ${issue.title}`).join("\n")
+      )
+    }
+  ]);
+
+  const turn = await runCodexSessionAgent(
     {
       role: "chief_of_staff",
       cwd: session.project.repoPath,
       model: session.project.model,
       allowWrite: false,
-      prompt
+      prompt,
+      sessionId: router.chiefOfStaff.sessionId
     },
     {
-      status: "needs_input",
-      summary: "No expansion issues were proposed.",
-      recommended_next_action: "Ask the director for a more concrete note.",
+      status: "ok",
+      summary: `Selected issue #${fallbackIssue.number} as the next ready slice.`,
+      recommended_next_action: "Route the issue into a lane or bounded implementation session.",
       artifact_refs: [],
-      blocking_questions: []
+      blocking_questions: [],
+      data: {
+        selected_issue_number: fallbackIssue.number,
+        execution_intent: fallbackIntent,
+        lane_id: fallbackLane.id,
+        lane_name: fallbackLane.name
+      }
     }
   );
 
-  const items = parseDataArray(result.data?.new_issues);
-  if (!items.length) {
+  const selectedIssueNumber = parseDataNumber(turn.result.data?.selected_issue_number) ?? fallbackIssue.number;
+  const selectedIssue =
+    issues.find((issue) => issue.number === selectedIssueNumber) ?? fallbackIssue;
+  const laneFallback = defaultLaneForIssue(selectedIssue);
+  const laneId = slugify(parseDataString(turn.result.data?.lane_id) ?? laneFallback.id);
+  const laneName = parseDataString(turn.result.data?.lane_name) ?? laneFallback.name;
+  const executionIntent =
+    parseDataString(turn.result.data?.execution_intent) === "plan"
+      ? "plan"
+      : defaultExecutionIntentForIssue(selectedIssue);
+
+  const nextRouter = applyChiefOfStaffTurn(session, router, {
+    sessionId: turn.sessionId,
+    phase: "queue_review",
+    result: turn.result,
+    issueNumber: selectedIssue.number
+  });
+  const lane = ensureLane(nextRouter, laneId, laneName);
+  if (!lane.issueNumbers.includes(selectedIssue.number)) {
+    lane.issueNumbers.push(selectedIssue.number);
+  }
+  lane.currentIssueNumber = selectedIssue.number;
+  lane.status = executionIntent === "plan" ? "planning" : "implementing";
+  lane.updatedAt = nowIso();
+  nextRouter.issueOwnership[String(selectedIssue.number)] = lane.id;
+  enqueueHandoff(nextRouter, {
+    laneId: lane.id,
+    issueNumber: selectedIssue.number,
+    kind: executionIntent,
+    status: "pending",
+    summary:
+      parseDataString(turn.result.data?.transcript_reply) ??
+      `Chief of Staff routed issue #${selectedIssue.number} to lane ${lane.name}.`,
+    prNumber: null,
+    branchName: null,
+    worktreePath: null,
+    reviewWindowEndsAt: null,
+    lastHandledCommentAt: null,
+    details:
+      parseDataString(turn.result.data?.guidance) !== null
+        ? {
+            guidance: parseDataString(turn.result.data?.guidance)
+          }
+        : null
+  });
+  nextRouter.orchestrator = {
+    ...nextRouter.orchestrator,
+    lastLoopAt: nowIso(),
+    lastSummary: `Routed issue #${selectedIssue.number} to lane ${lane.name} for ${executionIntent}.`
+  };
+
+  await saveRouterState(session.paths, nextRouter);
+  await appendConversationMessage(session, {
+    role: "chief_of_staff",
+    kind: "status_update",
+    content: `I routed issue #${selectedIssue.number} to lane ${lane.name} for ${executionIntent}.`,
+    summary: `Routed #${selectedIssue.number} to ${lane.name}`,
+    linkedIssueNumber: selectedIssue.number,
+    linkedPrNumber: null,
+    linkedPullRequestNumber: null,
+    isOpenQuestion: false
+  });
+}
+
+async function mediateLaneBlocker(
+  session: ProjectSession,
+  router: RouterState,
+  lane: RouterLaneState,
+  issue: GitHubIssueRecord,
+  handoff: RouterHandoffState,
+  laneResult: {
+    status: "ok" | "needs_input" | "failed";
+    summary: string;
+    recommended_next_action: string;
+    artifact_refs: string[];
+    blocking_questions: string[];
+    data?: Record<string, unknown> | null;
+    raw_model_output?: string | null;
+  }
+): Promise<RouterState> {
+  const fallbackQuestion =
+    laneResult.blocking_questions[0] ??
+    `Lane ${lane.name} is blocked on issue #${issue.number} and needs direction before continuing.`;
+  const prompt = buildChiefOfStaffPrompt(COS_TASK_APPENDICES.mediateBlocker, [
+    {
+      title: "Lane",
+      content: `${lane.name} (${lane.id})`
+    },
+    {
+      title: "Issue",
+      content: `#${issue.number}: ${issue.title}\n\n${issue.body.trim() || "No issue body provided."}`
+    },
+    {
+      title: "Lane summary",
+      content: laneResult.summary
+    },
+    {
+      title: "Blocking questions",
+      content: laneResult.blocking_questions.join("\n") || fallbackQuestion
+    },
+    {
+      title: "Lane relay",
+      content: parseDataString(laneResult.data?.transcript_reply)
+    }
+  ]);
+
+  const turn = await runCodexSessionAgent(
+    {
+      role: "chief_of_staff",
+      cwd: session.project.repoPath,
+      model: session.project.model,
+      allowWrite: false,
+      prompt,
+      sessionId: router.chiefOfStaff.sessionId
+    },
+    {
+      status: "needs_input",
+      summary: `Lane ${lane.name} is blocked on issue #${issue.number}.`,
+      recommended_next_action: "Ask the director for the missing decision through the Chief of Staff chat.",
+      artifact_refs: [],
+      blocking_questions: [fallbackQuestion],
+      data: {
+        outcome: "ask_human",
+        question: fallbackQuestion,
+        recommendation: "Reply in the CoS chat with the decision you want me to take."
+      }
+    }
+  );
+
+  const nextRouter = applyChiefOfStaffTurn(session, router, {
+    sessionId: turn.sessionId,
+    phase: "blocker_mediation",
+    result: turn.result,
+    issueNumber: issue.number
+  });
+  const outcome = parseDataString(turn.result.data?.outcome);
+  const guidance = parseDataString(turn.result.data?.guidance);
+  const transcriptReply =
+    parseDataString(turn.result.data?.transcript_reply) ?? turn.result.summary;
+
+  if (outcome === "answer_worker" || outcome === "reroute") {
+    handoff.status = "completed";
+    handoff.updatedAt = nowIso();
+    lane.status = handoff.kind === "plan" ? "planning" : "implementing";
+    lane.lastSummary = transcriptReply;
+    lane.updatedAt = nowIso();
+    enqueueHandoff(nextRouter, {
+      laneId: lane.id,
+      issueNumber: issue.number,
+      kind: handoff.kind,
+      status: "pending",
+      summary: guidance ?? transcriptReply,
+      prNumber: handoff.prNumber,
+      branchName: handoff.branchName,
+      worktreePath: handoff.worktreePath,
+      reviewWindowEndsAt: handoff.reviewWindowEndsAt,
+      lastHandledCommentAt: handoff.lastHandledCommentAt,
+      details: {
+        guidance: guidance ?? transcriptReply
+      }
+    });
+    nextRouter.orchestrator = {
+      ...nextRouter.orchestrator,
+      lastLoopAt: nowIso(),
+      lastSummary: `Chief of Staff resolved a blocker for lane ${lane.name} on issue #${issue.number}.`
+    };
+    await saveRouterState(session.paths, nextRouter);
+    await appendConversationMessage(session, {
+      role: "chief_of_staff",
+      kind: "status_update",
+      content: `I resolved a blocker for lane ${lane.name} on issue #${issue.number} and resumed the lane.`,
+      summary: `Resumed ${lane.name} on #${issue.number}`,
+      linkedIssueNumber: issue.number,
+      linkedPrNumber: null,
+      linkedPullRequestNumber: null,
+      isOpenQuestion: false
+    });
+    return nextRouter;
+  }
+
+  handoff.status = "blocked";
+  handoff.updatedAt = nowIso();
+  lane.status = "blocked";
+  lane.updatedAt = nowIso();
+
+  const questionSeed = blockedQuestionForLane(
+    issue,
+    turn.result.summary,
+    parseDataString(turn.result.data?.question) ?? fallbackQuestion,
+    parseDataString(turn.result.data?.recommendation)
+  );
+  const timestamp = nowIso();
+  nextRouter.openQuestion = {
+    id: `question_${Date.now()}`,
+    createdAt: timestamp,
+    updatedAt: timestamp,
+    ...questionSeed,
+    runId: assertPresent(
+      nextRouter.recentRuns.at(-1),
+      "Chief of Staff mediation run should have been recorded."
+    ).id
+  };
+  nextRouter.orchestrator = {
+    ...nextRouter.orchestrator,
+    lastLoopAt: nowIso(),
+    lastSummary: `Chief of Staff needs human guidance for issue #${issue.number}.`
+  };
+
+  await saveRouterState(session.paths, nextRouter);
+  await appendConversationMessage(session, {
+    role: "chief_of_staff",
+    kind: "cos_question",
+    content: formatHumanQuestionContent(
+      nextRouter.openQuestion.question,
+      nextRouter.openQuestion.whyItMatters,
+      nextRouter.openQuestion.recommendation
+    ),
+    summary: summarizeText(nextRouter.openQuestion.question),
+    linkedIssueNumber: issue.number,
+    linkedPrNumber: null,
+    linkedPullRequestNumber: null,
+    isOpenQuestion: true
+  });
+
+  return nextRouter;
+}
+
+async function dispatchPendingHandoff(session: ProjectSession): Promise<boolean> {
+  const [router, cache] = await Promise.all([
+    loadRouterState(session.paths, session.project.slug),
+    loadGitHubCacheState(session.paths, session.project.slug)
+  ]);
+
+  if (router.openQuestion) {
     return false;
   }
 
-  for (const item of items.slice(0, 3)) {
-    const title = parseDataString(item.title);
-    const body = parseDataString(item.body);
-    const kind = (parseDataString(item.kind) as WorkItemKind | null) ?? "task";
-    const executionMode = (parseDataString(item.execution_mode) as ExecutionMode | null) ?? (kind === "workstream" ? "lane" : "worker");
-    if (!title || !body) {
-      continue;
-    }
-
-    const created = await createIssue(session.project.repoSlug, {
-      title,
-      body,
-      labels: [labelFor(kind), labelFor("ready"), labelFor(executionMode)]
-    });
-
-    await upsertWorkItem(session.db, session.project.id, {
-      issueNumber: created.number,
-      parentIssueNumber: null,
-      title,
-      summary: summarizeText(body),
-      kind,
-      executionMode,
-      ownerRole: executionMode === "lane" ? "lane_owner" : "worker",
-      status: "ready",
-      priorityBucket: inferPriorityBucket("ready"),
-      activeRunId: null,
-      activePrNumber: null,
-      lastSummary: `Generated from director note ${primaryNote.id}.`
-    });
+  const handoff = pendingHandoff(router);
+  if (!handoff) {
+    return false;
   }
 
-  await session.db
-    .update(directorNotesTable)
-    .set({
-      status: "archived",
-      updatedAt: nowIso()
-    })
-    .where(eq(directorNotesTable.id, primaryNote.id));
+  const lane = ensureLane(router, handoff.laneId, handoff.laneId);
+  const issue =
+    cache.issues
+      .map((candidate) => mapRemoteIssue(session.project, candidate))
+      .find((candidate) => candidate.number === handoff.issueNumber) ?? null;
 
-  await recordEvent(session.db, session.project.id, "director_note.expanded", {
-    noteId: primaryNote.id
-  });
+  if (!issue) {
+    handoff.status = "blocked";
+    handoff.summary = `Issue #${handoff.issueNumber} is missing from the GitHub cache.`;
+    handoff.updatedAt = nowIso();
+    lane.status = "blocked";
+    lane.updatedAt = nowIso();
+    await saveRouterState(session.paths, {
+      ...router,
+      orchestrator: {
+        ...router.orchestrator,
+        lastLoopAt: nowIso(),
+        lastSummary: `Issue #${handoff.issueNumber} is missing from the local GitHub mirror.`
+      }
+    });
+    return true;
+  }
 
-  return true;
-}
-
-async function planLaneWork(session: ProjectSession, workItem: WorkItemRecord): Promise<void> {
-  const issueRows = await session.db
-    .select()
-    .from(githubIssuesTable)
-    .where(eq(githubIssuesTable.projectId, session.project.id));
-  const issue = issueRows.map(mapGitHubIssueRow).find((candidate) => candidate.number === workItem.issueNumber);
-  const liveIssue = assertPresent(issue, `Issue #${workItem.issueNumber} is missing from the local mirror.`);
-
-  const run = await insertRun(session, {
-    workItemId: workItem.id,
-    issueNumber: workItem.issueNumber,
-    prNumber: null,
-    role: "lane_owner",
-    status: "running",
-    phase: "planning",
-    summary: `Planning workstream #${workItem.issueNumber}.`,
-    recommendedNextAction: null,
-    artifacts: [],
-    blockingQuestions: [],
-    outputJson: null,
-    rawModelOutput: null,
-    worktreePath: null
-  });
-
-  await upsertWorkItem(session.db, session.project.id, {
-    issueNumber: workItem.issueNumber,
-    parentIssueNumber: workItem.parentIssueNumber,
-    title: workItem.title,
-    summary: workItem.summary,
-    kind: "workstream",
-    executionMode: "lane",
-    ownerRole: "lane_owner",
-    status: "planning",
-    priorityBucket: inferPriorityBucket("planning"),
-    activeRunId: run.id,
-    activePrNumber: workItem.activePrNumber,
-    lastSummary: workItem.lastSummary
-  });
-
-  const laneResult = await runCodexAgent(
+  const turn = await runCodexSessionAgent(
     {
       role: "lane_owner",
       cwd: session.project.repoPath,
       model: session.project.model,
       allowWrite: false,
-      prompt: buildChiefOfStaffPrompt(
-        [
-          "Task: run a planning pass for a larger GitHub issue before any write-enabled execution begins.",
-          "Return optional child issues in `data.child_tasks` as objects with `title` and `body`.",
-          "Only raise blocking questions when genuine product or taste judgment is required."
-        ].join("\n"),
-        [
-          {
-            title: "Issue",
-            content: `#${liveIssue.number}: ${liveIssue.title}`
-          },
-          {
-            title: "Issue body",
-            content: liveIssue.body
-          },
-          {
-            title: "Existing guidance",
-            content: guidancePromptSuffix(workItem.lastSummary)
-          },
-          {
-            title: "Recent project conversation",
-            content: await recentConversationPrompt(session)
-          }
-        ]
-      )
+      prompt: buildLanePrompt(session, lane, issue, handoff),
+      sessionId: lane.sessionId
     },
     {
       status: "ok",
-      summary: `Fallback lane plan for #${liveIssue.number}: continue as a bounded worker issue.`,
-      recommended_next_action: "Execute the issue directly as a worker task.",
+      summary: `Lane ${lane.name} acknowledged issue #${issue.number}.`,
+      recommended_next_action: "Keep routing follow-up work through the lane session.",
       artifact_refs: [],
       blocking_questions: [],
       data: {
-        child_tasks: []
+        transcript_reply: `Lane ${lane.name} is attached to issue #${issue.number}.`
       }
     }
   );
 
-  await updateRun(session, run.id, {
-    status: laneResult.status === "failed" ? "failed" : laneResult.status === "needs_input" ? "needs_input" : "succeeded",
-    summary: laneResult.summary,
-    recommendedNextAction: laneResult.recommended_next_action,
-    artifacts: laneResult.artifact_refs,
-    blockingQuestions: laneResult.blocking_questions,
-    outputJson: laneResult.data ?? null,
-    rawModelOutput: laneResult.raw_model_output ?? null
+  const nextRouter = applyLaneTurn(session, router, lane, {
+    sessionId: turn.sessionId,
+    phase: handoff.kind === "plan" ? "planning" : handoff.kind,
+    result: turn.result,
+    issueNumber: issue.number
   });
+  const relay = parseDataString(turn.result.data?.transcript_reply) ?? turn.result.summary;
 
-  if (laneResult.blocking_questions.length > 0) {
-    const mediated = await mediateAgentBlock(session, {
-      workItem,
-      runId: run.id,
-      prNumber: null,
-      source: "lane_owner",
-      summary: laneResult.summary,
-      recommendedNextAction: laneResult.recommended_next_action,
-      blockingQuestions: laneResult.blocking_questions,
-      artifacts: laneResult.artifact_refs,
-      outputJson: laneResult.data ?? null,
-      rawModelOutput: laneResult.raw_model_output ?? null,
-      allowInternalResolution: !guidancePromptSuffix(workItem.lastSummary)
-    });
-
-    if (mediated.kind === "resume") {
-      await appendCoSStatusUpdate(session, {
-        content: mediated.transcript,
-        workItem,
-        runId: run.id
-      });
-      await upsertWorkItem(session.db, session.project.id, {
-        issueNumber: workItem.issueNumber,
-        parentIssueNumber: workItem.parentIssueNumber,
-        title: workItem.title,
-        summary: workItem.summary,
-        kind: "workstream",
-        executionMode: "lane",
-        ownerRole: "lane_owner",
-        status: "ready",
-        priorityBucket: inferPriorityBucket("ready"),
-        activeRunId: null,
-        activePrNumber: workItem.activePrNumber,
-        lastSummary: `Chief of Staff guidance: ${mediated.guidance}`
-      });
-      return planLaneWork(
-        session,
-        assertPresent(
-          await getWorkItemByIssueNumber(session.db, session.project.id, workItem.issueNumber),
-          `Work item #${workItem.issueNumber} disappeared during CoS mediation.`
-        )
-      );
-    }
-
-    await upsertWorkItem(session.db, session.project.id, {
-      issueNumber: workItem.issueNumber,
-      parentIssueNumber: workItem.parentIssueNumber,
-      title: workItem.title,
-      summary: workItem.summary,
-      kind: "workstream",
-      executionMode: "lane",
-      ownerRole: "lane_owner",
-      status: "waiting_decision",
-      priorityBucket: inferPriorityBucket("waiting_decision"),
-      activeRunId: null,
-      activePrNumber: workItem.activePrNumber,
-      lastSummary: laneResult.summary
-    });
-    return;
-  }
-
-  const childTasks = parseDataArray(laneResult.data?.child_tasks);
-  if (childTasks.length) {
-    await createIssuesFromPlan(session, workItem.issueNumber, childTasks, "worker");
-    await upsertWorkItem(session.db, session.project.id, {
-      issueNumber: workItem.issueNumber,
-      parentIssueNumber: workItem.parentIssueNumber,
-      title: workItem.title,
-      summary: workItem.summary,
-      kind: "workstream",
-      executionMode: "lane",
-      ownerRole: "lane_owner",
-      status: "running",
-      priorityBucket: inferPriorityBucket("running"),
-      activeRunId: null,
-      activePrNumber: workItem.activePrNumber,
-      lastSummary: laneResult.summary
-    });
-    await recordEvent(session.db, session.project.id, "lane.plan_spawned", {
-      issueNumber: workItem.issueNumber,
-      childCount: childTasks.length
-    });
-    return;
-  }
-
-  await upsertWorkItem(session.db, session.project.id, {
-    issueNumber: workItem.issueNumber,
-    parentIssueNumber: workItem.parentIssueNumber,
-    title: workItem.title,
-    summary: workItem.summary,
-    kind: "task",
-    executionMode: "worker",
-    ownerRole: "worker",
-    status: "ready",
-    priorityBucket: inferPriorityBucket("ready"),
-    activeRunId: null,
-    activePrNumber: workItem.activePrNumber,
-    lastSummary: laneResult.summary
-  });
-}
-
-async function executeWorkerRun(
-  session: ProjectSession,
-  workItem: WorkItemRecord,
-  options: {
-    issue: GitHubIssueRecord;
-    phase: string;
-    promptSuffix?: string;
-    existingPrNumber?: number | null;
-    existingHeadRefName?: string | null;
-  }
-): Promise<void> {
-  const branchName =
-    options.existingHeadRefName ??
-    `codex/issue-${workItem.issueNumber}-${slugify(workItem.title).slice(0, 36)}`;
-  const desiredWorktreePath = path.join(session.project.worktreeRoot, `issue-${workItem.issueNumber}`);
-  const ensuredWorktree = await ensureWorktree(
-    session.project,
-    workItem.issueNumber,
-    branchName,
-    desiredWorktreePath
-  );
-  const worktreePath = ensuredWorktree.worktreePath;
-  const activeBranchName = ensuredWorktree.branchName;
-
-  const existingWorktreeRows = await session.db
-    .select()
-    .from(worktreesTable)
-    .where(eq(worktreesTable.path, worktreePath))
-    .limit(1);
-  const timestamp = nowIso();
-  if (existingWorktreeRows[0]) {
-    await session.db
-      .update(worktreesTable)
-      .set({
-        issueNumber: workItem.issueNumber,
-        branchName: activeBranchName,
-        status: "active",
-        updatedAt: timestamp
-      })
-      .where(eq(worktreesTable.id, existingWorktreeRows[0].id));
-  } else {
-    await session.db.insert(worktreesTable).values({
-      projectId: session.project.id,
-      issueNumber: workItem.issueNumber,
-      branchName: activeBranchName,
-      path: worktreePath,
-      status: "active",
-      createdAt: timestamp,
-      updatedAt: timestamp
-    });
-  }
-
-  const run = await insertRun(session, {
-    workItemId: workItem.id,
-    issueNumber: workItem.issueNumber,
-    prNumber: options.existingPrNumber ?? null,
-    role: "worker",
-    status: "running",
-    phase: options.phase,
-    summary: `Executing issue #${workItem.issueNumber}.`,
-    recommendedNextAction: null,
-    artifacts: [worktreePath],
-    blockingQuestions: [],
-    outputJson: null,
-    rawModelOutput: null,
-    worktreePath
-  });
-
-  await upsertWorkItem(session.db, session.project.id, {
-    issueNumber: workItem.issueNumber,
-    parentIssueNumber: workItem.parentIssueNumber,
-    title: workItem.title,
-    summary: workItem.summary,
-    kind: workItem.kind,
-    executionMode: "worker",
-    ownerRole: "worker",
-    status: "running",
-    priorityBucket: inferPriorityBucket("running"),
-    activeRunId: run.id,
-    activePrNumber: workItem.activePrNumber,
-    lastSummary: workItem.lastSummary
-  });
-
-  const workerResult = await runCodexAgent(
-    {
-      role: "worker",
-      cwd: worktreePath,
-      model: session.project.model,
-      allowWrite: true,
-      prompt: [
-        `Implement GitHub issue #${options.issue.number}: ${options.issue.title}.`,
-        "Use Codex's built-in planning discipline before editing, then make the bounded code changes needed to satisfy the issue.",
-        "If product judgment is required, do not guess; explain the blocking question clearly for the Chief of Staff.",
-        "Leave the repository ready for commit.",
-        "",
-        options.issue.body,
-        options.promptSuffix || guidancePromptSuffix(workItem.lastSummary)
-          ? `\nFollow-up context:\n${options.promptSuffix ?? guidancePromptSuffix(workItem.lastSummary)}`
-          : ""
-      ].join("\n")
-    },
-    {
-      status: "needs_input",
-      summary: `Worker completed without a clear implementation outcome for #${options.issue.number}.`,
-      recommended_next_action: "Inspect the worktree and decide whether to retry or escalate.",
-      artifact_refs: [worktreePath],
-      blocking_questions: []
-    }
-  );
-
-  if (workerResult.blocking_questions.length > 0 || workerResult.status === "needs_input") {
-    await updateRun(session, run.id, {
-      status: "needs_input",
-      summary: workerResult.summary,
-      recommendedNextAction: workerResult.recommended_next_action,
-      artifacts: workerResult.artifact_refs,
-      blockingQuestions: workerResult.blocking_questions,
-      outputJson: workerResult.data ?? null,
-      rawModelOutput: workerResult.raw_model_output ?? null
-    });
-
-    const mediated = await mediateAgentBlock(session, {
-      workItem,
-      runId: run.id,
-      prNumber: options.existingPrNumber ?? null,
-      source: "worker",
-      summary: workerResult.summary,
-      recommendedNextAction: workerResult.recommended_next_action,
-      blockingQuestions: workerResult.blocking_questions,
-      artifacts: workerResult.artifact_refs,
-      outputJson: workerResult.data ?? null,
-      rawModelOutput: workerResult.raw_model_output ?? null,
-      allowInternalResolution:
-        !options.promptSuffix && !guidancePromptSuffix(workItem.lastSummary)
-    });
-
-    if (mediated.kind === "resume") {
-      await appendCoSStatusUpdate(session, {
-        content: mediated.transcript,
-        workItem,
-        prNumber: options.existingPrNumber ?? null,
-        runId: run.id
-      });
-      await upsertWorkItem(session.db, session.project.id, {
-        issueNumber: workItem.issueNumber,
-        parentIssueNumber: workItem.parentIssueNumber,
-        title: workItem.title,
-        summary: workItem.summary,
-        kind: workItem.kind,
-        executionMode: "worker",
-        ownerRole: "worker",
-        status: "ready",
-        priorityBucket: inferPriorityBucket("ready"),
-        activeRunId: null,
-        activePrNumber: options.existingPrNumber ?? workItem.activePrNumber,
-        lastSummary: `Chief of Staff guidance: ${mediated.guidance}`
-      });
-      return executeWorkerRun(
-        session,
-        assertPresent(
-          await getWorkItemByIssueNumber(session.db, session.project.id, workItem.issueNumber),
-          `Work item #${workItem.issueNumber} disappeared during CoS mediation.`
-        ),
-        {
-          ...options,
-          promptSuffix: mediated.guidance
-        }
-      );
-    }
-
-    await upsertWorkItem(session.db, session.project.id, {
-      issueNumber: workItem.issueNumber,
-      parentIssueNumber: workItem.parentIssueNumber,
-      title: workItem.title,
-      summary: workItem.summary,
-      kind: workItem.kind,
-      executionMode: "worker",
-      ownerRole: "worker",
-      status: "waiting_decision",
-      priorityBucket: inferPriorityBucket("waiting_decision"),
-      activeRunId: null,
-      activePrNumber: options.existingPrNumber ?? workItem.activePrNumber,
-      lastSummary: workerResult.summary
-    });
-    return;
-  }
-
-  try {
-    await maybeRunPackageScript(worktreePath, "test");
-    await maybeRunPackageScript(worktreePath, "build");
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    await updateRun(session, run.id, {
-      status: "failed",
-      summary: `Validation failed for #${workItem.issueNumber}: ${message}`,
-      recommendedNextAction: "Inspect the failing command output and retry.",
-      artifacts: [worktreePath],
-      blockingQuestions: [],
-      outputJson: workerResult.data ?? null,
-      rawModelOutput: workerResult.raw_model_output ?? null
-    });
-    await upsertWorkItem(session.db, session.project.id, {
-      issueNumber: workItem.issueNumber,
-      parentIssueNumber: workItem.parentIssueNumber,
-      title: workItem.title,
-      summary: workItem.summary,
-      kind: workItem.kind,
-      executionMode: "worker",
-      ownerRole: "worker",
-      status: "blocked",
-      priorityBucket: inferPriorityBucket("blocked"),
-      activeRunId: null,
-      activePrNumber: options.existingPrNumber ?? workItem.activePrNumber,
-      lastSummary: message
-    });
-    return;
-  }
-
-  const statusOutput = await runCommand("git", ["status", "--porcelain"], worktreePath);
-  if (!statusOutput.trim()) {
-    await updateRun(session, run.id, {
-      status: "needs_input",
-      summary: "Worker completed without producing file changes.",
-      recommendedNextAction: "Inspect the repository and decide whether the issue needs a different prompt.",
-      artifacts: [worktreePath],
-      blockingQuestions: [],
-      outputJson: workerResult.data ?? null,
-      rawModelOutput: workerResult.raw_model_output ?? null
-    });
-    await upsertWorkItem(session.db, session.project.id, {
-      issueNumber: workItem.issueNumber,
-      parentIssueNumber: workItem.parentIssueNumber,
-      title: workItem.title,
-      summary: workItem.summary,
-      kind: workItem.kind,
-      executionMode: "worker",
-      ownerRole: "worker",
-      status: "blocked",
-      priorityBucket: inferPriorityBucket("blocked"),
-      activeRunId: null,
-      activePrNumber: options.existingPrNumber ?? workItem.activePrNumber,
-      lastSummary: workerResult.summary
-    });
-    return;
-  }
-
-  await runCommand("git", ["add", "-A"], worktreePath);
-  await runCommand(
-    "git",
-    ["commit", "-m", `${options.existingPrNumber ? "Refine" : "Implement"} #${workItem.issueNumber}: ${workItem.title}`],
-    worktreePath
-  );
-  await runCommand("git", ["push", "-u", "origin", activeBranchName], worktreePath);
-
-  let prNumber = options.existingPrNumber ?? null;
-  let prUrl: string | null = null;
-
-  if (!prNumber) {
-    const createdPullRequest = await createPullRequest(worktreePath, {
-      baseBranch: session.project.defaultBranch,
-      headBranch: activeBranchName,
-      title: workItem.title,
-      body: [`Fixes #${workItem.issueNumber}`, "", workerResult.summary].join("\n")
-    });
-    prNumber = createdPullRequest.number;
-    prUrl = createdPullRequest.url;
-  }
-
-  const livePullRequest = await viewPullRequest(worktreePath, assertPresent(prNumber, "PR number missing after worker run."));
-  await upsertGitHubPullRequestMirror(session.db, session.project.id, {
-    number: livePullRequest.number,
-    title: livePullRequest.title,
-    body: livePullRequest.body,
-    state: livePullRequest.state.toLowerCase(),
-    isDraft: livePullRequest.isDraft,
-    reviewDecision: livePullRequest.reviewDecision,
-    checksBucket: livePullRequest.checksBucket,
-    headRefName: livePullRequest.headRefName,
-    baseRefName: livePullRequest.baseRefName,
-    url: livePullRequest.url,
-    linkedIssueNumbers: livePullRequest.linkedIssueNumbers,
-    updatedAt: livePullRequest.updatedAt,
-    syncedAt: nowIso()
-  });
-
-  await upsertPrCycle(session.db, session.project.id, {
-    issueNumber: workItem.issueNumber,
-    prNumber: livePullRequest.number,
-    status: "opened",
-    summary: workerResult.summary,
-    automationWindowEndsAt: new Date(Date.now() + AUTOMATION_WAIT_MS).toISOString(),
-    lastCheckedAt: nowIso(),
-    lastHandledCommentAt: null,
-    mergedAt: null
-  });
-
-  await updateRun(session, run.id, {
-    prNumber: livePullRequest.number,
-    status: "succeeded",
-    summary: workerResult.summary,
-    recommendedNextAction: "Wait through the automated review window, then continue the PR cycle.",
-    artifacts: workerResult.artifact_refs.length ? workerResult.artifact_refs : [livePullRequest.url],
-    blockingQuestions: workerResult.blocking_questions,
-    outputJson: workerResult.data ?? null,
-    rawModelOutput: workerResult.raw_model_output ?? null
-  });
-
-  await upsertWorkItem(session.db, session.project.id, {
-    issueNumber: workItem.issueNumber,
-    parentIssueNumber: workItem.parentIssueNumber,
-    title: workItem.title,
-    summary: workItem.summary,
-    kind: workItem.kind,
-    executionMode: "worker",
-    ownerRole: "worker",
-    status: "waiting_review",
-    priorityBucket: inferPriorityBucket("waiting_review"),
-    activeRunId: null,
-    activePrNumber: livePullRequest.number,
-    lastSummary: workerResult.summary
-  });
-
-  await recordEvent(session.db, session.project.id, "work_item.pr_opened", {
-    issueNumber: workItem.issueNumber,
-    prNumber: livePullRequest.number,
-    prUrl: prUrl ?? livePullRequest.url
-  });
-  await appendCoSStatusUpdate(session, {
-    content: `I opened PR #${livePullRequest.number} for issue #${workItem.issueNumber}: ${livePullRequest.title}.`,
-    workItem,
-    prNumber: livePullRequest.number,
-    runId: run.id
-  });
-}
-
-function latestUnhandledComment(
-  comments: Array<{ author: string; body: string; updatedAt: string }>,
-  lastHandledCommentAt: string | null
-): { author: string; body: string; updatedAt: string } | null {
-  const ordered = [...comments].sort((left, right) => left.updatedAt.localeCompare(right.updatedAt));
-  const latest = ordered.at(-1) ?? null;
-  if (!latest) {
-    return null;
-  }
-
-  if (!lastHandledCommentAt) {
-    return latest;
-  }
-
-  return latest.updatedAt > lastHandledCommentAt ? latest : null;
-}
-
-async function runCosReviewOnPr(
-  session: ProjectSession,
-  workItem: WorkItemRecord,
-  pr: GitHubPullRequestRecord,
-  comments: Array<{ author: string; body: string; updatedAt: string }>
-): Promise<"merge" | "changes" | "escalate"> {
-  const [diff, checks] = await Promise.all([
-    pullRequestDiff(session.project.repoPath, pr.number),
-    pullRequestChecks(session.project.repoPath, pr.number)
-  ]);
-
-  const result = await runCodexAgent(
-    {
-      role: "chief_of_staff",
-      cwd: session.project.repoPath,
-      model: session.project.model,
-      allowWrite: false,
-      prompt: buildChiefOfStaffPrompt(COS_TASK_APPENDICES.reviewPr, [
-        {
-          title: "Pull request",
-          content: `PR #${pr.number} for issue #${workItem.issueNumber}: ${workItem.title}`
-        },
-        {
-          title: "Checks",
-          content: JSON.stringify(checks, null, 2)
-        },
-        {
-          title: "Recent comments",
-          content: comments.length
-            ? comments.map((comment) => `- ${comment.author}: ${comment.body}`).join("\n")
-            : "No recent PR comments."
-        },
-        {
-          title: "Diff",
-          content: diff.slice(0, 24_000)
-        }
-      ])
-    },
-    {
-      status: "ok",
-      summary: `Fallback CoS review approved merge for PR #${pr.number}.`,
-      recommended_next_action: "Merge the pull request.",
-      artifact_refs: [],
-      blocking_questions: [],
-      data: {
-        decision: "merge"
-      }
-    }
-  );
-
-  const verdict = parseDataString(result.data?.decision);
-  const normalized = verdict === "changes" || verdict === "escalate" ? verdict : "merge";
-
-  await insertRun(session, {
-    workItemId: workItem.id,
-    issueNumber: workItem.issueNumber,
-    prNumber: pr.number,
-    role: "reviewer",
-    status: result.status === "failed" ? "failed" : "succeeded",
-    phase: "cos_review",
-    summary: result.summary,
-    recommendedNextAction: result.recommended_next_action,
-    artifacts: result.artifact_refs,
-    blockingQuestions: result.blocking_questions,
-    outputJson: result.data ?? null,
-    rawModelOutput: result.raw_model_output ?? null,
-    worktreePath: null
-  });
-
-  if (normalized === "changes") {
-    const feedback = parseDataString(result.data?.feedback) ?? result.summary;
-    await executeWorkerRun(session, workItem, {
-      issue: assertPresent(
-        (
-          await session.db
-            .select()
-            .from(githubIssuesTable)
-            .where(eq(githubIssuesTable.projectId, session.project.id))
-        )
-          .map(mapGitHubIssueRow)
-          .find((candidate) => candidate.number === workItem.issueNumber),
-        `Issue #${workItem.issueNumber} is missing from the local mirror.`
-      ),
-      phase: "cos_follow_up",
-      promptSuffix: feedback,
-      existingPrNumber: pr.number,
-      existingHeadRefName: pr.headRefName
-    });
-  }
-
-  if (normalized === "escalate") {
-    await createHumanQuestionDecision(session, {
-      workItem,
-      prNumber: pr.number,
-      runId: null,
-      title: `Resolve merge judgment for PR #${pr.number}`,
-      summary: parseDataString(result.data?.why_it_matters) ?? result.summary,
-      question:
-        parseDataString(result.data?.question) ??
-        result.blocking_questions[0] ??
-        `Should I merge PR #${pr.number} for issue #${workItem.issueNumber}?`,
-      recommendation:
-        parseDataString(result.data?.recommendation) ??
-        result.recommended_next_action,
-      rationale: result.blocking_questions.join("\n") || "Chief of Staff requested a human decision."
-    });
-  }
-
-  return normalized;
-}
-
-async function processPrCycles(session: ProjectSession): Promise<boolean> {
-  const cycles = (
-    await session.db
-      .select()
-      .from(prCyclesTable)
-      .where(eq(prCyclesTable.projectId, session.project.id))
-  )
-    .map(mapPrCycleRow)
-    .filter((cycle) => cycle.status !== "merged")
-    .sort((left, right) => left.updatedAt.localeCompare(right.updatedAt));
-
-  if (!cycles.length) {
-    return false;
-  }
-
-  const workItems = (
-    await session.db
-      .select()
-      .from(workItemsTable)
-      .where(eq(workItemsTable.projectId, session.project.id))
-  ).map(mapWorkItemRow);
-  const prRows = (
-    await session.db
-      .select()
-      .from(githubPullRequestsTable)
-      .where(eq(githubPullRequestsTable.projectId, session.project.id))
-  ).map(mapGitHubPullRequestRow);
-  const commentRows = await session.db
-    .select()
-    .from(githubCommentsTable)
-    .where(eq(githubCommentsTable.projectId, session.project.id));
-
-  for (const cycle of cycles) {
-    const workItem = workItems.find((candidate) => candidate.issueNumber === cycle.issueNumber);
-    const pullRequest = prRows.find((candidate) => candidate.number === cycle.prNumber);
-    if (!workItem || !pullRequest) {
-      continue;
-    }
-
-    if (pullRequest.state.toLowerCase() !== "open") {
-      const merged = pullRequest.state.toLowerCase() === "merged";
-      await upsertPrCycle(session.db, session.project.id, {
-        issueNumber: cycle.issueNumber,
-        prNumber: cycle.prNumber,
-        status: merged ? "merged" : "blocked",
-        summary: cycle.summary,
-        automationWindowEndsAt: cycle.automationWindowEndsAt,
-        lastCheckedAt: nowIso(),
-        lastHandledCommentAt: cycle.lastHandledCommentAt,
-        mergedAt: merged ? nowIso() : cycle.mergedAt
-      });
-      await upsertWorkItem(session.db, session.project.id, {
-        issueNumber: workItem.issueNumber,
-        parentIssueNumber: workItem.parentIssueNumber,
-        title: workItem.title,
-        summary: workItem.summary,
-        kind: workItem.kind,
-        executionMode: workItem.executionMode,
-        ownerRole: workItem.ownerRole,
-        status: merged ? "completed" : "blocked",
-        priorityBucket: inferPriorityBucket(merged ? "completed" : "blocked"),
-        activeRunId: null,
-        activePrNumber: merged ? null : cycle.prNumber,
-        lastSummary: merged ? "Merged successfully." : "Pull request closed without merge."
-      });
-      return true;
-    }
-
-    if (cycle.automationWindowEndsAt && Date.now() < Date.parse(cycle.automationWindowEndsAt)) {
-      await upsertPrCycle(session.db, session.project.id, {
-        issueNumber: cycle.issueNumber,
-        prNumber: cycle.prNumber,
-        status: "waiting_automation",
-        summary: cycle.summary,
-        automationWindowEndsAt: cycle.automationWindowEndsAt,
-        lastCheckedAt: nowIso(),
-        lastHandledCommentAt: cycle.lastHandledCommentAt,
-        mergedAt: cycle.mergedAt
-      });
-      continue;
-    }
-
-    const comments = commentRows
-      .filter((candidate) => candidate.parentType === "pr" && candidate.parentNumber === cycle.prNumber)
-      .map((candidate) => ({
-        author: candidate.author,
-        body: candidate.body,
-        updatedAt: candidate.updatedAt
-      }));
-    const unhandled = latestUnhandledComment(comments, cycle.lastHandledCommentAt);
-
-    if (pullRequest.reviewDecision === "CHANGES_REQUESTED" || unhandled) {
-      const issueRows = await session.db
-        .select()
-        .from(githubIssuesTable)
-        .where(eq(githubIssuesTable.projectId, session.project.id));
-      const issue = issueRows.map(mapGitHubIssueRow).find((candidate) => candidate.number === workItem.issueNumber);
-      if (!issue) {
-        continue;
-      }
-
-      await upsertPrCycle(session.db, session.project.id, {
-        issueNumber: cycle.issueNumber,
-        prNumber: cycle.prNumber,
-        status: "changes_requested",
-        summary: unhandled?.body ? summarizeText(unhandled.body) : "Changes requested on the pull request.",
-        automationWindowEndsAt: cycle.automationWindowEndsAt,
-        lastCheckedAt: nowIso(),
-        lastHandledCommentAt: unhandled?.updatedAt ?? cycle.lastHandledCommentAt,
-        mergedAt: cycle.mergedAt
-      });
-
-      await executeWorkerRun(session, workItem, {
-        issue,
-        phase: "review_follow_up",
-        promptSuffix: unhandled?.body ?? "Review feedback was requested on the pull request.",
-        existingPrNumber: pullRequest.number,
-        existingHeadRefName: pullRequest.headRefName
-      });
-
-      await upsertPrCycle(session.db, session.project.id, {
-        issueNumber: cycle.issueNumber,
-        prNumber: cycle.prNumber,
-        status: "revalidating",
-        summary: "Worker addressed review feedback and pushed a follow-up commit.",
-        automationWindowEndsAt: new Date(Date.now() + AUTOMATION_WAIT_MS).toISOString(),
-        lastCheckedAt: nowIso(),
-        lastHandledCommentAt: unhandled?.updatedAt ?? cycle.lastHandledCommentAt,
-        mergedAt: cycle.mergedAt
-      });
-      return true;
-    }
-
-    if (!pullRequest.checksBucket || pullRequest.checksBucket === "pending") {
-      await upsertPrCycle(session.db, session.project.id, {
-        issueNumber: cycle.issueNumber,
-        prNumber: cycle.prNumber,
-        status: "waiting_automation",
-        summary: "Waiting for checks to settle.",
-        automationWindowEndsAt: cycle.automationWindowEndsAt,
-        lastCheckedAt: nowIso(),
-        lastHandledCommentAt: cycle.lastHandledCommentAt,
-        mergedAt: cycle.mergedAt
-      });
-      continue;
-    }
-
-    if (pullRequest.checksBucket === "fail") {
-      await createHumanQuestionDecision(session, {
-        workItem,
-        prNumber: pullRequest.number,
-        runId: null,
-        title: `Investigate failing checks on PR #${pullRequest.number}`,
-        summary: "Automated checks failed and need human judgment or a deeper fix.",
-        question: `PR #${pullRequest.number} failed automated checks. Should I keep iterating on this slice or narrow its scope?`,
-        recommendation: "Inspect the failing GitHub checks and decide whether to retry or narrow scope.",
-        rationale: "The current MVP does not yet fetch full CI logs for autonomous remediation."
-      });
-      await upsertPrCycle(session.db, session.project.id, {
-        issueNumber: cycle.issueNumber,
-        prNumber: cycle.prNumber,
-        status: "blocked",
-        summary: "Checks failed and were escalated.",
-        automationWindowEndsAt: cycle.automationWindowEndsAt,
-        lastCheckedAt: nowIso(),
-        lastHandledCommentAt: cycle.lastHandledCommentAt,
-        mergedAt: cycle.mergedAt
-      });
-      return true;
-    }
-
-    await upsertPrCycle(session.db, session.project.id, {
-      issueNumber: cycle.issueNumber,
-      prNumber: cycle.prNumber,
-      status: "cos_review",
-      summary: "Checks passed. Chief of Staff is reviewing merge readiness.",
-      automationWindowEndsAt: cycle.automationWindowEndsAt,
-      lastCheckedAt: nowIso(),
-      lastHandledCommentAt: cycle.lastHandledCommentAt,
-      mergedAt: cycle.mergedAt
-    });
-
-    const verdict = await runCosReviewOnPr(session, workItem, pullRequest, comments);
-    if (verdict === "merge") {
-      await mergePullRequest(session.project.repoPath, pullRequest.number);
-      await upsertPrCycle(session.db, session.project.id, {
-        issueNumber: cycle.issueNumber,
-        prNumber: cycle.prNumber,
-        status: "merged",
-        summary: "Chief of Staff merged the pull request.",
-        automationWindowEndsAt: cycle.automationWindowEndsAt,
-        lastCheckedAt: nowIso(),
-        lastHandledCommentAt: cycle.lastHandledCommentAt,
-        mergedAt: nowIso()
-      });
-      await upsertWorkItem(session.db, session.project.id, {
-        issueNumber: workItem.issueNumber,
-        parentIssueNumber: workItem.parentIssueNumber,
-        title: workItem.title,
-        summary: workItem.summary,
-        kind: workItem.kind,
-        executionMode: workItem.executionMode,
-        ownerRole: workItem.ownerRole,
-        status: "completed",
-        priorityBucket: inferPriorityBucket("completed"),
-        activeRunId: null,
-        activePrNumber: null,
-        lastSummary: "Merged by Chief of Staff."
-      });
-      await appendCoSStatusUpdate(session, {
-        content: `PR #${pullRequest.number} merged for issue #${workItem.issueNumber}.`,
-        workItem,
-        prNumber: pullRequest.number
-      });
-    } else if (verdict === "escalate") {
-      await upsertPrCycle(session.db, session.project.id, {
-        issueNumber: cycle.issueNumber,
-        prNumber: cycle.prNumber,
-        status: "blocked",
-        summary: "Chief of Staff escalated merge judgment.",
-        automationWindowEndsAt: cycle.automationWindowEndsAt,
-        lastCheckedAt: nowIso(),
-        lastHandledCommentAt: cycle.lastHandledCommentAt,
-        mergedAt: cycle.mergedAt
-      });
-    }
+  if (turn.result.status === "needs_input" || turn.result.blocking_questions.length > 0) {
+    handoff.summary = relay;
+    handoff.updatedAt = nowIso();
+    await mediateLaneBlocker(session, nextRouter, lane, issue, handoff, turn.result);
     return true;
   }
 
-  return false;
-}
+  handoff.status = "completed";
+  handoff.summary = relay;
+  handoff.updatedAt = nowIso();
+  lane.status = handoff.kind === "plan" ? "planning" : "implementing";
+  lane.currentIssueNumber = issue.number;
+  lane.updatedAt = nowIso();
+  nextRouter.orchestrator = {
+    ...nextRouter.orchestrator,
+    lastLoopAt: nowIso(),
+    lastSummary: `Lane ${lane.name} updated issue #${issue.number}.`
+  };
 
-async function processNextQueueItem(session: ProjectSession): Promise<boolean> {
-  const openDecision = await getOpenHumanDecision(session);
-  if (openDecision) {
-    await setOrchestratorState(session, "running", {
-      lastLoopAt: nowIso(),
-      lastSummary:
-        openDecision.issueNumber !== null
-          ? `Waiting for your reply on issue #${openDecision.issueNumber}.`
-          : "Waiting for your reply before claiming more work."
-    });
-    return false;
-  }
-
-  const next = await chooseNextWorkItem(session);
-  if (!next) {
-    const openDecisions = (
-      await session.db
-        .select()
-        .from(decisionsTable)
-        .where(eq(decisionsTable.projectId, session.project.id))
-    )
-      .map(mapDecisionRow)
-      .filter((decision) => decision.status === "open" && decision.title === "No queueable work remains");
-    if (!openDecisions.length) {
-      await createHumanQuestionDecision(session, {
-        workItem: null,
-        prNumber: null,
-        runId: null,
-        title: "No queueable work remains",
-        summary: "The backlog is empty and the Chief of Staff could not expand any active notes.",
-        question: "I’m out of safe autonomous work. What product direction or slice should I take next?",
-        recommendation: "Reply in chat with the next direction, constraint, or GitHub issue to prioritize.",
-        rationale: "Director OS ran out of safe autonomous work."
-      });
-    }
-    return false;
-  }
-
-  if (next.executionMode === "lane") {
-    await planLaneWork(session, next);
-    return true;
-  }
-
-  const issueRows = await session.db
-    .select()
-    .from(githubIssuesTable)
-    .where(eq(githubIssuesTable.projectId, session.project.id));
-  const issue = issueRows.map(mapGitHubIssueRow).find((candidate) => candidate.number === next.issueNumber);
-  if (!issue) {
-    return false;
-  }
-
-  await executeWorkerRun(session, next, {
-    issue,
-    phase: "implementation",
-    promptSuffix: guidancePromptSuffix(next.lastSummary)
+  await saveRouterState(session.paths, nextRouter);
+  await appendConversationMessage(session, {
+    role: "chief_of_staff",
+    kind: "status_update",
+    content: `Lane ${lane.name} took ownership of issue #${issue.number}. ${relay}`,
+    summary: `Lane ${lane.name} updated #${issue.number}`,
+    linkedIssueNumber: issue.number,
+    linkedPrNumber: null,
+    linkedPullRequestNumber: null,
+    isOpenQuestion: false
   });
   return true;
 }
 
-async function runOrchestratorIteration(): Promise<boolean> {
-  return withProject(async (session) => {
-    const orchestrator = await ensureOrchestratorRow(session);
-    if (orchestrator.status !== "running") {
-      return false;
-    }
+async function runOrchestratorLoop(): Promise<void> {
+  if (orchestratorRunning) {
+    return;
+  }
 
-    try {
-      await syncProjectInternal(session);
-      const openDecision = await getOpenHumanDecision(session);
-      const handledPrCycle = await processPrCycles(session);
-      const handledQueue =
-        handledPrCycle || openDecision ? false : await processNextQueueItem(session);
-      const pendingQuestion = await getOpenHumanDecision(session);
-      const currentOrchestrator = await ensureOrchestratorRow(session);
-      if (currentOrchestrator.status !== "running") {
-        return false;
+  orchestratorRunning = true;
+  let shouldReschedule = false;
+
+  try {
+    await withProject(async (session) => {
+      const lock = await readOrchestratorLock(session.paths);
+      if (lock?.token !== ORCHESTRATOR_OWNER_TOKEN) {
+        return;
       }
 
-      await setOrchestratorState(session, "running", {
-        lastLoopAt: nowIso(),
-        lastSummary: handledPrCycle
-          ? "Processed an active PR cycle."
-          : pendingQuestion
-            ? pendingQuestion.issueNumber !== null
-              ? `Waiting for your reply on issue #${pendingQuestion.issueNumber}.`
-              : "Waiting for your reply before claiming more work."
-          : handledQueue
-            ? "Processed the next queued work item."
-            : "No autonomous work was available this cycle."
-      });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      await setOrchestratorState(session, "blocked", {
-        lastLoopAt: nowIso(),
-        lastSummary: message
-      });
-      await createHumanQuestionDecision(session, {
-        workItem: null,
-        prNumber: null,
-        runId: null,
-        title: "Orchestrator blocked",
-        summary: message,
-        question: "The orchestrator hit an unexpected error and paused itself. What should I do next?",
-        recommendation: "Inspect the latest run and local environment, then restart the orchestrator.",
-        rationale: "The background loop hit an unexpected error."
-      });
-      return false;
-    }
+      const router = await loadRouterState(session.paths, session.project.slug);
+      if (router.orchestrator.status !== "running") {
+        return;
+      }
 
-    const refreshed = await ensureOrchestratorRow(session);
-    return refreshed.status === "running";
-  });
+      shouldReschedule = true;
+      await syncProjectInternal(session);
+      if (!(await dispatchPendingHandoff(session))) {
+        await chooseNextIssue(session);
+        await dispatchPendingHandoff(session);
+      }
+    });
+  } finally {
+    orchestratorRunning = false;
+    if (shouldReschedule) {
+      scheduleOrchestratorLoop();
+    }
+  }
 }
 
-function scheduleOrchestratorLoop(delayMs = 0): void {
+function scheduleOrchestratorLoop(delayMs = LOOP_INTERVAL_MS): void {
   if (orchestratorTimer) {
     clearTimeout(orchestratorTimer);
   }
 
   orchestratorTimer = setTimeout(() => {
     orchestratorTimer = null;
-    void ensureOrchestratorLoop();
+    void runOrchestratorLoop().catch((error) => {
+      console.error(error);
+    });
   }, delayMs);
-}
-
-async function ensureOrchestratorLoop(): Promise<void> {
-  if (orchestratorRunning) {
-    return;
-  }
-
-  orchestratorRunning = true;
-  try {
-    const shouldContinue = await runOrchestratorIteration();
-    if (shouldContinue) {
-      scheduleOrchestratorLoop(LOOP_INTERVAL_MS);
-    }
-  } finally {
-    orchestratorRunning = false;
-  }
 }
 
 export async function getSetupStatus(): Promise<SetupStatusResponse> {
@@ -3462,7 +1900,7 @@ export async function getSetupStatus(): Promise<SetupStatusResponse> {
     const activeProject = await getActiveProjectFromRuntime(session);
 
     if (activeProject) {
-      const { draft, check } = await buildRepositoryDraft(
+      const { draft, repositoryCheck } = await buildRepositoryDraft(
         {
           repoPath: activeProject.repoPath,
           projectName: activeProject.name,
@@ -3475,7 +1913,7 @@ export async function getSetupStatus(): Promise<SetupStatusResponse> {
       return evaluateSetupState(session, {
         activeProject,
         repositoryDraft: draft ?? projectToSetupDraft(activeProject),
-        repositoryCheck: check,
+        repositoryCheck,
         runWorkspace: true
       });
     }
@@ -3493,12 +1931,12 @@ export async function probeRepositorySetup(
 ): Promise<SetupStatusResponse> {
   return withRuntime(async (session) => {
     const activeProject = await getActiveProjectFromRuntime(session);
-    const { draft, check } = await buildRepositoryDraft(input, session.paths);
+    const { draft, repositoryCheck } = await buildRepositoryDraft(input, session.paths);
 
     return evaluateSetupState(session, {
       activeProject,
       repositoryDraft: draft,
-      repositoryCheck: check,
+      repositoryCheck,
       runWorkspace: false
     });
   });
@@ -3509,7 +1947,7 @@ export async function runWorkspaceSetupTest(
 ): Promise<SetupStatusResponse> {
   return withRuntime(async (session) => {
     const activeProject = await getActiveProjectFromRuntime(session);
-    const { draft, check } = await buildRepositoryDraft(
+    const { draft, repositoryCheck } = await buildRepositoryDraft(
       {
         repoPath: repositoryDraft.repoPath,
         projectName: repositoryDraft.projectName,
@@ -3522,7 +1960,7 @@ export async function runWorkspaceSetupTest(
     return evaluateSetupState(session, {
       activeProject,
       repositoryDraft: draft ?? repositoryDraft,
-      repositoryCheck: check,
+      repositoryCheck,
       runWorkspace: true
     });
   });
@@ -3533,7 +1971,7 @@ export async function completeSetup(
 ): Promise<SetupStatusResponse> {
   return withRuntime(async (session) => {
     const activeProject = await getActiveProjectFromRuntime(session);
-    const { draft, check } = await buildRepositoryDraft(
+    const { draft, repositoryCheck } = await buildRepositoryDraft(
       {
         repoPath: repositoryDraft.repoPath,
         projectName: repositoryDraft.projectName,
@@ -3543,10 +1981,11 @@ export async function completeSetup(
       session.paths
     );
     const resolvedDraft = draft ?? repositoryDraft;
+
     const status = await evaluateSetupState(session, {
       activeProject,
       repositoryDraft: resolvedDraft,
-      repositoryCheck: check,
+      repositoryCheck,
       runWorkspace: true
     });
 
@@ -3559,7 +1998,6 @@ export async function completeSetup(
     }
 
     const storedProject = await persistProjectRegistration(session, resolvedDraft);
-
     return evaluateSetupState(session, {
       activeProject: storedProject,
       repositoryDraft: projectToSetupDraft(storedProject),
@@ -3581,6 +2019,10 @@ export async function initDirector(options: InitCommandOptions = {}) {
   }
 
   return withRuntime(async (session) => {
+    if (!options.skipGhCheck) {
+      await ensureGhAuthenticated();
+    }
+
     const { draft: discoveredDraft } = await buildRepositoryDraft(
       {
         repoPath,
@@ -3590,12 +2032,8 @@ export async function initDirector(options: InitCommandOptions = {}) {
       },
       session.paths
     );
+
     let detected: Awaited<ReturnType<typeof detectRepoFromPath>> | null = null;
-
-    if (!options.skipGhCheck) {
-      await ensureGhAuthenticated();
-    }
-
     if (!discoveredDraft?.repoSlug || !discoveredDraft.defaultBranch || !options.projectName) {
       try {
         detected = await detectRepoFromPath(repoPath);
@@ -3657,291 +2095,130 @@ export async function syncProject(): Promise<DirectorOperationResponse> {
 
 export async function getDirectorStatus(): Promise<DirectorStatusResponse> {
   return withProject(async (session) => {
-    const orchestrator = await ensureOrchestratorRow(session);
-
-    const [workItemRows, decisionRows, prCycleRows, runRows, noteRows, prRows] = await Promise.all([
-      session.db.select().from(workItemsTable).where(eq(workItemsTable.projectId, session.project.id)),
-      session.db.select().from(decisionsTable).where(eq(decisionsTable.projectId, session.project.id)),
-      session.db.select().from(prCyclesTable).where(eq(prCyclesTable.projectId, session.project.id)),
-      session.db.select().from(runsTable).where(eq(runsTable.projectId, session.project.id)),
-      session.db.select().from(directorNotesTable).where(eq(directorNotesTable.projectId, session.project.id)),
-      session.db.select().from(githubPullRequestsTable).where(eq(githubPullRequestsTable.projectId, session.project.id))
+    const [router, cache, owner] = await Promise.all([
+      loadRouterState(session.paths, session.project.slug),
+      loadGitHubCacheState(session.paths, session.project.slug),
+      readOrchestratorLock(session.paths)
     ]);
 
-    const workItems = workItemRows.map(mapWorkItemRow);
+    const issues = cache.issues.map((issue) => mapRemoteIssue(session.project, issue));
+    const pullRequests = cache.pullRequests.map((pullRequest) =>
+      mapRemotePullRequest(session.project, pullRequest, cache.syncedAt)
+    );
+    const openPullRequests = pullRequests
+      .filter((pullRequest) => pullRequest.state.toLowerCase() === "open")
+      .sort((left, right) => left.number - right.number);
+
+    const workItems = issues
+      .filter((issue) => issue.state.toLowerCase() === "open")
+      .map((issue) => {
+        const linkedPullRequest =
+          pullRequests.find((pullRequest) => pullRequest.linkedIssueNumbers.includes(issue.number)) ??
+          null;
+        return synthesizeWorkItem(session.project, issue, linkedPullRequest, router);
+      });
+
     return {
       project: session.project,
-      orchestrator,
-      queue: selectQueuedWorkItems(workItems),
-      activeWork: selectActiveWorkItems(workItems),
-      decisions: decisionRows
-        .map(mapDecisionRow)
-        .filter((decision) => decision.status === "open")
-        .sort((left, right) => left.createdAt.localeCompare(right.createdAt)),
-      prCycles: prCycleRows
-        .map(mapPrCycleRow)
-        .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
-        .slice(0, 10),
-      recentRuns: runRows
-        .map(mapRunRow)
+      orchestrator: synthesizeOrchestratorStatus(session.project, router, owner),
+      lastSuccessfulSyncAt: router.lastSyncAt,
+      lanes: router.lanes.map((lane) => synthesizeLaneRecord(lane, openPullRequests)),
+      issues: issues.map((issue) => synthesizeIssueOwnership(issue, router, pullRequests)),
+      openQuestion: router.openQuestion ? toHumanQuestionRecord(router.openQuestion) : null,
+      recentActivity: synthesizeActivity(router),
+      openPullRequests,
+      queue: workItems
+        .filter((workItem) => ["queued", "ready", "planning"].includes(workItem.status))
+        .sort((left, right) => left.priorityBucket - right.priorityBucket || left.issueNumber - right.issueNumber),
+      activeWork: workItems
+        .filter((workItem) => ["running", "waiting_review", "waiting_decision"].includes(workItem.status))
+        .sort((left, right) => left.issueNumber - right.issueNumber),
+      decisions: router.openQuestion ? [toHumanQuestionRecord(router.openQuestion)] : [],
+      prCycles: openPullRequests.map((pullRequest) => synthesizePrCycle(session.project, pullRequest)),
+      recentRuns: router.recentRuns.slice(-12),
+      notes: router.notes
+        .slice()
         .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
-        .slice(0, 12),
-      notes: noteRows
-        .map(mapNoteRow)
-        .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
-        .slice(0, 10),
-      openPullRequests: prRows
-        .map(mapGitHubPullRequestRow)
-        .filter((pullRequest) => pullRequest.state.toLowerCase() === "open")
-        .sort((left, right) => left.number - right.number)
+        .slice(0, 10)
     };
   });
 }
 
 export async function listDecisions(): Promise<DecisionsResponse> {
   return withProject(async (session) => {
-    const rows = await session.db
-      .select()
-      .from(decisionsTable)
-      .where(eq(decisionsTable.projectId, session.project.id));
+    const router = await loadRouterState(session.paths, session.project.slug);
     return {
-      decisions: rows
-        .map(mapDecisionRow)
-        .filter((decision) => decision.status === "open")
-        .sort((left, right) => left.createdAt.localeCompare(right.createdAt))
+      decisions: router.openQuestion ? [toHumanQuestionRecord(router.openQuestion)] : []
     };
   });
-}
-
-async function insertDirectorNoteRecord(
-  session: ProjectSession,
-  content: string
-): Promise<DirectorNoteRecord> {
-  const timestamp = nowIso();
-  const result = await session.db.insert(directorNotesTable).values({
-    projectId: session.project.id,
-    content,
-    status: "active",
-    createdAt: timestamp,
-    updatedAt: timestamp
-  });
-  await recordEvent(session.db, session.project.id, "director_note.created", {
-    content
-  });
-  const row = await session.db
-    .select()
-    .from(directorNotesTable)
-    .where(eq(directorNotesTable.id, Number(result.lastInsertRowid)))
-    .limit(1);
-  return mapNoteRow(assertPresent(row[0], "Director note missing after insert."));
-}
-
-type CoSChatReply = {
-  kind: "cos_reply" | "cos_question";
-  reply: string;
-  question: string | null;
-  recommendation: string | null;
-  rationale: string | null;
-};
-
-async function runCoSChatReply(
-  session: ProjectSession,
-  content: string
-): Promise<CoSChatReply> {
-  const result = await runCodexAgent(
-    {
-      role: "chief_of_staff",
-      cwd: session.project.repoPath,
-      model: session.project.model,
-      allowWrite: false,
-      prompt: buildChiefOfStaffPrompt(COS_TASK_APPENDICES.replyInChat, [
-        {
-          title: "Recent conversation",
-          content: await recentConversationPrompt(session)
-        },
-        {
-          title: "Latest director message",
-          content
-        },
-        {
-          title: "Output contract",
-          content: [
-            "Return `data.kind` as `cos_reply` or `cos_question`.",
-            "Return the human-facing reply in `data.reply`.",
-            "If you ask a question, also return `data.question`, `data.recommendation`, and optional `data.rationale`."
-          ].join("\n")
-        }
-      ])
-    },
-    {
-      status: "ok",
-      summary: "Noted. I’ll use that direction to steer prioritization and execution.",
-      recommended_next_action: "Continue running the current queue.",
-      artifact_refs: [],
-      blocking_questions: [],
-      data: {
-        kind: "cos_reply",
-        reply: "Noted. I’ll use that direction to steer prioritization and execution."
-      }
-    }
-  );
-
-  return {
-    kind: parseDataString(result.data?.kind) === "cos_question" ? "cos_question" : "cos_reply",
-    reply:
-      parseDataString(result.data?.reply) ??
-      result.summary ??
-      "Noted. I’ll use that direction to steer prioritization and execution.",
-    question: parseDataString(result.data?.question) ?? null,
-    recommendation: parseDataString(result.data?.recommendation) ?? null,
-    rationale: parseDataString(result.data?.rationale) ?? null
-  };
-}
-
-async function resolveDecisionInternal(
-  session: ProjectSession,
-  decisionId: number,
-  resolution: string
-): Promise<DecisionRecord> {
-  const rows = await session.db
-    .select()
-    .from(decisionsTable)
-    .where(eq(decisionsTable.id, decisionId))
-    .limit(1);
-  const row = assertPresent(rows[0], `Decision ${decisionId} was not found.`);
-
-  await session.db
-    .update(decisionsTable)
-    .set({
-      status: "resolved",
-      resolution,
-      updatedAt: nowIso()
-    })
-    .where(eq(decisionsTable.id, decisionId));
-
-  if (row.workItemId) {
-    const workItemRows = await session.db
-      .select()
-      .from(workItemsTable)
-      .where(eq(workItemsTable.id, row.workItemId))
-      .limit(1);
-    if (workItemRows[0]) {
-      const workItem = mapWorkItemRow(workItemRows[0]);
-      const resumedStatus: WorkItemStatus = workItem.activePrNumber ? "waiting_review" : "ready";
-      await upsertWorkItem(session.db, session.project.id, {
-        issueNumber: workItem.issueNumber,
-        parentIssueNumber: workItem.parentIssueNumber,
-        title: workItem.title,
-        summary: workItem.summary,
-        kind: workItem.kind,
-        executionMode: workItem.executionMode,
-        ownerRole: workItem.ownerRole,
-        status: resumedStatus,
-        priorityBucket: inferPriorityBucket(resumedStatus),
-        activeRunId: null,
-        activePrNumber: workItem.activePrNumber,
-        lastSummary: `Human guidance: ${resolution}`
-      });
-    }
-  }
-
-  if (row.questionMessageId) {
-    await session.db
-      .update(conversationMessagesTable)
-      .set({
-        isOpenQuestion: false,
-        decisionId,
-        updatedAt: nowIso()
-      })
-      .where(eq(conversationMessagesTable.id, row.questionMessageId));
-  }
-
-  const resolutionText = formatResolutionMessage(mapDecisionRow(row), resolution);
-  const resolutionMessage = await appendConversationMessage(session, {
-    role: "chief_of_staff",
-    kind: "resolution",
-    content: resolutionText,
-    summary: summarizeText(resolutionText),
-    linkedIssueNumber: row.issueNumber ?? null,
-    linkedPrNumber: row.prNumber ?? null,
-    isOpenQuestion: false,
-    workItemId: row.workItemId ?? null,
-    issueNumber: row.issueNumber ?? null,
-    prNumber: row.prNumber ?? null,
-    decisionId,
-    runId: row.requestedByRunId ?? null
-  });
-
-  await session.db
-    .update(decisionsTable)
-    .set({
-      resolutionMessageId: resolutionMessage.id,
-      updatedAt: nowIso()
-    })
-    .where(eq(decisionsTable.id, decisionId));
-
-  await recordEvent(session.db, session.project.id, "decision.resolved", {
-    decisionId,
-    resolution
-  });
-
-  const updatedRows = await session.db
-    .select()
-    .from(decisionsTable)
-    .where(eq(decisionsTable.id, decisionId))
-    .limit(1);
-  return mapDecisionRow(
-    assertPresent(updatedRows[0], `Decision ${decisionId} vanished after update.`)
-  );
 }
 
 export async function getConversation(): Promise<ConversationResponse> {
   return withProject(async (session) => getConversationResponse(session));
 }
 
-export async function sendConversationMessage(
-  content: string
-): Promise<ConversationResponse> {
+export async function sendConversationMessage(content: string): Promise<ConversationResponse> {
   const trimmed = content.trim();
   if (!trimmed) {
     throw new Error("Message cannot be empty.");
   }
 
   return withProject(async (session) => {
-    await backfillOpenDecisionQuestions(session);
-    const openDecision = await getOpenHumanDecision(session);
     await appendConversationMessage(session, {
       role: "director",
       kind: "human_message",
       content: trimmed,
       summary: summarizeText(trimmed),
-      linkedIssueNumber: openDecision?.issueNumber ?? null,
-      linkedPrNumber: openDecision?.prNumber ?? null,
-      isOpenQuestion: false,
-      workItemId: openDecision?.workItemId ?? null,
-      issueNumber: openDecision?.issueNumber ?? null,
-      prNumber: openDecision?.prNumber ?? null,
-      decisionId: openDecision?.id ?? null,
-      runId: null
+      linkedIssueNumber: null,
+      linkedPrNumber: null,
+      linkedPullRequestNumber: null,
+      isOpenQuestion: false
     });
 
-    if (openDecision) {
-      await resolveDecisionInternal(session, openDecision.id, trimmed);
+    const router = await loadRouterState(session.paths, session.project.slug);
+    if (router.openQuestion) {
+      await resolveOpenQuestion(session, router, trimmed);
     } else {
       const reply = await runCoSChatReply(session, trimmed);
 
       if (reply.kind === "cos_question") {
-        await createHumanQuestionDecision(session, {
-          workItem: null,
-          prNumber: null,
-          runId: null,
-          title: "Chief of Staff question",
-          summary: reply.reply,
-          question:
-            reply.question ?? "I need a little more direction before I can continue.",
-          recommendation:
-            reply.recommendation ?? "Reply here with the direction you want me to take.",
-          rationale: reply.rationale ?? reply.reply
+        const timestamp = nowIso();
+        await saveRouterState(session.paths, {
+          ...router,
+          openQuestion: {
+            id: `question_${Date.now()}`,
+            title: "Chief of Staff question",
+            summary: reply.reply,
+            question: reply.question ?? "I need a little more direction before I continue.",
+            whyItMatters: reply.reply,
+            recommendation:
+              reply.recommendation ?? "Reply here with the direction you want me to take.",
+            issueNumber: null,
+            prNumber: null,
+            runId: reply.run.id,
+            requestedBy: "chief_of_staff",
+            createdAt: timestamp,
+            updatedAt: timestamp
+          },
+          orchestrator: {
+            ...router.orchestrator,
+            lastSummary: "Chief of Staff is waiting on human direction."
+          }
+        });
+
+        await appendConversationMessage(session, {
+          role: "chief_of_staff",
+          kind: "cos_question",
+          content: formatHumanQuestionContent(
+            reply.question ?? "I need a little more direction before I continue.",
+            reply.reply,
+            reply.recommendation ?? "Reply here with the direction you want me to take."
+          ),
+          summary: summarizeText(reply.question ?? reply.reply),
+          linkedIssueNumber: null,
+          linkedPrNumber: null,
+          linkedPullRequestNumber: null,
+          isOpenQuestion: true
         });
       } else {
         await appendConversationMessage(session, {
@@ -3951,20 +2228,17 @@ export async function sendConversationMessage(
           summary: summarizeText(reply.reply),
           linkedIssueNumber: null,
           linkedPrNumber: null,
-          isOpenQuestion: false,
-          workItemId: null,
-          issueNumber: null,
-          prNumber: null,
-          decisionId: null,
-          runId: null
+          linkedPullRequestNumber: null,
+          isOpenQuestion: false
         });
       }
     }
 
-    const orchestrator = await ensureOrchestratorRow(session);
-    if (orchestrator.status === "running" && !orchestratorTimer && !orchestratorRunning) {
+    const refreshedRouter = await loadRouterState(session.paths, session.project.slug);
+    if (refreshedRouter.orchestrator.status === "running" && !orchestratorRunning) {
       scheduleOrchestratorLoop(0);
     }
+
     return getConversationResponse(session);
   });
 }
@@ -3976,7 +2250,7 @@ export async function submitDirectorNote(content: string): Promise<DirectorNoteR
   }
 
   return withProject(async (session) => {
-    const note = await insertDirectorNoteRecord(session, trimmed);
+    const note = await addDirectorNote(session, trimmed);
     await appendConversationMessage(session, {
       role: "director",
       kind: "human_message",
@@ -3984,51 +2258,68 @@ export async function submitDirectorNote(content: string): Promise<DirectorNoteR
       summary: summarizeText(trimmed),
       linkedIssueNumber: null,
       linkedPrNumber: null,
-      isOpenQuestion: false,
-      workItemId: null,
-      issueNumber: null,
-      prNumber: null,
-      decisionId: null,
-      runId: null
+      linkedPullRequestNumber: null,
+      isOpenQuestion: false
     });
-    const orchestrator = await ensureOrchestratorRow(session);
-    if (orchestrator.status === "running" && !orchestratorTimer && !orchestratorRunning) {
+
+    const router = await loadRouterState(session.paths, session.project.slug);
+    if (router.orchestrator.status === "running" && !orchestratorRunning) {
       scheduleOrchestratorLoop(0);
     }
+
     return note;
   });
 }
 
 export async function resolveDecision(
-  decisionId: number,
+  decisionId: string,
   resolution: string
-): Promise<DecisionRecord> {
+): Promise<HumanQuestionRecord> {
   const trimmed = resolution.trim();
   if (!trimmed) {
     throw new Error("Resolution cannot be empty.");
   }
 
   return withProject(async (session) => {
-    const decision = await resolveDecisionInternal(session, decisionId, trimmed);
+    const router = await loadRouterState(session.paths, session.project.slug);
+    if (!router.openQuestion || router.openQuestion.id !== decisionId) {
+      throw new Error(`Decision ${decisionId} was not found.`);
+    }
 
-    const orchestrator = await ensureOrchestratorRow(session);
-    if (orchestrator.status === "running" && !orchestratorTimer && !orchestratorRunning) {
+    const resolved = await resolveOpenQuestion(session, router, trimmed);
+    const refreshedRouter = await loadRouterState(session.paths, session.project.slug);
+    if (refreshedRouter.orchestrator.status === "running" && !orchestratorRunning) {
       scheduleOrchestratorLoop(0);
     }
 
-    return decision;
+    return resolved;
   });
 }
 
 export async function startOrchestrator(): Promise<DirectorOperationResponse> {
+  const paths = await ensureRuntimeDirectories(resolveRuntimePaths());
+  const ownership = await acquireOrchestratorLock(paths);
+
+  if (ownership === "busy") {
+    return {
+      ok: true,
+      message: "Chief of Staff is already running in another local Director OS process."
+    };
+  }
+
   const response = await withProject(async (session) => {
-    await ensureOrchestratorRow(session);
-    await setOrchestratorState(session, "running", {
-      pauseReason: null,
-      lastSummary: "Chief of Staff is running.",
-      lastLoopAt: nowIso()
+    const router = await loadRouterState(session.paths, session.project.slug);
+    await saveRouterState(session.paths, {
+      ...router,
+      orchestrator: {
+        ...router.orchestrator,
+        status: "running",
+        pauseReason: null,
+        lastLoopAt: nowIso(),
+        lastSummary: "Chief of Staff router is running."
+      }
     });
-    await recordEvent(session.db, session.project.id, "orchestrator.started", {});
+
     return {
       ok: true,
       message: "Chief of Staff loop started."
@@ -4040,22 +2331,28 @@ export async function startOrchestrator(): Promise<DirectorOperationResponse> {
 }
 
 export async function pauseOrchestrator(reason?: string): Promise<DirectorOperationResponse> {
-  return withProject(async (session) => {
-    await ensureOrchestratorRow(session);
-    await setOrchestratorState(session, "paused", {
-      pauseReason: reason?.trim() || "Paused by the director.",
-      lastSummary: "Chief of Staff loop paused."
+  const response = await withProject(async (session) => {
+    const router = await loadRouterState(session.paths, session.project.slug);
+    await saveRouterState(session.paths, {
+      ...router,
+      orchestrator: {
+        ...router.orchestrator,
+        status: "paused",
+        pauseReason: reason?.trim() || "Paused by the director.",
+        lastSummary: "Chief of Staff loop paused."
+      }
     });
-    if (orchestratorTimer) {
-      clearTimeout(orchestratorTimer);
-      orchestratorTimer = null;
-    }
-    await recordEvent(session.db, session.project.id, "orchestrator.paused", {
-      reason: reason?.trim() || null
-    });
+
     return {
       ok: true,
       message: "Chief of Staff loop paused."
     };
   });
+
+  if (orchestratorTimer) {
+    clearTimeout(orchestratorTimer);
+    orchestratorTimer = null;
+  }
+  await releaseOrchestratorLock(await ensureRuntimeDirectories(resolveRuntimePaths()));
+  return response;
 }
