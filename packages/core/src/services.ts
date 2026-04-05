@@ -138,6 +138,71 @@ function summarizeText(value: string, maxLength = 240): string {
   return trimmed.length > maxLength ? `${trimmed.slice(0, maxLength - 1)}…` : trimmed;
 }
 
+function extractIssueNumbers(value: string): number[] {
+  const matches = value.matchAll(/#(\d+)/g);
+  const seen = new Set<number>();
+  const issueNumbers: number[] = [];
+
+  for (const match of matches) {
+    const issueNumber = Number.parseInt(match[1] ?? "", 10);
+    if (!Number.isFinite(issueNumber) || seen.has(issueNumber)) {
+      continue;
+    }
+
+    seen.add(issueNumber);
+    issueNumbers.push(issueNumber);
+  }
+
+  return issueNumbers;
+}
+
+function selectDirectedIssue(
+  issues: GitHubIssueRecord[],
+  messages: ConversationMessageRecord[]
+): GitHubIssueRecord | null {
+  const issuesByNumber = new Map(issues.map((issue) => [issue.number, issue]));
+
+  for (const message of [...messages].reverse()) {
+    if (message.role !== "director") {
+      continue;
+    }
+
+    for (const issueNumber of extractIssueNumbers(message.content)) {
+      const issue = issuesByNumber.get(issueNumber);
+      if (issue) {
+        return issue;
+      }
+    }
+  }
+
+  return null;
+}
+
+function priorityGuidancePrompt(
+  issue: GitHubIssueRecord | null,
+  messages: ConversationMessageRecord[]
+): string {
+  if (!issue) {
+    return "No explicit issue priority is active from the director right now.";
+  }
+
+  const latestInstruction =
+    [...messages]
+      .reverse()
+      .find(
+        (message) =>
+          message.role === "director" && extractIssueNumbers(message.content).includes(issue.number)
+      ) ?? null;
+
+  return [
+    `The director explicitly asked for issue #${issue.number} (${issue.title}) next.`,
+    "Prefer that issue while it remains open and ready unless a harder blocker makes it impossible.",
+    latestInstruction ? `Latest instruction: ${summarizeText(latestInstruction.content, 400)}` : null
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
 function parseDataString(value: unknown): string | null {
   return typeof value === "string" && value.trim() ? value.trim() : null;
 }
@@ -818,12 +883,32 @@ async function pathExists(targetPath: string): Promise<boolean> {
   }
 }
 
-async function maybeRunPackageScript(cwd: string, script: string): Promise<void> {
+function commandPathForWorktree(project: ProjectRecord, cwd: string): string {
+  const entries = [
+    path.join(cwd, "node_modules", ".bin"),
+    path.join(project.repoPath, "node_modules", ".bin"),
+    process.env.PATH ?? ""
+  ].filter(Boolean);
+
+  return entries.join(path.delimiter);
+}
+
+async function maybeRunPackageScript(
+  project: ProjectRecord,
+  cwd: string,
+  script: string
+): Promise<void> {
   if (!(await pathExists(path.join(cwd, "package.json")))) {
     return;
   }
 
-  await runCommandOrThrow("npm", ["run", script, "--if-present"], { cwd });
+  await runCommandOrThrow("npm", ["run", script, "--if-present"], {
+    cwd,
+    env: {
+      ...process.env,
+      PATH: commandPathForWorktree(project, cwd)
+    }
+  });
 }
 
 async function listGitWorktrees(repoPath: string) {
@@ -839,6 +924,113 @@ async function pruneGitWorktrees(repoPath: string): Promise<void> {
   await runCommandOrThrow("git", ["-C", repoPath, "worktree", "prune"], { cwd: repoPath });
 }
 
+async function worktreeHasUncommittedChanges(worktreePath: string): Promise<boolean> {
+  const status = await runCommandOrThrow("git", ["-C", worktreePath, "status", "--short"], {
+    cwd: worktreePath
+  });
+  return Boolean(status.trim());
+}
+
+async function localBranchExists(repoPath: string, branchName: string): Promise<boolean> {
+  try {
+    await runCommandOrThrow(
+      "git",
+      ["-C", repoPath, "show-ref", "--verify", "--quiet", `refs/heads/${branchName}`],
+      { cwd: repoPath }
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function suffixedWorktreeTarget(baseValue: string, attempt: number): string {
+  return attempt === 0 ? baseValue : `${baseValue}-rerun-${attempt}`;
+}
+
+async function resolveFreshIssueWorktreeTarget(
+  project: ProjectRecord,
+  entries: Awaited<ReturnType<typeof listGitWorktrees>>,
+  desiredBranchName: string,
+  desiredWorktreePath: string
+): Promise<{ branchName: string; worktreePath: string }> {
+  const livePaths = new Set(entries.filter((entry) => !entry.isPrunable).map((entry) => entry.path));
+  const liveBranches = new Set(
+    entries
+      .filter((entry) => !entry.isPrunable)
+      .flatMap((entry) => (entry.branchName ? [entry.branchName] : []))
+  );
+
+  let attempt = 0;
+  while (true) {
+    const candidateBranchName = suffixedWorktreeTarget(desiredBranchName, attempt);
+    const candidateWorktreePath = suffixedWorktreeTarget(desiredWorktreePath, attempt);
+    const branchBusy =
+      liveBranches.has(candidateBranchName) ||
+      (await localBranchExists(project.repoPath, candidateBranchName));
+    const pathBusy = livePaths.has(candidateWorktreePath);
+
+    if (!branchBusy && !pathBusy) {
+      return {
+        branchName: candidateBranchName,
+        worktreePath: candidateWorktreePath
+      };
+    }
+
+    attempt += 1;
+  }
+}
+
+async function ensureWorktreeNodeModules(
+  project: ProjectRecord,
+  worktreePath: string
+): Promise<void> {
+  const sourceNodeModulesPath = path.join(project.repoPath, "node_modules");
+  const targetNodeModulesPath = path.join(worktreePath, "node_modules");
+
+  if (!(await pathExists(sourceNodeModulesPath)) || (await pathExists(targetNodeModulesPath))) {
+    return;
+  }
+
+  try {
+    if (process.platform === "win32") {
+      await fs.symlink(sourceNodeModulesPath, targetNodeModulesPath, "junction");
+    } else {
+      await runCommandOrThrow("ln", ["-s", sourceNodeModulesPath, targetNodeModulesPath], {
+        cwd: worktreePath
+      });
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
+      throw error;
+    }
+  }
+}
+
+async function resetWorktreeValidationState(worktreePath: string): Promise<void> {
+  const transientPaths = [
+    "apps/cli/dist",
+    "apps/desktop/dist",
+    "apps/web/dist",
+    "packages/core/dist",
+    "packages/shared/dist",
+    "apps/cli/tsconfig.tsbuildinfo",
+    "apps/desktop/tsconfig.tsbuildinfo",
+    "apps/web/tsconfig.tsbuildinfo",
+    "packages/core/tsconfig.tsbuildinfo",
+    "packages/shared/tsconfig.tsbuildinfo"
+  ];
+
+  await Promise.all(
+    transientPaths.map((relativePath) =>
+      fs.rm(path.join(worktreePath, relativePath), {
+        recursive: true,
+        force: true
+      })
+    )
+  );
+}
+
 async function ensureIssueWorktree(
   project: ProjectRecord,
   issueNumber: number,
@@ -848,21 +1040,34 @@ async function ensureIssueWorktree(
   await fs.mkdir(project.worktreeRoot, { recursive: true });
   await pruneGitWorktrees(project.repoPath);
 
+  const entries = (await listGitWorktrees(project.repoPath)).filter(
+    (entry) =>
+      entry.path === worktreePath ||
+      entry.path.startsWith(`${project.worktreeRoot}${path.sep}`)
+  );
+
   const reusable = selectReusableGitWorktree(
-    await listGitWorktrees(project.repoPath),
+    entries,
     worktreePath,
     branchName
   );
 
-  if (reusable && (await pathExists(reusable.path))) {
+  if (
+    reusable &&
+    (await pathExists(reusable.path)) &&
+    !(await worktreeHasUncommittedChanges(reusable.path))
+  ) {
+    await ensureWorktreeNodeModules(project, reusable.path);
     return {
       branchName: reusable.branchName ?? branchName,
       worktreePath: reusable.path
     };
   }
 
-  if (await pathExists(worktreePath)) {
-    await fs.rm(worktreePath, { recursive: true, force: true });
+  const target = await resolveFreshIssueWorktreeTarget(project, entries, branchName, worktreePath);
+
+  if (await pathExists(target.worktreePath)) {
+    await fs.rm(target.worktreePath, { recursive: true, force: true });
   }
 
   await runCommandOrThrow(
@@ -873,16 +1078,18 @@ async function ensureIssueWorktree(
       "worktree",
       "add",
       "-B",
-      branchName,
-      worktreePath,
+      target.branchName,
+      target.worktreePath,
       project.defaultBranch
     ],
     { cwd: project.repoPath }
   );
 
+  await ensureWorktreeNodeModules(project, target.worktreePath);
+
   return {
-    branchName,
-    worktreePath
+    branchName: target.branchName,
+    worktreePath: target.worktreePath
   };
 }
 
@@ -1592,9 +1799,10 @@ async function resolveOpenQuestion(
 }
 
 async function chooseNextIssue(session: ProjectSession): Promise<void> {
-  const [router, cache] = await Promise.all([
+  const [router, cache, conversation] = await Promise.all([
     loadRouterState(session.paths, session.project.slug),
-    loadGitHubCacheState(session.paths, session.project.slug)
+    loadGitHubCacheState(session.paths, session.project.slug),
+    loadConversationState(session.paths, session.project)
   ]);
 
   if (router.openQuestion) {
@@ -1609,11 +1817,19 @@ async function chooseNextIssue(session: ProjectSession): Promise<void> {
     return;
   }
 
-  const issues = cache.issues
+  const candidateIssues = cache.issues
     .map((issue) => mapRemoteIssue(session.project, issue))
     .filter((issue) => issue.state.toLowerCase() === "open")
     .filter((issue) => issue.workflowState === "ready" || issue.workflowState === "queued")
     .filter((issue) => !hasPendingLaneWork(router, issue.number));
+  const readyIssues = candidateIssues.filter((issue) => issue.workflowState === "ready");
+  const issues = (readyIssues.length > 0 ? readyIssues : candidateIssues)
+    .filter((issue) => issue.workflowState === "ready" || issue.workflowState === "queued")
+    .sort((left, right) => {
+      const leftPriority = left.workflowState === "ready" ? 0 : 1;
+      const rightPriority = right.workflowState === "ready" ? 0 : 1;
+      return leftPriority - rightPriority || left.number - right.number;
+    });
 
   if (!issues.length) {
     await saveRouterState(session.paths, {
@@ -1628,10 +1844,24 @@ async function chooseNextIssue(session: ProjectSession): Promise<void> {
   }
 
   const fallbackIssue = assertPresent(issues[0], "No queueable issue is available.");
-  const fallbackLane = defaultLaneForIssue(fallbackIssue);
-  const fallbackIntent = defaultExecutionIntentForIssue(fallbackIssue);
+  const directedIssue = selectDirectedIssue(issues, conversation.messages);
+  const preferredIssue = directedIssue ?? fallbackIssue;
+  const directorGuidance =
+    directedIssue
+      ? [...conversation.messages]
+          .reverse()
+          .find(
+            (message) =>
+              message.role === "director" &&
+              extractIssueNumbers(message.content).includes(directedIssue.number)
+          )?.content ?? null
+      : null;
 
   const prompt = buildChiefOfStaffPrompt(COS_TASK_APPENDICES.chooseNextIssue, [
+    {
+      title: "Director priority",
+      content: priorityGuidancePrompt(directedIssue, conversation.messages)
+    },
     {
       title: "Existing lanes",
       content:
@@ -1645,6 +1875,17 @@ async function chooseNextIssue(session: ProjectSession): Promise<void> {
       title: "Open issues",
       content: truncatePromptSection(
         issues.map((issue) => `#${issue.number} [${issue.workflowState}] ${issue.title}`).join("\n")
+      )
+    },
+    {
+      title: "Recent CoS conversation",
+      content: truncatePromptSection(
+        conversation.messages.length > 0
+          ? conversation.messages
+              .slice(-6)
+              .map((message) => `[${message.role}/${message.kind}] ${message.content}`)
+              .join("\n")
+          : "No prior conversation."
       )
     }
   ]);
@@ -1660,36 +1901,57 @@ async function chooseNextIssue(session: ProjectSession): Promise<void> {
     },
     {
       status: "ok",
-      summary: `Selected issue #${fallbackIssue.number} as the next ready slice.`,
+      summary: `Selected issue #${preferredIssue.number} as the next ready slice.`,
       recommended_next_action: "Route the issue into a lane or bounded implementation session.",
       artifact_refs: [],
       blocking_questions: [],
       data: {
-        selected_issue_number: fallbackIssue.number,
+        selected_issue_number: preferredIssue.number,
         owner_type: "lane",
-        execution_intent: fallbackIntent,
-        lane_id: fallbackLane.id,
-        lane_name: fallbackLane.name
+        execution_intent: defaultExecutionIntentForIssue(preferredIssue),
+        lane_id: defaultLaneForIssue(preferredIssue).id,
+        lane_name: defaultLaneForIssue(preferredIssue).name,
+        guidance: directorGuidance,
+        transcript_reply: directedIssue
+          ? `I routed issue #${preferredIssue.number} next because the director explicitly prioritized it.`
+          : `I routed issue #${preferredIssue.number} next.`
       }
     }
   );
 
-  const selectedIssueNumber = parseDataNumber(turn.result.data?.selected_issue_number) ?? fallbackIssue.number;
+  const requestedIssueNumber = parseDataNumber(turn.result.data?.selected_issue_number) ?? preferredIssue.number;
+  const selectionResult =
+    directedIssue && requestedIssueNumber !== directedIssue.number
+      ? {
+          ...turn.result,
+          summary: `Respected the director's explicit request to route issue #${directedIssue.number} next.`,
+          data: {
+            ...(turn.result.data ?? {}),
+            selected_issue_number: directedIssue.number,
+            guidance: directorGuidance ?? parseDataString(turn.result.data?.guidance),
+            transcript_reply:
+              parseDataString(turn.result.data?.transcript_reply) ??
+              `I routed issue #${directedIssue.number} next because the director explicitly asked for it.`
+          }
+        }
+      : turn.result;
+  const selectedIssueNumber =
+    parseDataNumber(selectionResult.data?.selected_issue_number) ?? preferredIssue.number;
   const selectedIssue =
-    issues.find((issue) => issue.number === selectedIssueNumber) ?? fallbackIssue;
-  const ownerType = parseDataString(turn.result.data?.owner_type) ?? "lane";
+    issues.find((issue) => issue.number === selectedIssueNumber) ?? preferredIssue;
+  const ownerType = parseDataString(selectionResult.data?.owner_type) ?? "lane";
   const laneFallback = defaultLaneForIssue(selectedIssue);
-  const laneId = slugify(parseDataString(turn.result.data?.lane_id) ?? laneFallback.id);
-  const laneName = parseDataString(turn.result.data?.lane_name) ?? laneFallback.name;
+  const laneId = slugify(parseDataString(selectionResult.data?.lane_id) ?? laneFallback.id);
+  const laneName = parseDataString(selectionResult.data?.lane_name) ?? laneFallback.name;
   const executionIntent =
-    parseDataString(turn.result.data?.execution_intent) === "plan"
+    parseDataString(selectionResult.data?.execution_intent) === "plan"
       ? "plan"
       : defaultExecutionIntentForIssue(selectedIssue);
 
   const nextRouter = applyChiefOfStaffTurn(session, router, {
     sessionId: turn.sessionId,
     phase: "queue_review",
-    result: turn.result,
+    result: selectionResult,
     issueNumber: selectedIssue.number
   });
   if (ownerType === CHIEF_OF_STAFF_OWNER_ID) {
@@ -1724,7 +1986,7 @@ async function chooseNextIssue(session: ProjectSession): Promise<void> {
     kind: executionIntent,
     status: "pending",
     summary:
-      parseDataString(turn.result.data?.transcript_reply) ??
+      parseDataString(selectionResult.data?.transcript_reply) ??
       `Chief of Staff routed issue #${selectedIssue.number} to lane ${lane.name}.`,
     prNumber: null,
     branchName: null,
@@ -1732,9 +1994,9 @@ async function chooseNextIssue(session: ProjectSession): Promise<void> {
     reviewWindowEndsAt: null,
     lastHandledCommentAt: null,
     details:
-      parseDataString(turn.result.data?.guidance) !== null
+      parseDataString(selectionResult.data?.guidance) !== null
         ? {
-            guidance: parseDataString(turn.result.data?.guidance)
+            guidance: parseDataString(selectionResult.data?.guidance)
           }
         : null
   });
@@ -2304,8 +2566,9 @@ async function dispatchPendingHandoff(session: ProjectSession): Promise<boolean>
   }
 
   try {
-    await maybeRunPackageScript(ensuredWorktree.worktreePath, "typecheck");
-    await maybeRunPackageScript(ensuredWorktree.worktreePath, "build");
+    await resetWorktreeValidationState(ensuredWorktree.worktreePath);
+    await maybeRunPackageScript(session.project, ensuredWorktree.worktreePath, "typecheck");
+    await maybeRunPackageScript(session.project, ensuredWorktree.worktreePath, "build");
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     handoff.status = "blocked";
