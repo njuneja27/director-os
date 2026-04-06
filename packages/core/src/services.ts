@@ -880,6 +880,7 @@ async function evaluateSetupState(
 
   return {
     activeProject: input.activeProject,
+    hasCompletedSetup: Boolean(input.activeProject),
     checks,
     repositoryDraft: input.repositoryDraft,
     canComplete,

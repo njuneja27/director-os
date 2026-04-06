@@ -124,6 +124,14 @@ button {
   color: var(--text);
 }
 
+.engine-badge-static {
+  cursor: default;
+}
+
+.engine-badge-static:hover {
+  transform: none;
+}
+
 .engine-badge-ready {
   border-color: color-mix(in srgb, var(--success) 38%, var(--border));
   background: color-mix(in srgb, var(--success) 12%, white 88%);
@@ -179,6 +187,10 @@ button {
   padding-top: 24px;
 }
 
+.loading-shell {
+  padding-top: 24px;
+}
+
 .workspace-grid,
 .control-room-grid,
 .setup-grid {
@@ -198,6 +210,15 @@ button {
 .setup-grid {
   grid-template-columns: minmax(0, 0.95fr) minmax(360px, 1.05fr);
   align-items: start;
+}
+
+.loading-shell {
+  display: grid;
+  place-items: start;
+}
+
+.loading-panel {
+  width: min(100%, 720px);
 }
 
 .panel {

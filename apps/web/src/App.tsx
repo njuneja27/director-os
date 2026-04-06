@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
 import type {
   ConversationMessageRecord,
@@ -21,12 +21,13 @@ import {
   startDirector,
   syncNow
 } from "./api";
+import { deriveSetupStateBadge, hasCompletedSetup } from "./setup-state";
 
 type SetupStep = "landing" | "repository" | "readiness" | "complete";
 type SetupIntent = "fresh" | "repair";
 
 export function App() {
-  const [shellMode, setShellMode] = useState<"setup" | "app">("setup");
+  const [shellMode, setShellMode] = useState<"booting" | "setup" | "app">("booting");
   const [setupStep, setSetupStep] = useState<SetupStep>("landing");
   const [setupIntent, setSetupIntent] = useState<SetupIntent>("fresh");
   const [setupStatus, setSetupStatus] = useState<SetupStatusResponse | null>(null);
@@ -40,6 +41,7 @@ export function App() {
   const [busyAction, setBusyAction] = useState<string | null>(null);
   const [conversationError, setConversationError] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const setupRefreshSequence = useRef(0);
 
   useEffect(() => {
     void bootstrap();
@@ -59,9 +61,9 @@ export function App() {
     };
   }, [shellMode]);
 
-  const codexCheck = setupStatus?.checks.find((check) => check.kind === "codex") ?? null;
-  const codexBadge = deriveEngineBadge(codexCheck, setupStatus?.completed ?? false);
-  const showSetup = shellMode === "setup" || !setupStatus?.completed;
+  const setupStateBadge = deriveSetupStateBadge(setupStatus);
+  const canReturnToControlRoom = hasCompletedSetup(setupStatus);
+  const showSetup = shellMode === "setup";
   const openQuestion = conversation?.openQuestion ?? null;
   const composerPlaceholder = openQuestion
     ? "Reply to the Chief of Staff..."
@@ -85,13 +87,20 @@ export function App() {
   }
 
   async function refreshSetup(options?: { forceSetup?: boolean }) {
+    const refreshSequence = ++setupRefreshSequence.current;
+
     try {
       setError(null);
       const nextSetupStatus = await fetchSetupStatus();
+
+      if (setupRefreshSequence.current !== refreshSequence) {
+        return;
+      }
+
       setSetupStatus(nextSetupStatus);
       hydrateSetupDraft(nextSetupStatus.repositoryDraft);
 
-      if (nextSetupStatus.completed && !options?.forceSetup) {
+      if (hasCompletedSetup(nextSetupStatus) && !options?.forceSetup) {
         setShellMode("app");
         setSetupStep("complete");
         setSetupIntent("repair");
@@ -100,9 +109,17 @@ export function App() {
       }
 
       setShellMode("setup");
-      setSetupIntent(nextSetupStatus.activeProject ? "repair" : "fresh");
-      setSetupStep(nextSetupStatus.repositoryDraft || nextSetupStatus.activeProject ? "readiness" : "landing");
+      setSetupIntent(hasCompletedSetup(nextSetupStatus) ? "repair" : "fresh");
+      setSetupStep(
+        nextSetupStatus.repositoryDraft || hasCompletedSetup(nextSetupStatus)
+          ? "readiness"
+          : "landing"
+      );
     } catch (nextError) {
+      if (setupRefreshSequence.current !== refreshSequence) {
+        return;
+      }
+
       setError(nextError instanceof Error ? nextError.message : String(nextError));
       setShellMode("setup");
       setSetupStep("landing");
@@ -154,7 +171,7 @@ export function App() {
       hydrateSetupDraft(nextStatus.repositoryDraft);
       if (nextStatus.completed) {
         setSetupStep("complete");
-      } else if (nextStatus.repositoryDraft) {
+      } else if (nextStatus.repositoryDraft || hasCompletedSetup(nextStatus)) {
         setSetupStep("readiness");
       }
     } catch (nextError) {
@@ -178,7 +195,7 @@ export function App() {
   }
 
   async function beginSetup() {
-    setSetupIntent(setupStatus?.activeProject ? "repair" : "fresh");
+    setSetupIntent(hasCompletedSetup(setupStatus) ? "repair" : "fresh");
     setSetupStep("repository");
   }
 
@@ -223,8 +240,17 @@ export function App() {
   async function openRepairSetup() {
     setShellMode("setup");
     setSetupIntent("repair");
-    setSetupStep(setupStatus?.repositoryDraft ? "readiness" : "repository");
+    setSetupStep(setupStatus?.repositoryDraft || canReturnToControlRoom ? "readiness" : "repository");
     await refreshSetup({ forceSetup: true });
+  }
+
+  function returnToControlRoom() {
+    if (!canReturnToControlRoom) {
+      return;
+    }
+
+    setShellMode("app");
+    void refreshWorkspace();
   }
 
   async function handleSendMessage() {
@@ -242,12 +268,20 @@ export function App() {
     });
   }
 
+  if (shellMode === "booting") {
+    return (
+      <div className="app-shell">
+        <LoadingWorkspace badge={setupStateBadge} />
+      </div>
+    );
+  }
+
   if (showSetup) {
     return (
       <div className="app-shell">
         <SetupWorkspace
           busyAction={busyAction}
-          codexBadge={codexBadge}
+          canReturnToControlRoom={canReturnToControlRoom}
           error={error}
           intent={setupIntent}
           modelName={modelName}
@@ -258,9 +292,11 @@ export function App() {
           onProjectNameChange={setProjectName}
           onRefresh={() => void refreshSetup({ forceSetup: true })}
           onRepositoryPathChange={setRepositoryPath}
+          onReturnToControlRoom={returnToControlRoom}
           onRunWorkspaceTest={() => void runSetupWorkspaceTest()}
           projectName={projectName}
           repositoryPath={repositoryPath}
+          setupBadge={setupStateBadge}
           setupStatus={setupStatus}
           setupStep={setupStep}
           worktreeRoot={worktreeRoot}
@@ -307,8 +343,8 @@ export function App() {
               Start
             </button>
           )}
-          <button className={`engine-badge ${codexBadge.className}`} onClick={() => void openRepairSetup()}>
-            {codexBadge.label}
+          <button className={`engine-badge ${setupStateBadge.className}`} onClick={() => void openRepairSetup()}>
+            {setupStateBadge.label}
           </button>
         </div>
       </header>
@@ -581,7 +617,7 @@ export function App() {
 
 function SetupWorkspace(props: {
   busyAction: string | null;
-  codexBadge: { label: string; className: string };
+  canReturnToControlRoom: boolean;
   error: string | null;
   intent: SetupIntent;
   modelName: string;
@@ -592,16 +628,17 @@ function SetupWorkspace(props: {
   onProjectNameChange: (value: string) => void;
   onRefresh: () => void;
   onRepositoryPathChange: (value: string) => void;
+  onReturnToControlRoom: () => void;
   onRunWorkspaceTest: () => void;
   onWorktreeRootChange: (value: string) => void;
   projectName: string;
   repositoryPath: string;
+  setupBadge: { label: string; className: string };
   setupStatus: SetupStatusResponse | null;
   setupStep: SetupStep;
   worktreeRoot: string;
 }) {
   const repositoryCheck = props.setupStatus?.checks.find((check) => check.kind === "repository") ?? null;
-  const canOpenWorkspace = props.setupStatus?.completed;
 
   return (
     <div className="setup-shell">
@@ -617,9 +654,16 @@ function SetupWorkspace(props: {
             </div>
           </div>
         </div>
-        <button className={`engine-badge ${props.codexBadge.className}`} onClick={props.onRefresh}>
-          {props.codexBadge.label}
-        </button>
+        <div className="header-actions">
+          <span className={`engine-badge engine-badge-static ${props.setupBadge.className}`}>
+            {props.setupBadge.label}
+          </span>
+          {props.canReturnToControlRoom ? (
+            <button className="action-button action-button-secondary" onClick={props.onReturnToControlRoom}>
+              Return to control room
+            </button>
+          ) : null}
+        </div>
       </header>
 
       {props.error ? <Banner tone="danger">{props.error}</Banner> : null}
@@ -728,12 +772,45 @@ function SetupWorkspace(props: {
                 disabled={!props.setupStatus?.canComplete || props.busyAction === "setup-complete"}
                 onClick={props.onCompleteSetup}
               >
-                {canOpenWorkspace ? "Open Director Home" : "Complete setup"}
+                {props.canReturnToControlRoom ? "Save repair" : "Complete setup"}
               </button>
+              {props.canReturnToControlRoom ? (
+                <button className="action-button action-button-secondary" onClick={props.onReturnToControlRoom}>
+                  Return to control room
+                </button>
+              ) : null}
             </div>
           </div>
         </section>
       </div>
+    </div>
+  );
+}
+
+function LoadingWorkspace(props: { badge: { label: string; className: string } }) {
+  return (
+    <div className="setup-shell">
+      <header className="topbar setup-topbar">
+        <div className="brand-block">
+          <div className="brand-mark">D</div>
+          <div>
+            <div className="brand-name">Director OS</div>
+            <div className="brand-meta">Checking the local control room before the shell loads.</div>
+          </div>
+        </div>
+        <span className={`engine-badge engine-badge-static ${props.badge.className}`}>{props.badge.label}</span>
+      </header>
+
+      <main className="loading-shell">
+        <section className="panel loading-panel">
+          <div className="eyebrow">Local-first desktop shell</div>
+          <h1 className="hero-title">Checking setup completion.</h1>
+          <p className="hero-copy">
+            Director OS is reading the local project registration and runtime health before it picks
+            setup or the control room.
+          </p>
+        </section>
+      </main>
     </div>
   );
 }
@@ -838,44 +915,6 @@ function ItemList<TItem>(props: {
   }
 
   return <div className="list-stack">{props.items.map(props.render)}</div>;
-}
-
-function deriveEngineBadge(
-  check: SetupCheck | null,
-  completed: boolean
-): { className: string; label: string } {
-  if (!check && !completed) {
-    return {
-      className: "engine-badge-neutral",
-      label: "Setup pending"
-    };
-  }
-
-  if (check?.status === "ready") {
-    return {
-      className: "engine-badge-ready",
-      label: "Codex ready"
-    };
-  }
-
-  if (check?.code === "codex_sign_in_required") {
-    return {
-      className: "engine-badge-warning",
-      label: "Needs sign-in"
-    };
-  }
-
-  if (check?.status === "blocked") {
-    return {
-      className: "engine-badge-danger",
-      label: "Codex blocked"
-    };
-  }
-
-  return {
-    className: "engine-badge-neutral",
-    label: completed ? "Codex unknown" : "Setup pending"
-  };
 }
 
 function formatTimestamp(value: string): string {
