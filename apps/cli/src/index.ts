@@ -90,6 +90,13 @@ program
   });
 
 program
+  .command("status")
+  .description("Utility: print the full control-room status payload")
+  .action(async () => {
+    console.log(JSON.stringify(await getDirectorStatus(), null, 2));
+  });
+
+program
   .command("lanes")
   .description("Print lane visibility with owned issues, linked PRs, and the current blocker")
   .action(async () => {
