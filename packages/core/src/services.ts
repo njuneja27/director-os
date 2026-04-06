@@ -439,6 +439,35 @@ export function reconcileProjectConfigWithRepository(
   };
 }
 
+function normalizeSuccessfulSyncTimestamp(value: string | null | undefined): string | null {
+  if (typeof value !== "string") {
+    return null;
+  }
+
+  const trimmed = value.trim();
+  return trimmed && Number.isFinite(Date.parse(trimmed)) ? trimmed : null;
+}
+
+export function resolveLastSuccessfulSyncAt(
+  routerLastSyncAt: string | null | undefined,
+  cacheSyncedAt: string | null | undefined
+): string | null {
+  const routerTimestamp = normalizeSuccessfulSyncTimestamp(routerLastSyncAt);
+  const cacheTimestamp = normalizeSuccessfulSyncTimestamp(cacheSyncedAt);
+
+  if (!routerTimestamp) {
+    return cacheTimestamp;
+  }
+
+  if (!cacheTimestamp) {
+    return routerTimestamp;
+  }
+
+  return Date.parse(routerTimestamp) >= Date.parse(cacheTimestamp)
+    ? routerTimestamp
+    : cacheTimestamp;
+}
+
 async function getCurrentGitBranch(repoPath: string): Promise<string | null> {
   try {
     const branch = await runCommandOrThrow("git", ["rev-parse", "--abbrev-ref", "HEAD"], {
@@ -3226,7 +3255,7 @@ export async function getDirectorStatus(): Promise<DirectorStatusResponse> {
     return {
       project: session.project,
       orchestrator: synthesizeOrchestratorStatus(session.project, router, owner),
-      lastSuccessfulSyncAt: router.lastSyncAt,
+      lastSuccessfulSyncAt: resolveLastSuccessfulSyncAt(router.lastSyncAt, cache.syncedAt),
       lanes: router.lanes.map((lane) => synthesizeLaneRecord(lane, openPullRequests)),
       issues: issues.map((issue) => synthesizeIssueOwnership(issue, router, pullRequests)),
       openQuestion: router.openQuestion ? toHumanQuestionRecord(router.openQuestion) : null,
