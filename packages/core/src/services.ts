@@ -1603,6 +1603,7 @@ function applyLaneTurn(
       raw_model_output?: string | null;
     };
     issueNumber: number;
+    worktreePath?: string | null;
   }
 ): RouterState {
   lane.sessionId = input.sessionId ?? lane.sessionId;
@@ -1625,7 +1626,7 @@ function applyLaneTurn(
     blockingQuestions: input.result.blocking_questions,
     outputJson: input.result.data ?? null,
     rawModelOutput: input.result.raw_model_output ?? null,
-    worktreePath: null
+    worktreePath: input.worktreePath ?? null
   });
 }
 
@@ -2701,10 +2702,9 @@ async function dispatchPendingHandoff(session: ProjectSession): Promise<boolean>
   const turn = await runCodexSessionAgent(
     {
       role: "lane_owner",
-      cwd: session.project.repoPath,
+      cwd: ensuredWorktree.worktreePath,
       model: session.project.model,
       allowWrite: true,
-      addDirs: [session.project.worktreeRoot],
       prompt: buildLaneImplementationPrompt(session, lane, issue, handoff),
       sessionId: lane.sessionId
     },
@@ -2724,7 +2724,8 @@ async function dispatchPendingHandoff(session: ProjectSession): Promise<boolean>
     sessionId: turn.sessionId,
     phase: handoff.kind,
     result: turn.result,
-    issueNumber: issue.number
+    issueNumber: issue.number,
+    worktreePath: ensuredWorktree.worktreePath
   });
   const relay = parseDataString(turn.result.data?.transcript_reply) ?? turn.result.summary;
 
