@@ -11,6 +11,7 @@ import type { StoredProjectConfig } from "./config.js";
 import { createDefaultRouterState, type RouterState } from "./runtime-state.js";
 import {
   buildResetRouterState,
+  describeRouterRuntimeResetBlocker,
   ensureIssueWorktree,
   reconcileProjectConfigWithRepository,
   resolveLastSuccessfulSyncAt
@@ -384,5 +385,34 @@ describe("buildResetRouterState", () => {
     expect(reset.pendingHandoffs).toEqual([]);
     expect(reset.openQuestion).toBeNull();
     expect(reset.recentRuns).toEqual([]);
+  });
+});
+
+describe("describeRouterRuntimeResetBlocker", () => {
+  it("blocks reset while the Chief of Staff loop is still mid-turn", () => {
+    expect(
+      describeRouterRuntimeResetBlocker({
+        orchestratorRunning: true,
+        activeLaneDispatchCount: 0
+      })
+    ).toContain("Chief of Staff loop turn");
+  });
+
+  it("blocks reset while lane handoffs are still in flight", () => {
+    expect(
+      describeRouterRuntimeResetBlocker({
+        orchestratorRunning: false,
+        activeLaneDispatchCount: 2
+      })
+    ).toContain("2 lane handoffs");
+  });
+
+  it("allows reset once no local router work is still executing", () => {
+    expect(
+      describeRouterRuntimeResetBlocker({
+        orchestratorRunning: false,
+        activeLaneDispatchCount: 0
+      })
+    ).toBeNull();
   });
 });

@@ -483,6 +483,23 @@ export function buildResetRouterState(router: RouterState): RouterState {
   };
 }
 
+export function describeRouterRuntimeResetBlocker(input: {
+  orchestratorRunning: boolean;
+  activeLaneDispatchCount: number;
+}): string | null {
+  if (input.orchestratorRunning) {
+    return "This Director OS window is still running a Chief of Staff loop turn. Wait for it to finish or restart the app before resetting router runtime.";
+  }
+
+  if (input.activeLaneDispatchCount > 0) {
+    return `This Director OS window still has ${input.activeLaneDispatchCount} lane handoff${
+      input.activeLaneDispatchCount === 1 ? "" : "s"
+    } in flight. Wait for lane work to settle or restart the app before resetting router runtime.`;
+  }
+
+  return null;
+}
+
 async function getCurrentGitBranch(repoPath: string): Promise<string | null> {
   try {
     const branch = await runCommandOrThrow("git", ["rev-parse", "--abbrev-ref", "HEAD"], {
@@ -3898,6 +3915,16 @@ export async function resetRouterRuntime(): Promise<DirectorOperationResponse> {
           if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
             throw error;
           }
+        }
+      }
+
+      if (owner?.token === ORCHESTRATOR_OWNER_TOKEN) {
+        const resetBlocker = describeRouterRuntimeResetBlocker({
+          orchestratorRunning,
+          activeLaneDispatchCount: activeLaneDispatches.size
+        });
+        if (resetBlocker) {
+          throw new Error(resetBlocker);
         }
       }
 
