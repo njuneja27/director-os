@@ -87,6 +87,10 @@ async function pathExists(targetPath: string): Promise<boolean> {
   }
 }
 
+async function hasRuntimePayload(paths: RuntimePaths): Promise<boolean> {
+  return pathExists(paths.configPath);
+}
+
 export function resolveRuntimePaths(
   homeDir = resolveDefaultRuntimeHomeDir(),
   options: RuntimePathOptions = {}
@@ -112,7 +116,7 @@ export async function resolveActiveRuntimePaths(
     return preferredPaths;
   }
 
-  if (await pathExists(preferredPaths.homeDir)) {
+  if (await hasRuntimePayload(preferredPaths)) {
     return preferredPaths;
   }
 

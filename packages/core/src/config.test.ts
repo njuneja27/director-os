@@ -62,7 +62,7 @@ describe("resolveActiveRuntimePaths", () => {
     expect(paths.tmpDir).toBe(path.join(legacyHomeDir, "tmp"));
   });
 
-  it("prefers the native macOS location once Application Support already exists", async () => {
+  it("keeps using the legacy dotfolder when Application Support exists but has no config yet", async () => {
     const homedir = await createSandboxHome();
     const preferredHomeDir = resolveDefaultRuntimeHomeDir({
       homedir,
@@ -71,6 +71,27 @@ describe("resolveActiveRuntimePaths", () => {
     const legacyHomeDir = resolveLegacyRuntimeHomeDir({ homedir, platform: "darwin" });
 
     await fs.mkdir(preferredHomeDir, { recursive: true });
+    await fs.mkdir(legacyHomeDir, { recursive: true });
+
+    const paths = await resolveActiveRuntimePaths({
+      homedir,
+      platform: "darwin"
+    });
+
+    expect(paths.homeDir).toBe(legacyHomeDir);
+    expect(paths.tmpDir).toBe(path.join(legacyHomeDir, "tmp"));
+  });
+
+  it("prefers the native macOS location once Application Support has active runtime config", async () => {
+    const homedir = await createSandboxHome();
+    const preferredHomeDir = resolveDefaultRuntimeHomeDir({
+      homedir,
+      platform: "darwin"
+    });
+    const legacyHomeDir = resolveLegacyRuntimeHomeDir({ homedir, platform: "darwin" });
+
+    await fs.mkdir(preferredHomeDir, { recursive: true });
+    await fs.writeFile(path.join(preferredHomeDir, "config.json"), "{}\n", "utf8");
     await fs.mkdir(legacyHomeDir, { recursive: true });
 
     const paths = await resolveActiveRuntimePaths({
