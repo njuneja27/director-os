@@ -101,6 +101,10 @@ function createHttpDirectorClient(): WebDirectorClient {
     sync: () =>
       requestJson<DirectorOperationResponse>("/api/sync", {
         method: "POST"
+      }),
+    resetRouterRuntime: () =>
+      requestJson<DirectorOperationResponse>("/api/reset-router-runtime", {
+        method: "POST"
       })
   };
 }
@@ -117,7 +121,8 @@ function createIpcDirectorClient(bridge: DirectorDesktopBridge): WebDirectorClie
     getStatus: () => bridge.director.getStatus(),
     start: () => bridge.director.start(),
     pause: (reason?: string) => bridge.director.pause(reason),
-    sync: () => bridge.director.sync()
+    sync: () => bridge.director.sync(),
+    resetRouterRuntime: () => bridge.director.resetRouterRuntime()
   };
 }
 
@@ -179,4 +184,8 @@ export async function pauseDirector(reason?: string): Promise<DirectorOperationR
 
 export async function syncNow(): Promise<DirectorOperationResponse> {
   return getDirectorClient().sync();
+}
+
+export async function resetRouterRuntime(): Promise<DirectorOperationResponse> {
+  return getDirectorClient().resetRouterRuntime();
 }

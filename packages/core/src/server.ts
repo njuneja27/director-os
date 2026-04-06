@@ -12,6 +12,7 @@ import {
   getSetupStatus,
   pauseOrchestrator,
   probeRepositorySetup,
+  resetRouterRuntime,
   runWorkspaceSetupTest,
   startOrchestrator,
   sendConversationMessage,
@@ -91,6 +92,7 @@ export async function createDirectorServer() {
     pauseOrchestrator(request.body?.reason)
   );
   app.post("/api/sync", async () => syncProject());
+  app.post("/api/reset-router-runtime", async () => resetRouterRuntime());
 
   app.setNotFoundHandler(async (request, reply) => {
     if (request.raw.url?.startsWith("/api/")) {

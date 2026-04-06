@@ -379,6 +379,7 @@ export interface DirectorClient {
   start(): Promise<DirectorOperationResponse>;
   pause(reason?: string): Promise<DirectorOperationResponse>;
   sync(): Promise<DirectorOperationResponse>;
+  resetRouterRuntime(): Promise<DirectorOperationResponse>;
 }
 
 export interface DirectorDesktopBridge {
@@ -397,6 +398,7 @@ export interface DirectorDesktopBridge {
     start(): Promise<DirectorOperationResponse>;
     pause(reason?: string): Promise<DirectorOperationResponse>;
     sync(): Promise<DirectorOperationResponse>;
+    resetRouterRuntime(): Promise<DirectorOperationResponse>;
   };
 }
 

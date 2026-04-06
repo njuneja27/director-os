@@ -8,7 +8,9 @@ import { describe, expect, it } from "vitest";
 
 import type { DecisionRecord, ProjectRecord, RunRecord } from "@director-os/shared";
 import type { StoredProjectConfig } from "./config.js";
+import { createDefaultRouterState, type RouterState } from "./runtime-state.js";
 import {
+  buildResetRouterState,
   ensureIssueWorktree,
   reconcileProjectConfigWithRepository,
   resolveLastSuccessfulSyncAt
@@ -266,5 +268,121 @@ describe("resolveLastSuccessfulSyncAt", () => {
       resolveLastSuccessfulSyncAt("not-a-timestamp", "2026-04-05T12:00:00.000Z")
     ).toBe("2026-04-05T12:00:00.000Z");
     expect(resolveLastSuccessfulSyncAt("not-a-timestamp", "also-bad")).toBeNull();
+  });
+});
+
+describe("buildResetRouterState", () => {
+  it("clears operational router runtime state while preserving sync metadata", () => {
+    const router: RouterState = {
+      ...createDefaultRouterState("director-os"),
+      orchestrator: {
+        status: "blocked",
+        pauseReason: "Wedged local state",
+        lastLoopAt: "2026-04-06T12:30:00.000Z",
+        lastSummary: "Router wedged on a pending lane handoff."
+      },
+      chiefOfStaff: {
+        sessionId: "cos-session",
+        lastSummary: "Reviewing blocker state.",
+        updatedAt: "2026-04-06T12:29:00.000Z"
+      },
+      lanes: [
+        {
+          id: "operations",
+          name: "Operations",
+          sessionId: "lane-session",
+          issueNumbers: [82],
+          status: "blocked",
+          currentIssueNumber: 82,
+          activePullRequestNumber: 14,
+          lastSummary: "Waiting on a blocker reset.",
+          lastPlanSummary: "Reset runtime through the control room.",
+          updatedAt: "2026-04-06T12:28:00.000Z"
+        }
+      ],
+      issueOwnership: {
+        "82": "operations"
+      },
+      pendingHandoffs: [
+        {
+          id: "handoff_1",
+          laneId: "operations",
+          issueNumber: 82,
+          kind: "implement",
+          status: "blocked",
+          summary: "Lane runtime wedged.",
+          prNumber: 14,
+          branchName: "codex/issue-82-add-a-control-room-action-to-reset-l",
+          worktreePath: "/tmp/director-os/issue-82",
+          startedAt: "2026-04-06T12:26:00.000Z",
+          startedBy: "owner-token",
+          startedByPid: 12345,
+          reviewWindowEndsAt: null,
+          lastHandledCommentAt: null,
+          details: {
+            retryable: true
+          },
+          createdAt: "2026-04-06T12:25:00.000Z",
+          updatedAt: "2026-04-06T12:27:00.000Z"
+        }
+      ],
+      openQuestion: {
+        id: "question_1",
+        title: "Need runtime recovery decision",
+        summary: "The router is wedged.",
+        question: "Should the local router runtime be reset?",
+        whyItMatters: "The control room cannot continue until operational state is cleared.",
+        recommendation: "Reset the local router runtime from the control room.",
+        issueNumber: 82,
+        prNumber: 14,
+        runId: 9,
+        requestedBy: "chief_of_staff",
+        createdAt: "2026-04-06T12:24:00.000Z",
+        updatedAt: "2026-04-06T12:24:00.000Z"
+      },
+      recentRuns: [
+        {
+          id: 9,
+          projectId: 1,
+          issueNumber: 82,
+          prNumber: 14,
+          role: "chief_of_staff",
+          status: "needs_input",
+          phase: "question",
+          summary: "Waiting on a runtime recovery decision.",
+          recommendedNextAction: "Reset the local router runtime.",
+          artifacts: [],
+          blockingQuestions: [
+            "Should the local router runtime be reset?"
+          ],
+          outputJson: null,
+          rawModelOutput: null,
+          worktreePath: null,
+          createdAt: "2026-04-06T12:24:00.000Z",
+          updatedAt: "2026-04-06T12:24:00.000Z"
+        }
+      ],
+      lastSyncAt: "2026-04-06T12:20:00.000Z",
+      updatedAt: "2026-04-06T12:30:00.000Z"
+    };
+
+    const reset = buildResetRouterState(router);
+
+    expect(reset.projectSlug).toBe("director-os");
+    expect(reset.lastSyncAt).toBe("2026-04-06T12:20:00.000Z");
+    expect(reset.orchestrator.status).toBe("idle");
+    expect(reset.orchestrator.pauseReason).toBeNull();
+    expect(reset.orchestrator.lastLoopAt).toBeNull();
+    expect(reset.orchestrator.lastSummary).toContain("reset");
+    expect(reset.chiefOfStaff).toEqual({
+      sessionId: null,
+      lastSummary: null,
+      updatedAt: null
+    });
+    expect(reset.lanes).toEqual([]);
+    expect(reset.issueOwnership).toEqual({});
+    expect(reset.pendingHandoffs).toEqual([]);
+    expect(reset.openQuestion).toBeNull();
+    expect(reset.recentRuns).toEqual([]);
   });
 });

@@ -33,7 +33,8 @@ const api: DirectorDesktopBridge = {
     getStatus: () => invoke(IPC_CHANNELS.director.getStatus),
     start: () => invoke(IPC_CHANNELS.director.start),
     pause: (reason?: string) => invoke(IPC_CHANNELS.director.pause, reason),
-    sync: () => invoke(IPC_CHANNELS.director.sync)
+    sync: () => invoke(IPC_CHANNELS.director.sync),
+    resetRouterRuntime: () => invoke(IPC_CHANNELS.director.resetRouterRuntime)
   }
 };
 
