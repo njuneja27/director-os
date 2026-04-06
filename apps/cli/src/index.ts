@@ -15,9 +15,21 @@ import {
 
 program.name("director").description("Director OS Chief of Staff chat plus lane visibility").version("0.1.0");
 
+async function printLaneVisibility(): Promise<void> {
+  const status = await getDirectorStatus();
+  console.log(JSON.stringify({
+    orchestrator: status.orchestrator,
+    lastSuccessfulSyncAt: status.lastSuccessfulSyncAt,
+    openQuestion: status.openQuestion,
+    lanes: status.lanes,
+    issues: status.issues,
+    openPullRequests: status.openPullRequests
+  }, null, 2));
+}
+
 program
   .command("init")
-  .description("Initialize Director OS and register a project")
+  .description("Setup: initialize Director OS and register a project")
   .option("--project-name <name>")
   .option("--repo-path <path>")
   .option("--repo-slug <slug>")
@@ -45,7 +57,7 @@ program
 
 program
   .command("serve")
-  .description("Start the local API and UI server")
+  .description("Utility: start the local API and UI server")
   .option("--port <port>", "Port to bind", "4848")
   .option("--open", "Open the browser after starting the server", false)
   .action(async (options) => {
@@ -79,24 +91,16 @@ program
 
 program
   .command("status")
-  .description("Print the current Chief of Staff and lane status payload")
+  .description("Utility: print the full control-room status payload")
   .action(async () => {
     console.log(JSON.stringify(await getDirectorStatus(), null, 2));
   });
 
 program
   .command("lanes")
-  .description("Print the current lane ownership view")
+  .description("Print lane visibility with owned issues, linked PRs, and the current blocker")
   .action(async () => {
-    const status = await getDirectorStatus();
-    console.log(JSON.stringify({
-      orchestrator: status.orchestrator,
-      lastSuccessfulSyncAt: status.lastSuccessfulSyncAt,
-      openQuestion: status.openQuestion,
-      lanes: status.lanes,
-      issues: status.issues,
-      openPullRequests: status.openPullRequests
-    }, null, 2));
+    await printLaneVisibility();
   });
 
 program
