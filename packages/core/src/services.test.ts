@@ -433,7 +433,9 @@ describe("Chief of Staff blocker routing", () => {
       blockingQuestion: "How should the lane recover from this validation failure?",
       transcriptReply: "Delivery hit a validation failure on issue #55.",
       artifactRefs: ["/tmp/director-os/issue-55"],
-      commandError: "tsc failed"
+      commandError: "tsc failed",
+      blockerSource: "validation_failure",
+      blockerContext: "Validation failed."
     });
 
     expect(result.status).toBe("needs_input");
@@ -445,6 +447,8 @@ describe("Chief of Staff blocker routing", () => {
       "Delivery hit a validation failure on issue #55."
     );
     expect(result.data?.command_error).toBe("tsc failed");
+    expect(result.data?.blocker_source).toBe("validation_failure");
+    expect(result.data?.blocker_context).toBe("Validation failed.");
   });
 
   it("queues lane blockers for Chief of Staff mediation instead of finalizing them directly", () => {
@@ -522,7 +526,9 @@ describe("Chief of Staff blocker routing", () => {
           blockingQuestion: "How should Delivery recover from this validation failure?",
           transcriptReply: "Delivery hit a validation failure on issue #55.",
           artifactRefs: ["/tmp/director-os/worktrees/issue-55"],
-          commandError: "tsc failed"
+          commandError: "tsc failed",
+          blockerSource: "validation_failure",
+          blockerContext: "Validation failed for issue #55."
         }),
         reviewType: "blocker_mediation",
         branchName: "codex/issue-55-chief-of-staff-blockers",
