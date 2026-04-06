@@ -1,5 +1,27 @@
 # Director OS
 
+## Source Checkout Startup
+
+From the repository root, use one command to launch the desktop app from source:
+
+1. `npm start`
+
+What `npm start` does for you:
+
+- bootstraps workspace dependencies with `npm install` when the checkout is new or `package-lock.json` is newer than the installed dependency state
+- rebuilds the shared package, core package, web renderer, desktop shell, and CLI before launch
+- opens the Electron desktop app once the checkout is current
+
+First run:
+
+- run `npm start`
+- expect dependency installation plus a full rebuild before the desktop window opens
+
+Normal relaunch:
+
+- run `npm start`
+- dependency installation is skipped when the checkout is already bootstrapped, but build artifacts are still refreshed before launch so the app does not use stale `dist` output
+
 ## What We Want To Do
 
 Director OS is a local-first orchestration engine for running a software product with AI agents while the human stays at the level of direction, taste, and exception handling.
@@ -67,11 +89,10 @@ The primary desktop experience is:
 
 ## Dogfood Smoke Test
 
-When operating Director OS from this source checkout rather than an installed build, rebuild first so the local `dist` artifacts match the current source before using the CLI directly.
+After launching the desktop app from source, the CLI remains available for smoke tests and debugging.
 
-1. `npm run build`
-2. `node apps/cli/dist/index.js sync`
-3. `node apps/cli/dist/index.js status`
+1. `npm run director -- sync`
+2. `npm run director -- status`
 
 Expected result:
 
@@ -79,24 +100,15 @@ Expected result:
 - newly opened GitHub issues do appear in `status.queue`
 - the control-room queue only shows open, claimable work
 
-### Validated Local Smoke-Test Path
+### Advanced and Debug Paths
 
-When using the CLI directly, prefer the root `director` script so commands run against a fresh build instead of potentially stale compiled artifacts.
+The lower-level entrypoints are still available when you need them, but they are no longer the default source-checkout instructions.
 
-Examples:
-
-- `npm run director -- status`
-- `npm run director -- sync`
-- `npm run director -- conversation`
-- `npm run director -- message "Focus on setup reliability before UI polish."`
-- `npm run director -- start`
-- `npm run director -- pause --reason "manual stop"`
-
-For desktop dogfooding, prefer:
-
-- `npm run desktop:start`
-
-This path rebuilds the desktop shell, renderer, core package, and CLI before launch.
+- `npm run desktop:start` is the legacy alias for `npm start`
+- `npm run desktop:build` refreshes the desktop app artifacts without launching Electron
+- `npm run director -- <command>` runs CLI commands against a fresh build
+- `npm run desktop:dev` starts the live-reload desktop development loop
+- `npm --prefix apps/desktop run start` launches Electron directly against whatever artifacts are already built
 
 ## Scope
 
