@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 
 import type {
   ConversationMessageRecord,
@@ -83,19 +83,6 @@ export function App() {
   const composerPlaceholder = openQuestion
     ? "Reply to the Chief of Staff..."
     : "Message the Chief of Staff about the next slice, blocker, or product call.";
-
-  const counts = useMemo(
-    () => ({
-      lanes: status?.lanes.length ?? 0,
-      ownedIssues:
-        status?.issues.filter((issue) => issue.state.toLowerCase() === "open" && issue.ownerKind).length ?? 0,
-      blockers:
-        (status?.openQuestion ? 1 : 0) +
-        (status?.lanes.filter((lane) => lane.status === "blocked").length ?? 0),
-      prs: status?.openPullRequests.length ?? 0
-    }),
-    [status]
-  );
 
   async function bootstrap() {
     await refreshSetup();
@@ -474,29 +461,26 @@ export function App() {
           <section className="panel sidebar-card">
             <div className="panel-header">
               <div>
-                <div className="section-title">State</div>
+                <div className="section-title">Session state</div>
                 <div className="section-meta">{status?.orchestrator?.lastSummary ?? "The Chief of Staff router is ready."}</div>
               </div>
             </div>
-            <div className="hero-stats sidebar-stats">
-              <StatCard label="Lanes" value={String(counts.lanes)} />
-              <StatCard label="Owned issues" value={String(counts.ownedIssues)} />
-              <StatCard label="Blockers" value={String(counts.blockers)} />
-              <StatCard label="Open PRs" value={String(counts.prs)} />
+            <div className="meta-pairs">
+              <div className="meta-pair">
+                <span className="meta-pair-label">Chief of Staff loop</span>
+                <StatusPill status={status?.orchestrator?.status ?? "idle"} />
+              </div>
+              <div className="meta-pair">
+                <span className="meta-pair-label">Last successful GitHub sync</span>
+                <span className="meta-pair-value">
+                  {status?.lastSuccessfulSyncAt
+                    ? formatTimestamp(status.lastSuccessfulSyncAt)
+                    : "No successful sync yet"}
+                </span>
+              </div>
             </div>
-            <div className="hero-meta">
-              <span className={`status-pill status-pill-${(status?.orchestrator?.status ?? "idle").replace("_", "-")}`}>
-                {formatOrchestratorStatus(status?.orchestrator?.status ?? "idle")}
-              </span>
-              <span>The Chief of Staff loop stays local and routes work through persistent lane sessions.</span>
-            </div>
-            <div className="hero-meta">
-              <span>Last successful GitHub sync</span>
-              <span>
-                {status?.lastSuccessfulSyncAt
-                  ? formatTimestamp(status.lastSuccessfulSyncAt)
-                  : "No successful sync yet"}
-              </span>
+            <div className="list-note">
+              The Chief of Staff loop stays local and routes work through persistent lane sessions.
             </div>
           </section>
 
@@ -637,31 +621,6 @@ export function App() {
             />
           </section>
 
-          <section className="panel sidebar-card">
-            <div className="panel-header">
-              <div>
-                <div className="section-title">Recent activity</div>
-                <div className="section-meta">A lightweight trail of CoS and lane movement without exposing the old workflow engine.</div>
-              </div>
-            </div>
-            <ItemList<DirectorStatusResponse["recentActivity"][number]>
-              empty="No recent activity yet."
-              items={status?.recentActivity ?? []}
-              render={(activity) => (
-                <div className="list-row compact-list-row" key={activity.id}>
-                  <div>
-                    <div className="list-title">{activity.summary}</div>
-                    <div className="list-meta">
-                      {activity.laneName ? <span>{activity.laneName}</span> : null}
-                      {activity.issueNumber ? <span>Issue #{activity.issueNumber}</span> : null}
-                      {activity.pullRequestNumber ? <span>PR #{activity.pullRequestNumber}</span> : null}
-                      <span>{formatTimestamp(activity.createdAt)}</span>
-                    </div>
-                  </div>
-                </div>
-              )}
-            />
-          </section>
         </aside>
       </main>
     </div>
@@ -1046,15 +1005,6 @@ function ConversationBubble(props: { message: ConversationMessageRecord }) {
         {props.message.linkedPrNumber ? <span>PR #{props.message.linkedPrNumber}</span> : null}
       </div>
     </article>
-  );
-}
-
-function StatCard(props: { label: string; value: string }) {
-  return (
-    <div className="stat-card">
-      <div className="stat-value">{props.value}</div>
-      <div className="stat-label">{props.label}</div>
-    </div>
   );
 }
 
