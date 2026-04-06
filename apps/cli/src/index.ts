@@ -104,14 +104,6 @@ program
   });
 
 program
-  .command("status")
-  .description("Compatibility alias for lane visibility")
-  .hideHelp()
-  .action(async () => {
-    await printLaneVisibility();
-  });
-
-program
   .command("sync")
   .description("Sync GitHub issues, PRs, comments, and checks into the local mirror")
   .action(async () => {
