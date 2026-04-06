@@ -28,7 +28,7 @@ Director OS now treats the local app as an orchestration layer on top of GitHub 
 
 The core local objects are:
 
-- `WorkItem`: a local record for a numbered GitHub issue, including kind, ownership mode, queue state, and active PR linkage
+- `Lane ownership`: a lightweight mapping from numbered GitHub issues to persistent lane sessions
 - `Run`: a Chief of Staff, lane, worker, review, validation, or PR-watch execution with logs and summaries
 - `Decision`: a real escalation, targeted either to the Chief of Staff or the human director
 - `PR cycle`: the local state machine around an open PR while it waits for automation, comments, revalidation, CoS review, and merge
@@ -108,7 +108,7 @@ MVP includes:
 
 - local setup and readiness checks
 - GitHub issue and PR mirroring
-- a local orchestration schema built around work items, runs, decisions, notes, and orchestrator state
+- a minimal local runtime state built around lane ownership, runs, decisions, and orchestrator state
 - a continuous Chief of Staff loop with `Start` and `Pause`
 - lane planning via read-only Codex runs
 - worker execution via write-enabled Codex runs
