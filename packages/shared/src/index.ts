@@ -336,6 +336,7 @@ export interface SetupProbeRepositoryInput {
 
 export interface SetupStatusResponse {
   activeProject: ProjectRecord | null;
+  hasCompletedSetup: boolean;
   checks: SetupCheck[];
   repositoryDraft: SetupRepositoryDraft | null;
   canComplete: boolean;
