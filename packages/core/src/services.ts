@@ -67,7 +67,11 @@ import {
   resolveRepoPath,
   viewPullRequest
 } from "./github.js";
-import { parseGitWorktreeList, selectReusableGitWorktree } from "./git-worktrees.js";
+import {
+  parseGitWorktreeList,
+  selectReusableGitWorktree,
+  shouldReuseCleanIssueWorktree
+} from "./git-worktrees.js";
 import {
   createDefaultConversationState,
   initializeProjectRuntime,
@@ -1108,6 +1112,58 @@ async function localBranchExists(repoPath: string, branchName: string): Promise<
   }
 }
 
+async function resolveGitRevision(repoPath: string, ref: string): Promise<string> {
+  const revision = await runCommandOrThrow("git", ["-C", repoPath, "rev-parse", ref], {
+    cwd: repoPath
+  });
+  return revision.trim();
+}
+
+async function resolveComparablePath(targetPath: string): Promise<string> {
+  try {
+    return await fs.realpath(targetPath);
+  } catch {
+    return path.resolve(targetPath);
+  }
+}
+
+async function countBranchCommitsBehind(
+  repoPath: string,
+  baseRef: string,
+  branchRef: string
+): Promise<number> {
+  const count = await runCommandOrThrow(
+    "git",
+    ["-C", repoPath, "rev-list", "--count", `${branchRef}..${baseRef}`],
+    { cwd: repoPath }
+  );
+  return Number.parseInt(count.trim(), 10) || 0;
+}
+
+async function canReuseCleanIssueWorktree(
+  project: ProjectRecord,
+  branchName: string,
+  options: {
+    preserveExistingBranch?: boolean;
+  } = {}
+): Promise<boolean> {
+  if (options.preserveExistingBranch) {
+    return true;
+  }
+
+  const [branchHeadRevision, defaultBranchRevision, branchCommitsBehind] = await Promise.all([
+    resolveGitRevision(project.repoPath, branchName),
+    resolveGitRevision(project.repoPath, project.defaultBranch),
+    countBranchCommitsBehind(project.repoPath, project.defaultBranch, branchName)
+  ]);
+
+  return shouldReuseCleanIssueWorktree({
+    branchHeadRevision,
+    defaultBranchRevision,
+    branchCommitsBehind
+  });
+}
+
 function suffixedWorktreeTarget(baseValue: string, attempt: number): string {
   return attempt === 0 ? baseValue : `${baseValue}-rerun-${attempt}`;
 }
@@ -1195,20 +1251,38 @@ async function resetWorktreeValidationState(worktreePath: string): Promise<void>
   );
 }
 
-async function ensureIssueWorktree(
+export async function ensureIssueWorktree(
   project: ProjectRecord,
   issueNumber: number,
   branchName: string,
-  worktreePath: string
+  worktreePath: string,
+  options: {
+    preserveExistingBranch?: boolean;
+  } = {}
 ): Promise<{ branchName: string; worktreePath: string }> {
   await fs.mkdir(project.worktreeRoot, { recursive: true });
   await pruneGitWorktrees(project.repoPath);
 
-  const entries = (await listGitWorktrees(project.repoPath)).filter(
-    (entry) =>
-      entry.path === worktreePath ||
-      entry.path.startsWith(`${project.worktreeRoot}${path.sep}`)
-  );
+  const [desiredComparablePath, worktreeRootComparablePath, rawEntries] = await Promise.all([
+    resolveComparablePath(worktreePath),
+    resolveComparablePath(project.worktreeRoot),
+    listGitWorktrees(project.repoPath)
+  ]);
+
+  const entries = (
+    await Promise.all(
+      rawEntries.map(async (entry) => ({
+        entry,
+        comparablePath: await resolveComparablePath(entry.path)
+      }))
+    )
+  )
+    .filter(
+      ({ comparablePath }) =>
+        comparablePath === desiredComparablePath ||
+        comparablePath.startsWith(`${worktreeRootComparablePath}${path.sep}`)
+    )
+    .map(({ entry }) => entry);
 
   const reusable = selectReusableGitWorktree(
     entries,
@@ -1219,7 +1293,8 @@ async function ensureIssueWorktree(
   if (
     reusable &&
     (await pathExists(reusable.path)) &&
-    !(await worktreeHasUncommittedChanges(reusable.path))
+    !(await worktreeHasUncommittedChanges(reusable.path)) &&
+    (await canReuseCleanIssueWorktree(project, reusable.branchName ?? branchName, options))
   ) {
     await ensureWorktreeNodeModules(project, reusable.path);
     return {
@@ -2693,7 +2768,10 @@ async function dispatchPendingHandoff(session: ProjectSession): Promise<boolean>
     session.project,
     issue.number,
     handoff.branchName ?? branchNameForIssue(issue),
-    handoff.worktreePath ?? path.join(session.project.worktreeRoot, `issue-${issue.number}`)
+    handoff.worktreePath ?? path.join(session.project.worktreeRoot, `issue-${issue.number}`),
+    {
+      preserveExistingBranch: handoff.prNumber != null
+    }
   );
   handoff.branchName = ensuredWorktree.branchName;
   handoff.worktreePath = ensuredWorktree.worktreePath;
