@@ -2326,6 +2326,8 @@ export function buildChiefOfStaffBlockerLaneResult(input: {
   recommendedNextAction?: string | null;
   artifactRefs?: string[];
   commandError?: string | null;
+  blockerSource?: string | null;
+  blockerContext?: string | null;
 }): LaneAgentResult {
   const transcriptReply =
     input.transcriptReply?.trim() ||
@@ -2343,7 +2345,11 @@ export function buildChiefOfStaffBlockerLaneResult(input: {
     data: {
       ...(input.baseResult?.data ?? {}),
       transcript_reply: transcriptReply,
-      command_error: input.commandError ?? parseDataString(input.baseResult?.data?.command_error) ?? null
+      command_error: input.commandError ?? parseDataString(input.baseResult?.data?.command_error) ?? null,
+      blocker_source:
+        input.blockerSource?.trim() ?? parseDataString(input.baseResult?.data?.blocker_source) ?? null,
+      blocker_context:
+        input.blockerContext?.trim() ?? parseDataString(input.baseResult?.data?.blocker_context) ?? null
     },
     raw_model_output: input.baseResult?.raw_model_output ?? null
   };
@@ -4251,6 +4257,7 @@ async function queueLaneBlockerForChiefOfStaff(
     issueBody?: string | null;
     artifactRefs?: string[];
     commandError?: string | null;
+    blockerSource?: string | null;
   }
 ): Promise<void> {
   const [router, cache] = await Promise.all([
@@ -4283,7 +4290,9 @@ async function queueLaneBlockerForChiefOfStaff(
       artifactRefs:
         input.artifactRefs ??
         [input.worktreePath ?? handoff.worktreePath].filter((entry): entry is string => Boolean(entry)),
-      commandError: input.commandError
+      commandError: input.commandError,
+      blockerSource: input.blockerSource,
+      blockerContext: input.summary
     }),
     reviewType: "blocker_mediation",
     branchName: input.branchName ?? handoff.branchName,
@@ -4509,7 +4518,8 @@ async function executeLaneHandoff(
       sessionId: turn.sessionId,
       worktreePath: ensuredWorktree.worktreePath,
       branchName: ensuredWorktree.branchName,
-      commandError: message
+      commandError: message,
+      blockerSource: "validation_failure"
     });
     return;
   }
@@ -4525,7 +4535,8 @@ async function executeLaneHandoff(
       recommendedNextAction: "Review the empty result and decide whether to guide another implementation pass, reroute, or escalate.",
       sessionId: turn.sessionId,
       worktreePath: ensuredWorktree.worktreePath,
-      branchName: ensuredWorktree.branchName
+      branchName: ensuredWorktree.branchName,
+      blockerSource: "no_file_changes"
     });
     return;
   }
@@ -4587,7 +4598,8 @@ function startLaneDispatch(session: ProjectSession, handoffId: string): void {
         blockingQuestion: "How should the Chief of Staff recover from this lane execution crash?",
         transcriptReply: "A lane execution crashed before it could finish.",
         recommendedNextAction: "Review the crash and decide whether to retry with guidance, reroute, or escalate.",
-        commandError: message
+        commandError: message,
+        blockerSource: "lane_crash"
       });
     })
     .finally(() => {
