@@ -43,7 +43,6 @@ import {
   getProjectConfig,
   loadConfig,
   nowIso,
-  resolveRuntimePaths,
   saveConfig,
   slugify,
   type DirectorConfigFile,
@@ -541,7 +540,7 @@ async function refreshProjectMetadata(session: ProjectSession): Promise<string[]
 async function withRuntime<TValue>(
   callback: (session: RuntimeSession) => Promise<TValue>
 ): Promise<TValue> {
-  const paths = await ensureRuntimeDirectories(resolveRuntimePaths());
+  const paths = await ensureRuntimeDirectories();
   const config = await loadConfig(paths);
   return callback({
     paths,
@@ -3580,7 +3579,7 @@ export async function completeSetup(
 }
 
 export async function initDirector(options: InitCommandOptions = {}) {
-  const paths = await ensureRuntimeDirectories(resolveRuntimePaths());
+  const paths = await ensureRuntimeDirectories();
   const repoPath = resolveRepoPath(options.repoPath ?? process.cwd());
 
   if (options.noProjectRegistration) {
@@ -3796,7 +3795,7 @@ export async function sendConversationMessage(content: string): Promise<Conversa
 }
 
 export async function startOrchestrator(): Promise<DirectorOperationResponse> {
-  const paths = await ensureRuntimeDirectories(resolveRuntimePaths());
+  const paths = await ensureRuntimeDirectories();
   const ownership = await acquireOrchestratorLock(paths);
 
   if (ownership === "busy") {
@@ -3852,6 +3851,6 @@ export async function pauseOrchestrator(reason?: string): Promise<DirectorOperat
     clearTimeout(orchestratorTimer);
     orchestratorTimer = null;
   }
-  await releaseOrchestratorLock(await ensureRuntimeDirectories(resolveRuntimePaths()));
+  await releaseOrchestratorLock(await ensureRuntimeDirectories());
   return response;
 }

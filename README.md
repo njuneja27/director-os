@@ -98,6 +98,14 @@ For desktop dogfooding, prefer:
 
 This path rebuilds the desktop shell, renderer, core package, and CLI before launch.
 
+### Runtime Storage On macOS
+
+New macOS installs store Director OS runtime state under `~/Library/Application Support/Director OS`.
+
+- app-managed config, runtime state, logs, and default worktrees live under Application Support
+- temporary Codex scratch data lives under `~/Library/Caches/Director OS/tmp`
+- existing dogfood installs that already use `~/.director-os` continue to work through a compatibility path instead of being auto-migrated
+
 ## Scope
 
 ### MVP

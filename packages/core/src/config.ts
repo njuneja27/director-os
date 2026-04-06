@@ -34,6 +34,11 @@ export interface RuntimePaths {
   orchestratorLockPath: string;
 }
 
+interface RuntimePathOptions {
+  homedir?: string;
+  platform?: NodeJS.Platform;
+}
+
 export function nowIso(): string {
   return new Date().toISOString();
 }
@@ -49,27 +54,89 @@ export function slugify(value: string): string {
   );
 }
 
-export function resolveRuntimePaths(homeDir = path.join(os.homedir(), ".director-os")): RuntimePaths {
+export function resolveLegacyRuntimeHomeDir(options: RuntimePathOptions = {}): string {
+  const homedir = options.homedir ?? os.homedir();
+  return path.join(homedir, ".director-os");
+}
+
+export function resolveDefaultRuntimeHomeDir(options: RuntimePathOptions = {}): string {
+  const homedir = options.homedir ?? os.homedir();
+  const platform = options.platform ?? process.platform;
+
+  return platform === "darwin"
+    ? path.join(homedir, "Library", "Application Support", "Director OS")
+    : resolveLegacyRuntimeHomeDir({ homedir, platform });
+}
+
+function resolveDefaultTmpDir(homeDir: string, options: RuntimePathOptions = {}): string {
+  const homedir = options.homedir ?? os.homedir();
+  const platform = options.platform ?? process.platform;
+  const preferredHomeDir = resolveDefaultRuntimeHomeDir({ homedir, platform });
+
+  return platform === "darwin" && path.normalize(homeDir) === path.normalize(preferredHomeDir)
+    ? path.join(homedir, "Library", "Caches", "Director OS", "tmp")
+    : path.join(homeDir, "tmp");
+}
+
+async function pathExists(targetPath: string): Promise<boolean> {
+  try {
+    await fs.access(targetPath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function resolveRuntimePaths(
+  homeDir = resolveDefaultRuntimeHomeDir(),
+  options: RuntimePathOptions = {}
+): RuntimePaths {
   return {
     homeDir,
     configPath: path.join(homeDir, "config.json"),
     runtimeDir: path.join(homeDir, "runtime"),
     logsDir: path.join(homeDir, "logs"),
     worktreesDir: path.join(homeDir, "worktrees"),
-    tmpDir: path.join(homeDir, "tmp"),
+    tmpDir: resolveDefaultTmpDir(homeDir, options),
     orchestratorLockPath: path.join(homeDir, "orchestrator.lock.json")
   };
 }
 
-export async function ensureRuntimeDirectories(paths = resolveRuntimePaths()): Promise<RuntimePaths> {
-  await fs.mkdir(paths.homeDir, { recursive: true });
+export async function resolveActiveRuntimePaths(
+  options: RuntimePathOptions = {}
+): Promise<RuntimePaths> {
+  const platform = options.platform ?? process.platform;
+  const preferredPaths = resolveRuntimePaths(resolveDefaultRuntimeHomeDir(options), options);
+
+  if (platform !== "darwin") {
+    return preferredPaths;
+  }
+
+  if (await pathExists(preferredPaths.homeDir)) {
+    return preferredPaths;
+  }
+
+  const legacyHomeDir = resolveLegacyRuntimeHomeDir(options);
+  if (path.normalize(legacyHomeDir) === path.normalize(preferredPaths.homeDir)) {
+    return preferredPaths;
+  }
+
+  return (await pathExists(legacyHomeDir))
+    ? resolveRuntimePaths(legacyHomeDir, options)
+    : preferredPaths;
+}
+
+export async function ensureRuntimeDirectories(paths?: RuntimePaths): Promise<RuntimePaths> {
+  const resolvedPaths = paths ?? (await resolveActiveRuntimePaths());
+
+  await fs.mkdir(resolvedPaths.homeDir, { recursive: true });
   await Promise.all([
-    fs.mkdir(paths.runtimeDir, { recursive: true }),
-    fs.mkdir(paths.logsDir, { recursive: true }),
-    fs.mkdir(paths.worktreesDir, { recursive: true }),
-    fs.mkdir(paths.tmpDir, { recursive: true })
+    fs.mkdir(resolvedPaths.runtimeDir, { recursive: true }),
+    fs.mkdir(resolvedPaths.logsDir, { recursive: true }),
+    fs.mkdir(resolvedPaths.worktreesDir, { recursive: true }),
+    fs.mkdir(resolvedPaths.tmpDir, { recursive: true })
   ]);
-  return paths;
+  return resolvedPaths;
 }
 
 function defaultConfig(): DirectorConfigFile {
@@ -110,11 +177,11 @@ function normalizeStoredProject(
   };
 }
 
-export async function loadConfig(paths = resolveRuntimePaths()): Promise<DirectorConfigFile> {
-  await ensureRuntimeDirectories(paths);
+export async function loadConfig(paths?: RuntimePaths): Promise<DirectorConfigFile> {
+  const resolvedPaths = await ensureRuntimeDirectories(paths);
 
   try {
-    const raw = await fs.readFile(paths.configPath, "utf8");
+    const raw = await fs.readFile(resolvedPaths.configPath, "utf8");
     const parsed = JSON.parse(raw) as Partial<DirectorConfigFile>;
 
     return {
@@ -122,7 +189,7 @@ export async function loadConfig(paths = resolveRuntimePaths()): Promise<Directo
       activeProjectSlug: parsed.activeProjectSlug ?? null,
       projects: Array.isArray(parsed.projects)
         ? parsed.projects.map((project, index) =>
-            normalizeStoredProject(project as Partial<StoredProjectConfig>, index, paths)
+            normalizeStoredProject(project as Partial<StoredProjectConfig>, index, resolvedPaths)
           )
         : [],
       updatedAt: parsed.updatedAt ?? nowIso()
@@ -130,7 +197,7 @@ export async function loadConfig(paths = resolveRuntimePaths()): Promise<Directo
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") {
       const initial = defaultConfig();
-      await saveConfig(initial, paths);
+      await saveConfig(initial, resolvedPaths);
       return initial;
     }
 
@@ -138,14 +205,16 @@ export async function loadConfig(paths = resolveRuntimePaths()): Promise<Directo
   }
 }
 
-export async function saveConfig(config: DirectorConfigFile, paths = resolveRuntimePaths()): Promise<void> {
-  await ensureRuntimeDirectories(paths);
+export async function saveConfig(config: DirectorConfigFile, paths?: RuntimePaths): Promise<void> {
+  const resolvedPaths = await ensureRuntimeDirectories(paths);
   const nextConfig: DirectorConfigFile = {
     ...config,
-    projects: config.projects.map((project, index) => normalizeStoredProject(project, index, paths)),
+    projects: config.projects.map((project, index) =>
+      normalizeStoredProject(project, index, resolvedPaths)
+    ),
     updatedAt: nowIso()
   };
-  await fs.writeFile(paths.configPath, `${JSON.stringify(nextConfig, null, 2)}\n`, "utf8");
+  await fs.writeFile(resolvedPaths.configPath, `${JSON.stringify(nextConfig, null, 2)}\n`, "utf8");
 }
 
 export function upsertProjectConfig(
