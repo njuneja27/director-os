@@ -12,6 +12,7 @@ import type {
   SetupProbeRepositoryInput,
   SetupRepositoryDraft,
   SetupStatusResponse,
+  UpdateIssueLaneAssignmentInput,
   UpdateProjectSettingsInput
 } from "@director-os/shared";
 
@@ -26,6 +27,7 @@ export type {
   SetupProbeRepositoryInput,
   SetupRepositoryDraft,
   SetupStatusResponse,
+  UpdateIssueLaneAssignmentInput,
   UpdateProjectSettingsInput
 } from "@director-os/shared";
 
@@ -111,6 +113,11 @@ function createHttpDirectorClient(): WebDirectorClient {
         method: "POST",
         body: JSON.stringify(input)
       }),
+    updateIssueLaneAssignment: (issueNumber: number, input: UpdateIssueLaneAssignmentInput) =>
+      requestJson<DirectorStatusResponse>(`/api/issues/${issueNumber}/lane`, {
+        method: "POST",
+        body: JSON.stringify(input)
+      }),
     resetRouterRuntime: () =>
       requestJson<DirectorOperationResponse>("/api/reset-router-runtime", {
         method: "POST"
@@ -133,6 +140,8 @@ function createIpcDirectorClient(bridge: DirectorDesktopBridge): WebDirectorClie
     sync: () => bridge.director.sync(),
     updateProjectSettings: (input: UpdateProjectSettingsInput) =>
       bridge.director.updateProjectSettings(input),
+    updateIssueLaneAssignment: (issueNumber: number, input: UpdateIssueLaneAssignmentInput) =>
+      bridge.director.updateIssueLaneAssignment(issueNumber, input),
     resetRouterRuntime: () => bridge.director.resetRouterRuntime()
   };
 }
@@ -201,6 +210,13 @@ export async function updateProjectSettings(
   input: UpdateProjectSettingsInput
 ): Promise<DirectorStatusResponse> {
   return getDirectorClient().updateProjectSettings(input);
+}
+
+export async function updateIssueLaneAssignment(
+  issueNumber: number,
+  input: UpdateIssueLaneAssignmentInput
+): Promise<DirectorStatusResponse> {
+  return getDirectorClient().updateIssueLaneAssignment(issueNumber, input);
 }
 
 export async function resetRouterRuntime(): Promise<DirectorOperationResponse> {

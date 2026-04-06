@@ -21,12 +21,15 @@ import {
   buildSyntheticIssueRecord,
   ensureIssueWorktree,
   isPrSweepDue,
+  preferredLaneForIssue,
   queueChiefOfStaffReviewFromLaneState,
+  reassignIssueLaneInRouter,
   reconcileProjectConfigWithRepository,
   resolveLastSuccessfulSyncAt,
   schedulePrSweepState,
   sortQueueableIssues,
   startPrSweepState,
+  synthesizeLaneSuggestions,
   synthesizeProjectConfigStatus,
   updateRunningPrSweepState
 } from "./services.js";
@@ -302,6 +305,125 @@ describe("synthesizeProjectConfigStatus", () => {
         "Targeting base branch main, but the local repo default branch could not be detected yet.",
       canHealToRepoDefault: false
     });
+  });
+});
+
+describe("lane assignment helpers", () => {
+  it("distinguishes explicit lane labels from the default fallback lane", () => {
+    expect(
+      preferredLaneForIssue(
+        makeIssueRecord(89, {
+          labels: ["director:lane:experience"]
+        })
+      )
+    ).toEqual({
+      id: "experience",
+      name: "Experience",
+      source: "explicit"
+    });
+
+    expect(preferredLaneForIssue(makeIssueRecord(30))).toEqual({
+      id: "delivery",
+      name: "Delivery",
+      source: "fallback"
+    });
+  });
+
+  it("builds lane suggestions from active lanes and open issue preferences", () => {
+    const suggestions = synthesizeLaneSuggestions(
+      [
+        makeIssueRecord(30),
+        makeIssueRecord(36, {
+          labels: ["director:lane:experience"]
+        }),
+        makeIssueRecord(79, {
+          labels: ["director:lane:experience"]
+        })
+      ],
+      [
+        {
+          id: "delivery",
+          name: "Delivery",
+          sessionId: "lane-delivery",
+          issueNumbers: [30],
+          status: "implementing",
+          currentIssueNumber: 30,
+          activePullRequestNumber: null,
+          lastSummary: "Working issue #30.",
+          lastPlanSummary: null,
+          updatedAt: "2026-04-06T00:00:00.000Z"
+        }
+      ]
+    );
+
+    expect(suggestions).toEqual([
+      {
+        id: "delivery",
+        name: "Delivery",
+        isActive: true,
+        issueCount: 1
+      },
+      {
+        id: "experience",
+        name: "Experience",
+        isActive: false,
+        issueCount: 2
+      }
+    ]);
+  });
+
+  it("reassigns active lane ownership and pending handoffs together", () => {
+    const router: RouterState = {
+      ...createDefaultRouterState("director-os"),
+      lanes: [
+        {
+          id: "delivery",
+          name: "Delivery",
+          sessionId: "lane-delivery",
+          issueNumbers: [79],
+          status: "implementing",
+          currentIssueNumber: 79,
+          activePullRequestNumber: null,
+          lastSummary: "Implementing issue #79.",
+          lastPlanSummary: null,
+          updatedAt: "2026-04-06T00:00:00.000Z"
+        }
+      ],
+      issueOwnership: {
+        "79": "delivery"
+      },
+      pendingHandoffs: [
+        {
+          id: "handoff_79",
+          laneId: "delivery",
+          issueNumber: 79,
+          kind: "implement",
+          status: "pending",
+          summary: "Implement issue #79.",
+          prNumber: null,
+          branchName: "codex/issue-79-parallel-lanes",
+          worktreePath: "/tmp/director-os/worktrees/issue-79",
+          startedAt: null,
+          startedBy: null,
+          startedByPid: null,
+          reviewWindowEndsAt: null,
+          lastHandledCommentAt: null,
+          details: null,
+          createdAt: "2026-04-06T00:00:00.000Z",
+          updatedAt: "2026-04-06T00:00:00.000Z"
+        }
+      ]
+    };
+
+    const lane = reassignIssueLaneInRouter(router, 79, "experience", "Experience");
+
+    expect(lane.id).toBe("experience");
+    expect(lane.name).toBe("Experience");
+    expect(lane.status).toBe("implementing");
+    expect(router.issueOwnership["79"]).toBe("experience");
+    expect(router.lanes.find((candidate) => candidate.id === "delivery")?.issueNumbers).toEqual([]);
+    expect(router.lanes.find((candidate) => candidate.id === "experience")?.issueNumbers).toEqual([79]);
+    expect(router.pendingHandoffs[0]?.laneId).toBe("experience");
   });
 });
 
