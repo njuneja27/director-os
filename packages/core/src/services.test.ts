@@ -15,10 +15,13 @@ import type {
 import type { StoredProjectConfig } from "./config.js";
 import { createDefaultRouterState, type RouterState } from "./runtime-state.js";
 import {
+  buildChiefOfStaffBlockerLaneResult,
   buildPrSweepBlockerLabels,
   buildResetRouterState,
+  buildSyntheticIssueRecord,
   ensureIssueWorktree,
   isPrSweepDue,
+  queueChiefOfStaffReviewFromLaneState,
   reconcileProjectConfigWithRepository,
   resolveLastSuccessfulSyncAt,
   schedulePrSweepState,
@@ -44,6 +47,23 @@ function makeProjectConfig(
     agentRunner: "codex",
     createdAt: "2026-04-05T00:00:00.000Z",
     model: "gpt-5.4",
+    updatedAt: "2026-04-05T00:00:00.000Z",
+    ...overrides
+  };
+}
+
+function makeProjectRecord(overrides: Partial<ProjectRecord> = {}): ProjectRecord {
+  return {
+    id: 1,
+    name: "Director OS",
+    slug: "director-os",
+    repoPath: "/repo",
+    repoSlug: "njuneja27/director-os",
+    defaultBranch: "main",
+    worktreeRoot: "/tmp/director-os",
+    agentRunner: "codex",
+    model: "gpt-5.4",
+    createdAt: "2026-04-05T00:00:00.000Z",
     updatedAt: "2026-04-05T00:00:00.000Z",
     ...overrides
   };
@@ -384,6 +404,155 @@ describe("PR sweep helpers", () => {
       "director:ready",
       "director:priority"
     ]);
+  });
+});
+
+describe("Chief of Staff blocker routing", () => {
+  it("builds a synthetic issue record when lane blocker review cannot rely on cached issue details", () => {
+    const issue = buildSyntheticIssueRecord(
+      {
+        id: 1,
+        repoSlug: "njuneja27/director-os"
+      },
+      55,
+      {
+        title: "Issue #55 (missing from local cache)",
+        body: "The issue was not present in the local GitHub mirror."
+      }
+    );
+
+    expect(issue.number).toBe(55);
+    expect(issue.title).toBe("Issue #55 (missing from local cache)");
+    expect(issue.body).toContain("not present in the local GitHub mirror");
+    expect(issue.url).toBe("https://github.com/njuneja27/director-os/issues/55");
+  });
+
+  it("builds a Chief of Staff blocker lane result that preserves artifacts and records the blocker", () => {
+    const result = buildChiefOfStaffBlockerLaneResult({
+      summary: "Validation failed.",
+      blockingQuestion: "How should the lane recover from this validation failure?",
+      transcriptReply: "Delivery hit a validation failure on issue #55.",
+      artifactRefs: ["/tmp/director-os/issue-55"],
+      commandError: "tsc failed",
+      blockerSource: "validation_failure",
+      blockerContext: "Validation failed."
+    });
+
+    expect(result.status).toBe("needs_input");
+    expect(result.artifact_refs).toEqual(["/tmp/director-os/issue-55"]);
+    expect(result.blocking_questions).toEqual([
+      "How should the lane recover from this validation failure?"
+    ]);
+    expect(result.data?.transcript_reply).toBe(
+      "Delivery hit a validation failure on issue #55."
+    );
+    expect(result.data?.command_error).toBe("tsc failed");
+    expect(result.data?.blocker_source).toBe("validation_failure");
+    expect(result.data?.blocker_context).toBe("Validation failed.");
+  });
+
+  it("queues lane blockers for Chief of Staff mediation instead of finalizing them directly", () => {
+    const session = {
+      paths: {
+        homeDir: "/tmp/director-os",
+        configPath: "/tmp/director-os/config.json",
+        runtimeDir: "/tmp/director-os/runtime",
+        logsDir: "/tmp/director-os/logs",
+        worktreesDir: "/tmp/director-os/worktrees",
+        tmpDir: "/tmp/director-os/tmp",
+        orchestratorLockPath: "/tmp/director-os/orchestrator.lock.json"
+      },
+      config: {
+        version: 1,
+        activeProjectSlug: "director-os",
+        projects: [makeProjectConfig()],
+        updatedAt: "2026-04-06T00:00:00.000Z"
+      },
+      project: makeProjectRecord(),
+      projectConfig: makeProjectConfig()
+    } satisfies Parameters<typeof queueChiefOfStaffReviewFromLaneState>[0];
+    const issue = makeIssueRecord(55);
+    const router: RouterState = {
+      ...createDefaultRouterState("director-os"),
+      lanes: [
+        {
+          id: "delivery",
+          name: "Delivery",
+          sessionId: "lane-session",
+          issueNumbers: [55],
+          status: "implementing",
+          currentIssueNumber: 55,
+          activePullRequestNumber: null,
+          lastSummary: "Implementing issue #55.",
+          lastPlanSummary: null,
+          updatedAt: "2026-04-06T00:00:00.000Z"
+        }
+      ],
+      issueOwnership: {
+        "55": "delivery"
+      },
+      pendingHandoffs: [
+        {
+          id: "handoff_55",
+          laneId: "delivery",
+          issueNumber: 55,
+          kind: "implement",
+          status: "in_progress",
+          summary: "Implement issue #55.",
+          prNumber: null,
+          branchName: "codex/issue-55-chief-of-staff-blockers",
+          worktreePath: "/tmp/director-os/worktrees/issue-55",
+          startedAt: "2026-04-06T00:01:00.000Z",
+          startedBy: "owner-token",
+          startedByPid: 1234,
+          reviewWindowEndsAt: null,
+          lastHandledCommentAt: null,
+          details: null,
+          createdAt: "2026-04-06T00:00:30.000Z",
+          updatedAt: "2026-04-06T00:01:00.000Z"
+        }
+      ]
+    };
+
+    const nextRouter = queueChiefOfStaffReviewFromLaneState(
+      session,
+      router,
+      "handoff_55",
+      {
+        issue,
+        sessionId: "lane-session",
+        laneResult: buildChiefOfStaffBlockerLaneResult({
+          summary: "Validation failed for issue #55.",
+          blockingQuestion: "How should Delivery recover from this validation failure?",
+          transcriptReply: "Delivery hit a validation failure on issue #55.",
+          artifactRefs: ["/tmp/director-os/worktrees/issue-55"],
+          commandError: "tsc failed",
+          blockerSource: "validation_failure",
+          blockerContext: "Validation failed for issue #55."
+        }),
+        reviewType: "blocker_mediation",
+        branchName: "codex/issue-55-chief-of-staff-blockers",
+        worktreePath: "/tmp/director-os/worktrees/issue-55"
+      }
+    );
+
+    expect(nextRouter).not.toBeNull();
+    const completedHandoff = nextRouter?.pendingHandoffs.find(
+      (handoff) => handoff.id === "handoff_55"
+    );
+    const reviewHandoff = nextRouter?.pendingHandoffs.find(
+      (handoff) => handoff.kind === "review"
+    );
+    const deliveryLane = nextRouter?.lanes.find((lane) => lane.id === "delivery");
+
+    expect(completedHandoff?.status).toBe("completed");
+    expect(reviewHandoff?.status).toBe("pending");
+    expect(reviewHandoff?.details?.review_type).toBe("blocker_mediation");
+    expect(deliveryLane?.status).toBe("blocked");
+    expect(deliveryLane?.lastSummary).toBe(
+      "Delivery hit a validation failure on issue #55."
+    );
+    expect(nextRouter?.openQuestion).toBeNull();
   });
 });
 

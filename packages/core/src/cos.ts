@@ -20,9 +20,12 @@ export const COS_TASK_APPENDICES = {
   ].join("\n"),
   mediateBlocker: [
     "Task: mediate a blocked Codex run before any human escalation is created.",
-    "Return `data.outcome` as `answer_worker`, `ask_human`, or `reroute`.",
+    "Return `data.outcome` as `answer_worker`, `hold`, `ask_human`, or `reroute`.",
+    "Prefer `answer_worker` when the blocker is operational and you can give concrete retry or recovery guidance without human product judgment.",
     "If you can answer internally, return `data.guidance` and `data.transcript_reply`.",
+    "If you choose `hold`, keep the issue with the Chief of Staff and optionally return GitHub-ready follow-up issues in `data.new_issues`.",
     "If you reroute, also return `data.lane_id` and optionally `data.lane_name`.",
+    "Choose `ask_human` only when the blocker truly requires a product or taste decision from the human.",
     "If the human must decide, return `data.question`, `data.why_it_matters`, and `data.recommendation`."
   ].join("\n"),
   reviewLanePlan: [
