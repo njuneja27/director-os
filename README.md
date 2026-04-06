@@ -110,6 +110,14 @@ The lower-level entrypoints are still available when you need them, but they are
 - `npm run desktop:dev` starts the live-reload desktop development loop
 - `npm --prefix apps/desktop run start` launches Electron directly against whatever artifacts are already built
 
+### Runtime Storage On macOS
+
+New macOS installs store Director OS runtime state under `~/Library/Application Support/Director OS`.
+
+- app-managed config, runtime state, logs, and default worktrees live under Application Support
+- temporary Codex scratch data lives under `~/Library/Caches/Director OS/tmp`
+- existing dogfood installs that already use `~/.director-os` continue to work through a compatibility path instead of being auto-migrated
+
 ## Scope
 
 ### MVP

@@ -3,7 +3,7 @@ import path from "node:path";
 
 import type { AgentResultEnvelope } from "@director-os/shared";
 
-import { ensureRuntimeDirectories, resolveRuntimePaths, slugify } from "./config.js";
+import { ensureRuntimeDirectories, slugify } from "./config.js";
 import {
   commandErrorText,
   isMissingBinaryError,
@@ -231,7 +231,7 @@ export async function probeCodexCli(
   model = "gpt-5.4-mini",
   runner: CommandRunner = runCommandCapture
 ): Promise<CodexProbeResult> {
-  const runtimePaths = await ensureRuntimeDirectories(resolveRuntimePaths());
+  const runtimePaths = await ensureRuntimeDirectories();
   const stem = `codex-probe-${Date.now()}`;
   const schemaPath = path.join(runtimePaths.tmpDir, `${stem}.schema.json`);
   const outputPath = path.join(runtimePaths.tmpDir, `${stem}.output.json`);
@@ -315,7 +315,7 @@ export async function probeCodexCli(
 export async function runCodexSessionTurn(
   input: RunAgentOptions
 ): Promise<CodexSessionTurnResult> {
-  const runtimePaths = await ensureRuntimeDirectories(resolveRuntimePaths());
+  const runtimePaths = await ensureRuntimeDirectories();
   const stem = `${slugify(input.role)}-${Date.now()}`;
   const outputPath = path.join(runtimePaths.tmpDir, `${stem}.message.txt`);
 
@@ -434,7 +434,7 @@ export async function runCodexSessionAgent(
     };
   }
 
-  const runtimePaths = await ensureRuntimeDirectories(resolveRuntimePaths());
+  const runtimePaths = await ensureRuntimeDirectories();
   const stem = `${slugify(input.role)}-${Date.now()}`;
   const schemaPath = path.join(runtimePaths.tmpDir, `${stem}.schema.json`);
   const outputPath = path.join(runtimePaths.tmpDir, `${stem}.output.json`);

@@ -630,7 +630,8 @@ function SetupWorkspace(props: {
           <h1 className="hero-title">Bring Director OS online on this computer.</h1>
           <p className="hero-copy">
             Director OS stays local. It checks the repository, GitHub CLI, Codex CLI, and a safe
-            workspace test before the control room appears.
+            workspace test before the control room appears. On macOS, new installs live in
+            Application Support and use Library/Caches for temporary files.
           </p>
           <div className="step-stack">
             <SetupStepCard index={1} title="Landing" body="Start the setup conversation." active={props.setupStep === "landing"} />
