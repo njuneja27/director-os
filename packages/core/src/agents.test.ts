@@ -25,4 +25,18 @@ describe("codexOutputSchema", () => {
       Object.keys(dataSchema.properties).sort()
     );
   });
+
+  it("does not expose the legacy child_tasks planning field", () => {
+    const dataSchema = (
+      codexOutputSchema.properties as {
+        data: {
+          properties: Record<string, unknown>;
+          required: string[];
+        };
+      }
+    ).data;
+
+    expect(dataSchema.properties).not.toHaveProperty("child_tasks");
+    expect(dataSchema.required).not.toContain("child_tasks");
+  });
 });

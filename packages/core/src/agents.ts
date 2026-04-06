@@ -71,7 +71,6 @@ const structuredDataSchema = {
     "execution_intent",
     "rationale",
     "new_issues",
-    "child_tasks",
     "decision",
     "feedback",
     "kind",
@@ -92,10 +91,6 @@ const structuredDataSchema = {
     execution_intent: { type: ["string", "null"] },
     rationale: { type: ["string", "null"] },
     new_issues: {
-      type: ["array", "null"],
-      items: issueTaskSchema
-    },
-    child_tasks: {
       type: ["array", "null"],
       items: issueTaskSchema
     },
