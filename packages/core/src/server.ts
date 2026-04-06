@@ -17,6 +17,7 @@ import {
   startOrchestrator,
   sendConversationMessage,
   syncProject,
+  updateIssueLaneAssignment,
   updateProjectSettings
 } from "./services.js";
 
@@ -103,6 +104,16 @@ export async function createDirectorServer() {
       model: string;
     };
   }>("/api/project/settings", async (request) => updateProjectSettings(request.body));
+  app.post<{
+    Params: {
+      issueNumber: string;
+    };
+    Body: {
+      laneName: string;
+    };
+  }>("/api/issues/:issueNumber/lane", async (request) =>
+    updateIssueLaneAssignment(Number(request.params.issueNumber), request.body)
+  );
   app.post("/api/reset-router-runtime", async () => resetRouterRuntime());
 
   app.setNotFoundHandler(async (request, reply) => {

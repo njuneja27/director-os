@@ -8,6 +8,7 @@ import type {
   SetupProbeRepositoryInput,
   SetupRepositoryDraft,
   SetupStatusResponse,
+  UpdateIssueLaneAssignmentInput,
   UpdateProjectSettingsInput
 } from "@director-os/shared";
 
@@ -37,6 +38,8 @@ const api: DirectorDesktopBridge = {
     sync: () => invoke(IPC_CHANNELS.director.sync),
     updateProjectSettings: (input: UpdateProjectSettingsInput) =>
       invoke(IPC_CHANNELS.director.updateProjectSettings, input),
+    updateIssueLaneAssignment: (issueNumber: number, input: UpdateIssueLaneAssignmentInput) =>
+      invoke(IPC_CHANNELS.director.updateIssueLaneAssignment, issueNumber, input),
     resetRouterRuntime: () => invoke(IPC_CHANNELS.director.resetRouterRuntime)
   }
 };

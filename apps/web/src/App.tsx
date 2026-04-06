@@ -23,6 +23,7 @@ import {
   sendMessage,
   startDirector,
   syncNow,
+  updateIssueLaneAssignment as saveIssueLaneAssignment,
   updateProjectSettings as saveProjectSettings
 } from "./api";
 import { deriveSetupStateBadge, hasCompletedSetup } from "./setup-state";
@@ -52,6 +53,8 @@ export function App() {
   const [conversation, setConversation] = useState<ConversationResponse | null>(null);
   const [projectSettingsDraft, setProjectSettingsDraft] = useState<UpdateProjectSettingsInput | null>(null);
   const [editingProjectSettings, setEditingProjectSettings] = useState(false);
+  const [editingLaneIssueNumber, setEditingLaneIssueNumber] = useState<number | null>(null);
+  const [laneDraft, setLaneDraft] = useState("");
   const [repositoryPath, setRepositoryPath] = useState("");
   const [projectName, setProjectName] = useState("");
   const [worktreeRoot, setWorktreeRoot] = useState("");
@@ -349,6 +352,24 @@ export function App() {
       setStatus(nextStatus);
       hydrateProjectSettingsDraft(nextStatus);
       setEditingProjectSettings(false);
+      await refreshWorkspace();
+    });
+  }
+
+  async function handleSaveIssueLaneAssignment(issueNumber: number) {
+    const nextLaneName = laneDraft.trim();
+    if (!nextLaneName) {
+      setError("Lane name is required.");
+      return;
+    }
+
+    await runDashboardAction(`save-issue-lane-${issueNumber}`, async () => {
+      const nextStatus = await saveIssueLaneAssignment(issueNumber, {
+        laneName: nextLaneName
+      });
+      setStatus(nextStatus);
+      setEditingLaneIssueNumber(null);
+      setLaneDraft("");
       await refreshWorkspace();
     });
   }
@@ -920,7 +941,7 @@ export function App() {
             <div className="panel-header">
               <div>
                 <div className="section-title">Lanes</div>
-                <div className="section-meta">Persistent Codex sessions owned by the Chief of Staff. Independent lanes can run in parallel when they own different issues.</div>
+                <div className="section-meta">Persistent Codex sessions owned by the Chief of Staff. Parallel lane work only happens when issues are distributed across different lane IDs.</div>
               </div>
             </div>
             <ItemList<DirectorStatusResponse["lanes"][number]>
@@ -932,6 +953,7 @@ export function App() {
                     <div className="list-title">{lane.name}</div>
                     <div className="list-meta">
                       <span>{String(lane.status).replace("_", " ")}</span>
+                      <span>{lane.ownedIssueNumbers.length} issue{lane.ownedIssueNumbers.length === 1 ? "" : "s"}</span>
                       {lane.currentIssueNumber ? <span>Issue #{lane.currentIssueNumber}</span> : null}
                       {lane.activePullRequestNumber ? <span>PR #{lane.activePullRequestNumber}</span> : null}
                     </div>
@@ -945,27 +967,100 @@ export function App() {
           <section className="panel sidebar-card">
             <div className="panel-header">
               <div>
-                <div className="section-title">Owned issues</div>
-                <div className="section-meta">GitHub issues stay durable; the router only shows whether the Chief of Staff or a lane currently owns each slice.</div>
+                <div className="section-title">Issue lanes</div>
+                <div className="section-meta">GitHub labels are the durable lane preference. Change them here to rebalance work across distinct lane IDs without dropping into the terminal.</div>
               </div>
             </div>
             <ItemList<DirectorStatusResponse["issues"][number]>
-              empty="No GitHub issues are currently owned by the Chief of Staff or a lane."
-              items={(status?.issues ?? []).filter((issue) => issue.state.toLowerCase() === "open" && issue.ownerKind)}
+              empty="No open GitHub issues are available for lane routing yet."
+              items={(status?.issues ?? []).filter((issue) => issue.state.toLowerCase() === "open")}
               render={(issue) => (
-                <div className="list-row compact-list-row" key={issue.issueNumber}>
-                  <div>
+                <div className="compact-card" key={issue.issueNumber}>
+                  <div className="compact-card-head">
                     <div className="list-title">#{issue.issueNumber} {issue.title}</div>
-                    <div className="list-meta">
-                      {issue.ownerName ? <span>{issue.ownerName}</span> : null}
-                      <span>{String(issue.status).replace("_", " ")}</span>
-                      {issue.linkedPullRequestNumber ? <span>PR #{issue.linkedPullRequestNumber}</span> : null}
-                    </div>
+                    <span
+                      className={`check-pill ${
+                        issue.preferredLaneSource === "explicit"
+                          ? "check-pill-ready"
+                          : "check-pill-needs-action"
+                      }`}
+                    >
+                      {issue.preferredLaneSource === "explicit" ? "Explicit lane" : "Fallback lane"}
+                    </span>
                   </div>
-                  <div className="list-note">{issue.lastSummary ?? issue.workflowState}</div>
+                  <div className="compact-card-meta">
+                    <span>{issue.ownerName ?? "Unassigned"}</span>
+                    <span>{String(issue.status).replace("_", " ")}</span>
+                    <span>Target {issue.preferredLaneName ?? "Delivery"}</span>
+                    {issue.laneName ? <span>Active {issue.laneName}</span> : null}
+                    {issue.linkedPullRequestNumber ? <span>PR #{issue.linkedPullRequestNumber}</span> : null}
+                  </div>
+                  <div className="list-note">
+                    {issue.preferredLaneSource === "explicit"
+                      ? `GitHub is explicitly routing this issue to ${issue.preferredLaneName}.`
+                      : `This issue will fall back to ${issue.preferredLaneName} until an explicit lane is set.`}{" "}
+                    {issue.sharedLaneIssueCount > 1
+                      ? `${issue.sharedLaneIssueCount} open issues currently target this lane, so they will still serialize there.`
+                      : "This lane currently has room to run independently without sharing a same-lane queue."}
+                  </div>
+                  {editingLaneIssueNumber === issue.issueNumber ? (
+                    <div className="setup-form">
+                      <label className="field-group">
+                        <span className="field-label">Lane name</span>
+                        <input
+                          className="text-field"
+                          list="lane-suggestion-options"
+                          value={laneDraft}
+                          onChange={(event) => setLaneDraft(event.target.value)}
+                          placeholder="Delivery, Experience, Operations..."
+                        />
+                      </label>
+                      <div className="inline-actions">
+                        <button
+                          className="action-button action-button-primary"
+                          disabled={busyAction === `save-issue-lane-${issue.issueNumber}`}
+                          onClick={() => void handleSaveIssueLaneAssignment(issue.issueNumber)}
+                        >
+                          {busyAction === `save-issue-lane-${issue.issueNumber}`
+                            ? "Saving..."
+                            : issue.ownerKind === "lane"
+                              ? "Move lane"
+                              : "Set lane"}
+                        </button>
+                        <button
+                          className="action-button action-button-secondary"
+                          onClick={() => {
+                            setEditingLaneIssueNumber(null);
+                            setLaneDraft("");
+                          }}
+                        >
+                          Cancel
+                        </button>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="inline-actions">
+                      <button
+                        className="action-button action-button-secondary"
+                        onClick={() => {
+                          setEditingLaneIssueNumber(issue.issueNumber);
+                          setLaneDraft(issue.laneName ?? issue.preferredLaneName ?? "Delivery");
+                        }}
+                      >
+                        {issue.ownerKind === "lane" ? "Change lane" : "Set target lane"}
+                      </button>
+                    </div>
+                  )}
                 </div>
               )}
             />
+            <datalist id="lane-suggestion-options">
+              {(status?.laneSuggestions ?? []).map((lane) => (
+                <option key={lane.id} value={lane.name}>
+                  {lane.issueCount > 0 ? `${lane.issueCount} open issues` : "No open issues yet"}
+                </option>
+              ))}
+            </datalist>
           </section>
 
           <section className="panel sidebar-card">

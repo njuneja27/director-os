@@ -256,6 +256,13 @@ export interface LaneRecord {
   updatedAt: string;
 }
 
+export interface LaneSuggestionRecord {
+  id: string;
+  name: string;
+  isActive: boolean;
+  issueCount: number;
+}
+
 export interface IssueOwnershipRecord {
   issueNumber: number;
   title: string;
@@ -266,6 +273,10 @@ export interface IssueOwnershipRecord {
   ownerName: string | null;
   laneId: string | null;
   laneName: string | null;
+  preferredLaneId: string | null;
+  preferredLaneName: string | null;
+  preferredLaneSource: "explicit" | "fallback" | null;
+  sharedLaneIssueCount: number;
   executionIntent: "plan" | "implement" | null;
   status: IssueRoutingStatus;
   linkedPullRequestNumber: number | null;
@@ -375,6 +386,7 @@ export interface DirectorStatusResponse {
   lastSuccessfulSyncAt: string | null;
   prSweep: PrSweepRecord | null;
   lanes: LaneRecord[];
+  laneSuggestions: LaneSuggestionRecord[];
   issues: IssueOwnershipRecord[];
   openQuestion: HumanQuestionRecord | null;
   recentActivity: ActivityRecord[];
@@ -404,6 +416,10 @@ export interface UpdateProjectSettingsInput {
   model: string;
 }
 
+export interface UpdateIssueLaneAssignmentInput {
+  laneName: string;
+}
+
 export interface DirectorClient {
   getSetupStatus(): Promise<SetupStatusResponse>;
   probeRepository(input: SetupProbeRepositoryInput): Promise<SetupStatusResponse>;
@@ -416,6 +432,10 @@ export interface DirectorClient {
   pause(reason?: string): Promise<DirectorOperationResponse>;
   sync(): Promise<DirectorOperationResponse>;
   updateProjectSettings(input: UpdateProjectSettingsInput): Promise<DirectorStatusResponse>;
+  updateIssueLaneAssignment(
+    issueNumber: number,
+    input: UpdateIssueLaneAssignmentInput
+  ): Promise<DirectorStatusResponse>;
   resetRouterRuntime(): Promise<DirectorOperationResponse>;
 }
 
@@ -436,6 +456,10 @@ export interface DirectorDesktopBridge {
     pause(reason?: string): Promise<DirectorOperationResponse>;
     sync(): Promise<DirectorOperationResponse>;
     updateProjectSettings(input: UpdateProjectSettingsInput): Promise<DirectorStatusResponse>;
+    updateIssueLaneAssignment(
+      issueNumber: number,
+      input: UpdateIssueLaneAssignmentInput
+    ): Promise<DirectorStatusResponse>;
     resetRouterRuntime(): Promise<DirectorOperationResponse>;
   };
 }

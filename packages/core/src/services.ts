@@ -17,6 +17,7 @@ import type {
   InitCommandOptions,
   IssueOwnershipRecord,
   LaneRecord,
+  LaneSuggestionRecord,
   OrchestratorStatusRecord,
   ProjectConfigStatusRecord,
   ProjectRecord,
@@ -27,6 +28,7 @@ import type {
   SetupProbeRepositoryInput,
   SetupRepositoryDraft,
   SetupStatusResponse,
+  UpdateIssueLaneAssignmentInput,
   UpdateProjectSettingsInput
 } from "@director-os/shared";
 
@@ -50,6 +52,7 @@ import {
 } from "./config.js";
 import { COS_TASK_APPENDICES, buildChiefOfStaffPrompt } from "./cos.js";
 import {
+  addIssueLabels,
   closePullRequest,
   commentOnIssue,
   createIssue,
@@ -65,6 +68,7 @@ import {
   probeRepositoryPath,
   pullRequestChecks,
   pullRequestDiff,
+  removeIssueLabels,
   resolveRepoPath,
   viewPullRequest
 } from "./github.js";
@@ -1325,24 +1329,156 @@ function assignIssueToChiefOfStaff(router: RouterState, issueNumber: number): vo
   router.issueOwnership[String(issueNumber)] = CHIEF_OF_STAFF_OWNER_ID;
 }
 
-function defaultLaneForIssue(issue: GitHubIssueRecord): { id: string; name: string } {
-  const explicitLabel = issue.labels.find((label) => label.startsWith("director:lane:"));
+function humanizeLaneName(rawName: string): string {
+  const trimmed = rawName.trim();
+  if (!trimmed) {
+    return "Delivery";
+  }
+
+  if (/[A-Z]/.test(trimmed)) {
+    return trimmed;
+  }
+
+  return trimmed
+    .split(/[-_\s]+/)
+    .map((part) => (part ? `${part[0]?.toUpperCase() ?? ""}${part.slice(1)}` : part))
+    .join(" ");
+}
+
+function laneDescriptorFromName(rawName: string): { id: string; name: string } {
+  const trimmed = rawName.trim();
+  const resolvedName = trimmed || "Delivery";
+  return {
+    id: slugify(resolvedName) || "delivery",
+    name: humanizeLaneName(resolvedName)
+  };
+}
+
+function explicitLaneLabelForIssue(issue: Pick<GitHubIssueRecord, "labels">): string | null {
+  return issue.labels.find((label) => label.startsWith("director:lane:")) ?? null;
+}
+
+export function preferredLaneForIssue(
+  issue: Pick<GitHubIssueRecord, "labels">
+): { id: string; name: string; source: "explicit" | "fallback" } {
+  const explicitLabel = explicitLaneLabelForIssue(issue);
   if (explicitLabel) {
-    const rawName = explicitLabel.slice("director:lane:".length).trim();
-    const normalized = rawName || "delivery";
+    const descriptor = laneDescriptorFromName(
+      explicitLabel.slice("director:lane:".length).trim() || "delivery"
+    );
     return {
-      id: slugify(normalized),
-      name: normalized
-        .split(/[-_\s]+/)
-        .map((part) => (part ? `${part[0]?.toUpperCase() ?? ""}${part.slice(1)}` : part))
-        .join(" ")
+      ...descriptor,
+      source: "explicit"
     };
   }
 
   return {
     id: "delivery",
-    name: "Delivery"
+    name: "Delivery",
+    source: "fallback"
   };
+}
+
+function defaultLaneForIssue(issue: GitHubIssueRecord): { id: string; name: string } {
+  const preferredLane = preferredLaneForIssue(issue);
+  return {
+    id: preferredLane.id,
+    name: preferredLane.name
+  };
+}
+
+export function reassignIssueLaneInRouter(
+  router: RouterState,
+  issueNumber: number,
+  laneId: string,
+  laneName: string
+): RouterLaneState {
+  const previousLane = findIssueLane(router, issueNumber);
+  const previousLaneSnapshot = previousLane
+    ? {
+        status: previousLane.status,
+        lastSummary: previousLane.lastSummary,
+        lastPlanSummary: previousLane.lastPlanSummary,
+        activePullRequestNumber: previousLane.activePullRequestNumber
+      }
+    : null;
+  const nextLane = assignIssueToLane(router, issueNumber, laneId, laneName);
+
+  if (previousLaneSnapshot) {
+    nextLane.status = previousLaneSnapshot.status;
+    nextLane.lastSummary = previousLaneSnapshot.lastSummary;
+    nextLane.lastPlanSummary = previousLaneSnapshot.lastPlanSummary;
+    nextLane.activePullRequestNumber = previousLaneSnapshot.activePullRequestNumber;
+    nextLane.updatedAt = nowIso();
+  }
+
+  for (const handoff of router.pendingHandoffs) {
+    if (handoff.issueNumber === issueNumber && handoff.status !== "completed") {
+      handoff.laneId = laneId;
+      handoff.updatedAt = nowIso();
+    }
+  }
+
+  return nextLane;
+}
+
+export function synthesizeLaneSuggestions(
+  issues: GitHubIssueRecord[],
+  lanes: RouterLaneState[]
+): LaneSuggestionRecord[] {
+  const suggestions = new Map<string, LaneSuggestionRecord>();
+
+  const ensureSuggestion = (id: string, name: string, isActive: boolean) => {
+    const existing = suggestions.get(id);
+    if (existing) {
+      if (!existing.isActive) {
+        existing.name = name;
+      }
+      existing.isActive = existing.isActive || isActive;
+      return existing;
+    }
+
+    const created: LaneSuggestionRecord = {
+      id,
+      name,
+      isActive,
+      issueCount: 0
+    };
+    suggestions.set(id, created);
+    return created;
+  };
+
+  ensureSuggestion("delivery", "Delivery", lanes.some((lane) => lane.id === "delivery"));
+
+  for (const lane of lanes) {
+    ensureSuggestion(lane.id, lane.name, true);
+  }
+
+  for (const issue of issues) {
+    if (issue.state.toLowerCase() !== "open") {
+      continue;
+    }
+
+    const preferredLane = preferredLaneForIssue(issue);
+    const suggestion = ensureSuggestion(preferredLane.id, preferredLane.name, false);
+    suggestion.issueCount += 1;
+  }
+
+  return [...suggestions.values()].sort((left, right) => {
+    if (left.isActive !== right.isActive) {
+      return left.isActive ? -1 : 1;
+    }
+    if (left.issueCount !== right.issueCount) {
+      return right.issueCount - left.issueCount;
+    }
+    if (left.id === "delivery" && right.id !== "delivery") {
+      return -1;
+    }
+    if (right.id === "delivery" && left.id !== "delivery") {
+      return 1;
+    }
+    return left.name.localeCompare(right.name);
+  });
 }
 
 function defaultExecutionIntentForIssue(issue: GitHubIssueRecord): "plan" | "implement" {
@@ -1930,10 +2066,12 @@ function synthesizeLaneRecord(
 function synthesizeIssueOwnership(
   issue: GitHubIssueRecord,
   router: RouterState,
-  pullRequests: GitHubPullRequestRecord[]
+  pullRequests: GitHubPullRequestRecord[],
+  preferredLaneIssueCounts: ReadonlyMap<string, number>
 ): IssueOwnershipRecord {
   const ownerId = issueOwnerId(router, issue.number);
   const lane = findIssueLane(router, issue.number);
+  const preferredLane = preferredLaneForIssue(issue);
   const ownerKind =
     ownerId === CHIEF_OF_STAFF_OWNER_ID ? "chief_of_staff" : lane ? "lane" : null;
   const linkedPullRequest =
@@ -1950,6 +2088,13 @@ function synthesizeIssueOwnership(
       ownerKind === "chief_of_staff" ? "Chief of Staff" : ownerKind === "lane" ? lane?.name ?? null : null,
     laneId: lane?.id ?? null,
     laneName: lane?.name ?? null,
+    preferredLaneId: preferredLane.id,
+    preferredLaneName: preferredLane.name,
+    preferredLaneSource: preferredLane.source,
+    sharedLaneIssueCount:
+      issue.state.toLowerCase() === "open"
+        ? preferredLaneIssueCounts.get(preferredLane.id) ?? 1
+        : 0,
     executionIntent: lane?.status === "planning" ? "plan" : lane ? "implement" : null,
     status:
       issue.state.toLowerCase() !== "open"
@@ -5108,6 +5253,87 @@ export async function updateProjectSettings(
   });
 }
 
+export async function updateIssueLaneAssignment(
+  issueNumber: number,
+  input: UpdateIssueLaneAssignmentInput
+): Promise<DirectorStatusResponse> {
+  const normalizedIssueNumber = Number(issueNumber);
+  if (!Number.isInteger(normalizedIssueNumber) || normalizedIssueNumber <= 0) {
+    throw new Error("A valid issue number is required.");
+  }
+
+  const laneName = input.laneName.trim();
+  if (!laneName) {
+    throw new Error("Lane name is required.");
+  }
+
+  return withProject(async (session) => {
+    const [router, cache] = await Promise.all([
+      loadRouterState(session.paths, session.project.slug),
+      loadGitHubCacheState(session.paths, session.project.slug)
+    ]);
+
+    const targetIssue = cache.issues.find((issue) => issue.number === normalizedIssueNumber) ?? null;
+    if (!targetIssue) {
+      throw new Error(`Issue #${normalizedIssueNumber} is not available in the local GitHub cache.`);
+    }
+
+    const laneDescriptor = laneDescriptorFromName(laneName);
+    const nextLaneLabel = `director:lane:${laneDescriptor.id}`;
+    const labelsToRemove = targetIssue.labels.filter(
+      (label) => label.startsWith("director:lane:") && label !== nextLaneLabel
+    );
+    const labelsToAdd = targetIssue.labels.includes(nextLaneLabel) ? [] : [nextLaneLabel];
+
+    if (labelsToRemove.length > 0) {
+      await removeIssueLabels(session.project.repoSlug, normalizedIssueNumber, labelsToRemove);
+    }
+    if (labelsToAdd.length > 0) {
+      await addIssueLabels(session.project.repoSlug, normalizedIssueNumber, labelsToAdd);
+    }
+
+    const nextCache: GitHubCacheState = {
+      ...cache,
+      issues: cache.issues.map((issue) =>
+        issue.number === normalizedIssueNumber
+          ? {
+              ...issue,
+              labels: [
+                ...issue.labels.filter((label) => !label.startsWith("director:lane:")),
+                nextLaneLabel
+              ],
+              updatedAt: nowIso()
+            }
+          : issue
+      )
+    };
+    await saveGitHubCacheState(session.paths, nextCache, session.project.slug);
+
+    const ownerId = issueOwnerId(router, normalizedIssueNumber);
+    const hasLaneRuntimeState =
+      Boolean(findIssueLane(router, normalizedIssueNumber)) ||
+      (ownerId !== null && ownerId !== CHIEF_OF_STAFF_OWNER_ID) ||
+      router.pendingHandoffs.some(
+        (handoff) =>
+          handoff.issueNumber === normalizedIssueNumber &&
+          handoff.status !== "completed"
+      );
+
+    if (hasLaneRuntimeState) {
+      reassignIssueLaneInRouter(
+        router,
+        normalizedIssueNumber,
+        laneDescriptor.id,
+        laneDescriptor.name
+      );
+      router.updatedAt = nowIso();
+      await saveRouterState(session.paths, router);
+    }
+
+    return getDirectorStatus();
+  });
+}
+
 export async function getDirectorStatus(): Promise<DirectorStatusResponse> {
   return withProject(async (session) => {
     const [router, cache, owner, currentBranch, repoDefaultBranch] = await Promise.all([
@@ -5125,6 +5351,17 @@ export async function getDirectorStatus(): Promise<DirectorStatusResponse> {
     const openPullRequests = pullRequests
       .filter((pullRequest) => pullRequest.state.toLowerCase() === "open")
       .sort((left, right) => left.number - right.number);
+    const preferredLaneIssueCounts = new Map<string, number>();
+    for (const issue of issues) {
+      if (issue.state.toLowerCase() !== "open") {
+        continue;
+      }
+      const preferredLane = preferredLaneForIssue(issue);
+      preferredLaneIssueCounts.set(
+        preferredLane.id,
+        (preferredLaneIssueCounts.get(preferredLane.id) ?? 0) + 1
+      );
+    }
 
     return {
       project: session.project,
@@ -5136,7 +5373,10 @@ export async function getDirectorStatus(): Promise<DirectorStatusResponse> {
       lastSuccessfulSyncAt: resolveLastSuccessfulSyncAt(router.lastSyncAt, cache.syncedAt),
       prSweep: synthesizePrSweepRecord(router),
       lanes: router.lanes.map((lane) => synthesizeLaneRecord(lane, openPullRequests)),
-      issues: issues.map((issue) => synthesizeIssueOwnership(issue, router, pullRequests)),
+      laneSuggestions: synthesizeLaneSuggestions(issues, router.lanes),
+      issues: issues.map((issue) =>
+        synthesizeIssueOwnership(issue, router, pullRequests, preferredLaneIssueCounts)
+      ),
       openQuestion: router.openQuestion ? toHumanQuestionRecord(router.openQuestion) : null,
       recentActivity: synthesizeActivity(router),
       openPullRequests
