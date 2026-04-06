@@ -175,6 +175,24 @@ function summarizeText(value: string, maxLength = 240): string {
   return trimmed.length > maxLength ? `${trimmed.slice(0, maxLength - 1)}…` : trimmed;
 }
 
+function buildHumanQuestionTitle(
+  question: string,
+  options?: {
+    issueNumber?: number | null;
+    prNumber?: number | null;
+  }
+): string {
+  if (options?.issueNumber !== null && options?.issueNumber !== undefined) {
+    return `Decision needed on issue #${options.issueNumber}`;
+  }
+
+  if (options?.prNumber !== null && options?.prNumber !== undefined) {
+    return `Decision needed on PR #${options.prNumber}`;
+  }
+
+  return summarizeText(question, 72);
+}
+
 function extractIssueNumbers(value: string): number[] {
   const matches = value.matchAll(/#(\d+)/g);
   const seen = new Set<number>();
@@ -1756,6 +1774,10 @@ async function getConversationResponse(session: ProjectSession): Promise<Convers
   ]);
 
   const latestMessage = conversation.messages.at(-1) ?? null;
+  const openQuestionRun =
+    router.openQuestion?.runId !== null && router.openQuestion?.runId !== undefined
+      ? router.recentRuns.find((run) => run.id === router.openQuestion?.runId) ?? null
+      : null;
 
   return {
     thread: conversation.thread
@@ -1767,7 +1789,7 @@ async function getConversationResponse(session: ProjectSession): Promise<Convers
     messages: conversation.messages,
     openQuestion: router.openQuestion ? toHumanQuestionRecord(router.openQuestion) : null,
     latestSummary: latestMessage?.summary ?? null,
-    openQuestionRun: null
+    openQuestionRun
   };
 }
 
@@ -2001,7 +2023,9 @@ function blockedQuestionForLane(
   recommendation: string | null
 ): Omit<RouterQuestionState, "id" | "createdAt" | "updatedAt"> {
   return {
-    title: `Chief of Staff question for #${issue.number}`,
+    title: buildHumanQuestionTitle(blockingQuestion, {
+      issueNumber: issue.number
+    }),
     summary,
     question: blockingQuestion,
     whyItMatters: whyItMatters ?? summary,
@@ -3762,17 +3786,19 @@ export async function sendConversationMessage(content: string): Promise<Conversa
       const reply = await runCoSChatReply(session, trimmed);
 
       if (reply.kind === "cos_question") {
+        const questionText = reply.question ?? reply.reply;
+        const recommendation =
+          reply.recommendation ?? "Reply with the decision, priority, or tradeoff you want me to apply next.";
         const timestamp = nowIso();
         await saveRouterState(session.paths, {
           ...router,
           openQuestion: {
             id: `question_${Date.now()}`,
-            title: "Chief of Staff question",
+            title: buildHumanQuestionTitle(questionText),
             summary: reply.reply,
-            question: reply.question ?? "I need a little more direction before I continue.",
+            question: questionText,
             whyItMatters: reply.rationale ?? reply.reply,
-            recommendation:
-              reply.recommendation ?? "Reply here with the direction you want me to take.",
+            recommendation,
             issueNumber: null,
             prNumber: null,
             runId: reply.run.id,
@@ -3790,11 +3816,11 @@ export async function sendConversationMessage(content: string): Promise<Conversa
           role: "chief_of_staff",
           kind: "cos_question",
           content: formatHumanQuestionContent(
-            reply.question ?? "I need a little more direction before I continue.",
+            questionText,
             reply.rationale ?? reply.reply,
-            reply.recommendation ?? "Reply here with the direction you want me to take."
+            recommendation
           ),
-          summary: summarizeText(reply.question ?? reply.reply),
+          summary: summarizeText(questionText),
           linkedIssueNumber: null,
           linkedPrNumber: null,
           linkedPullRequestNumber: null,

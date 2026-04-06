@@ -4,6 +4,7 @@ import type {
   ConversationMessageRecord,
   ConversationResponse,
   DirectorStatusResponse,
+  HumanQuestionRecord,
   RunRecord,
   SetupCheck,
   SetupRepositoryDraft,
@@ -405,26 +406,11 @@ export function App() {
           </div>
 
           {openQuestion ? (
-            <div className="open-question-card">
-              <div className="eyebrow">Reply needed</div>
-              <div className="open-question-title">{openQuestion.title || "Chief of Staff question"}</div>
-              <p className="open-question-copy">{openQuestion.question}</p>
-              <p className="list-note">{openQuestion.whyItMatters}</p>
-              <p className="list-note">Recommendation: {openQuestion.recommendation}</p>
-              <div className="open-question-meta">
-                {openQuestion.linkedIssueNumber ? <span>Issue #{openQuestion.linkedIssueNumber}</span> : null}
-                {openQuestion.linkedPullRequestNumber ? (
-                  <span>PR #{openQuestion.linkedPullRequestNumber}</span>
-                ) : null}
-                <span>{formatTimestamp(openQuestion.createdAt)}</span>
-              </div>
-              {conversation?.openQuestionRun ? (
-                <RunOutputDetails
-                  run={conversation.openQuestionRun}
-                  summaryLabel="Source run output"
-                />
-              ) : null}
-            </div>
+            <EscalationCard
+              question={openQuestion}
+              run={conversation?.openQuestionRun ?? null}
+              status={status}
+            />
           ) : null}
 
           <div className="conversation-stream">
@@ -568,21 +554,8 @@ export function App() {
             <ItemList<NonNullable<DirectorStatusResponse["openQuestion"]>>
               empty="No blocker is waiting on you right now."
               items={status?.openQuestion ? [status.openQuestion] : []}
-              render={(decision) => (
-                <div className="compact-card" key={decision.id}>
-                  <div className="compact-card-head">
-                    <div className="list-title">{decision.title}</div>
-                    <span className="check-pill check-pill-needs-action">Reply needed</span>
-                  </div>
-                  <div className="compact-card-meta">
-                    {decision.linkedIssueNumber ? <span>Issue #{decision.linkedIssueNumber}</span> : null}
-                    {decision.linkedPullRequestNumber ? (
-                      <span>PR #{decision.linkedPullRequestNumber}</span>
-                    ) : null}
-                  </div>
-                  <div className="list-note">{decision.whyItMatters}</div>
-                  <div className="list-note">Recommendation: {decision.recommendation}</div>
-                </div>
+              render={(question) => (
+                <EscalationCard key={question.id} question={question} status={status} variant="compact" />
               )}
             />
           </section>
@@ -936,6 +909,110 @@ function StatusPill(props: { status: string }) {
   return <span className={`status-pill status-pill-${props.status.replace("_", "-")}`}>{formatOrchestratorStatus(props.status)}</span>;
 }
 
+function EscalationCard(props: {
+  question: HumanQuestionRecord;
+  run?: RunRecord | null;
+  status: DirectorStatusResponse | null;
+  variant?: "full" | "compact";
+}) {
+  const variant = props.variant ?? "full";
+  const linkedIssue = resolveLinkedIssue(props.question, props.status);
+  const linkedPullRequest = resolveLinkedPullRequest(props.question, props.status, linkedIssue);
+  const heading = deriveEscalationHeading(props.question, linkedIssue, linkedPullRequest);
+  const deck = deriveEscalationDeck(props.question, linkedIssue, linkedPullRequest);
+  const hasContext = Boolean(linkedIssue || linkedPullRequest);
+
+  return (
+    <article className={`open-question-card ${variant === "compact" ? "open-question-card-compact" : ""}`}>
+      <div className="open-question-header">
+        <div className="open-question-header-copy">
+          <div className="eyebrow">CoS escalation</div>
+          <div className="open-question-head">
+            <div className="open-question-title">{heading}</div>
+            <span className="check-pill check-pill-needs-action">Decision needed</span>
+          </div>
+          {deck ? <p className="open-question-deck">{deck}</p> : null}
+        </div>
+        <div className="open-question-status">
+          <span className="open-question-status-label">Raised</span>
+          <span>{formatTimestamp(props.question.createdAt)}</span>
+        </div>
+      </div>
+
+      <div className="open-question-sections">
+        <QuestionSection emphasis="strong" label="Exact ask" text={props.question.question} />
+        <QuestionSection label="Why it matters" text={props.question.whyItMatters} />
+        <QuestionSection emphasis="strong" label="Recommendation" text={props.question.recommendation} />
+      </div>
+
+      <div className="open-question-context">
+        <div className="open-question-context-label">Linked context</div>
+        <div className="open-question-context-links">
+          {linkedIssue ? (
+            <ContextLink
+              kind="Issue"
+              number={linkedIssue.number}
+              title={linkedIssue.title}
+              url={linkedIssue.url}
+            />
+          ) : null}
+          {linkedPullRequest ? (
+            <ContextLink
+              kind="PR"
+              number={linkedPullRequest.number}
+              title={linkedPullRequest.title}
+              url={linkedPullRequest.url}
+            />
+          ) : null}
+          {!hasContext ? (
+            <span className="context-link context-link-static">No linked issue or PR context yet.</span>
+          ) : null}
+        </div>
+      </div>
+
+      {variant === "full" && props.run ? (
+        <RunOutputDetails run={props.run} summaryLabel="Inspect source run" />
+      ) : null}
+    </article>
+  );
+}
+
+function QuestionSection(props: {
+  emphasis?: "default" | "strong";
+  label: string;
+  text: string;
+}) {
+  return (
+    <section className={`open-question-section ${props.emphasis === "strong" ? "open-question-section-strong" : ""}`}>
+      <div className="open-question-section-label">{props.label}</div>
+      <p className="open-question-section-copy">{props.text}</p>
+    </section>
+  );
+}
+
+function ContextLink(props: {
+  kind: "Issue" | "PR";
+  number: number;
+  title: string | null;
+  url: string | null;
+}) {
+  const title = props.title ? `#${props.number} ${props.title}` : `#${props.number}`;
+  const content = (
+    <>
+      <span className="context-link-kind">{props.kind}</span>
+      <span className="context-link-title">{title}</span>
+    </>
+  );
+
+  return props.url ? (
+    <a className="context-link" href={props.url} rel="noreferrer" target="_blank">
+      {content}
+    </a>
+  ) : (
+    <span className="context-link context-link-static">{content}</span>
+  );
+}
+
 function ConversationBubble(props: { message: ConversationMessageRecord }) {
   const toneClass =
     props.message.role === "director"
@@ -997,6 +1074,101 @@ function ItemList<TItem>(props: {
   return <div className="list-stack">{props.items.map(props.render)}</div>;
 }
 
+function resolveLinkedIssue(
+  question: HumanQuestionRecord,
+  status: DirectorStatusResponse | null
+): { number: number; title: string | null; url: string | null } | null {
+  if (!question.linkedIssueNumber) {
+    return null;
+  }
+
+  const linkedIssue =
+    status?.issues.find((issue) => issue.issueNumber === question.linkedIssueNumber) ?? null;
+
+  return {
+    number: question.linkedIssueNumber,
+    title: linkedIssue?.title ?? null,
+    url:
+      linkedIssue?.url ??
+      buildGitHubUrl(status?.project?.repoSlug ?? null, "issues", question.linkedIssueNumber)
+  };
+}
+
+function resolveLinkedPullRequest(
+  question: HumanQuestionRecord,
+  status: DirectorStatusResponse | null,
+  linkedIssue: { number: number; title: string | null; url: string | null } | null
+): { number: number; title: string | null; url: string | null } | null {
+  if (!question.linkedPullRequestNumber) {
+    return null;
+  }
+
+  const linkedPullRequest =
+    status?.openPullRequests.find((pullRequest) => pullRequest.number === question.linkedPullRequestNumber) ?? null;
+  const linkedIssueRecord =
+    status?.issues.find((issue) => issue.issueNumber === linkedIssue?.number) ?? null;
+
+  return {
+    number: question.linkedPullRequestNumber,
+    title: linkedPullRequest?.title ?? null,
+    url:
+      linkedPullRequest?.url ??
+      linkedIssueRecord?.linkedPullRequestUrl ??
+      buildGitHubUrl(status?.project?.repoSlug ?? null, "pull", question.linkedPullRequestNumber)
+  };
+}
+
+function deriveEscalationHeading(
+  question: HumanQuestionRecord,
+  linkedIssue: { number: number; title: string | null; url: string | null } | null,
+  linkedPullRequest: { number: number; title: string | null; url: string | null } | null
+): string {
+  if (linkedIssue) {
+    return `Decision needed on issue #${linkedIssue.number}`;
+  }
+
+  if (linkedPullRequest) {
+    return `Decision needed on PR #${linkedPullRequest.number}`;
+  }
+
+  if (!isGenericEscalationTitle(question.title)) {
+    return question.title.trim();
+  }
+
+  return "Decision needed to proceed";
+}
+
+function deriveEscalationDeck(
+  question: HumanQuestionRecord,
+  linkedIssue: { number: number; title: string | null; url: string | null } | null,
+  linkedPullRequest: { number: number; title: string | null; url: string | null } | null
+): string | null {
+  if (linkedIssue?.title) {
+    return linkedIssue.title;
+  }
+
+  if (linkedPullRequest?.title) {
+    return linkedPullRequest.title;
+  }
+
+  if (!isGenericEscalationTitle(question.title)) {
+    return question.title.trim();
+  }
+
+  return null;
+}
+
+function isGenericEscalationTitle(value: string): boolean {
+  return /^chief of staff question(?:\s+for\b.*)?$/i.test(value.trim());
+}
+
+function buildGitHubUrl(
+  repoSlug: string | null,
+  kind: "issues" | "pull",
+  number: number
+): string | null {
+  return repoSlug ? `https://github.com/${repoSlug}/${kind}/${number}` : null;
+}
 function formatTimestamp(value: string): string {
   try {
     return new Intl.DateTimeFormat(undefined, {
