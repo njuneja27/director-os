@@ -2,7 +2,8 @@ import { describe, expect, it } from "vitest";
 
 import {
   parseGitWorktreeList,
-  selectReusableGitWorktree
+  selectReusableGitWorktree,
+  shouldReuseCleanIssueWorktree
 } from "./git-worktrees.js";
 
 describe("parseGitWorktreeList", () => {
@@ -82,5 +83,37 @@ describe("selectReusableGitWorktree", () => {
       branchName: "codex/issue-30",
       isPrunable: false
     });
+  });
+});
+
+describe("shouldReuseCleanIssueWorktree", () => {
+  it("reuses a clean branch when it already matches the current default branch tip", () => {
+    expect(
+      shouldReuseCleanIssueWorktree({
+        branchHeadRevision: "abc123",
+        defaultBranchRevision: "abc123",
+        branchCommitsBehind: 0
+      })
+    ).toBe(true);
+  });
+
+  it("reuses a clean branch when it still contains the current default branch tip", () => {
+    expect(
+      shouldReuseCleanIssueWorktree({
+        branchHeadRevision: "def456",
+        defaultBranchRevision: "abc123",
+        branchCommitsBehind: 0
+      })
+    ).toBe(true);
+  });
+
+  it("rejects a clean branch that has fallen behind the current default branch tip", () => {
+    expect(
+      shouldReuseCleanIssueWorktree({
+        branchHeadRevision: "def456",
+        defaultBranchRevision: "abc123",
+        branchCommitsBehind: 2
+      })
+    ).toBe(false);
   });
 });

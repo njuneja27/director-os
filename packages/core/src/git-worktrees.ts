@@ -67,3 +67,11 @@ export function selectReusableGitWorktree(
     ) ?? null
   );
 }
+
+export function shouldReuseCleanIssueWorktree(input: {
+  branchHeadRevision: string;
+  defaultBranchRevision: string;
+  branchCommitsBehind: number;
+}): boolean {
+  return input.branchHeadRevision === input.defaultBranchRevision || input.branchCommitsBehind === 0;
+}
