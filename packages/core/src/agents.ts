@@ -57,6 +57,27 @@ const issueTaskSchema = {
 const structuredDataSchema = {
   type: "object",
   additionalProperties: false,
+  required: [
+    "outcome",
+    "owner_type",
+    "lane_id",
+    "lane_name",
+    "guidance",
+    "transcript_reply",
+    "why_it_matters",
+    "question",
+    "recommendation",
+    "selected_issue_number",
+    "execution_intent",
+    "rationale",
+    "new_issues",
+    "child_tasks",
+    "decision",
+    "feedback",
+    "kind",
+    "reply",
+    "command_error"
+  ],
   properties: {
     outcome: { type: ["string", "null"] },
     owner_type: { type: ["string", "null"] },
@@ -86,7 +107,7 @@ const structuredDataSchema = {
   }
 } as const;
 
-const outputSchema = {
+export const codexOutputSchema = {
   type: "object",
   additionalProperties: false,
   required: [
@@ -94,7 +115,8 @@ const outputSchema = {
     "summary",
     "recommended_next_action",
     "artifact_refs",
-    "blocking_questions"
+    "blocking_questions",
+    "data"
   ],
   properties: {
     status: {
@@ -422,7 +444,7 @@ export async function runCodexSessionAgent(
   const schemaPath = path.join(runtimePaths.tmpDir, `${stem}.schema.json`);
   const outputPath = path.join(runtimePaths.tmpDir, `${stem}.output.json`);
 
-  await fs.writeFile(schemaPath, `${JSON.stringify(outputSchema, null, 2)}\n`, "utf8");
+  await fs.writeFile(schemaPath, `${JSON.stringify(codexOutputSchema, null, 2)}\n`, "utf8");
 
   const args = [
     "exec",
@@ -476,14 +498,15 @@ export async function runCodexSessionAgent(
     return {
       sessionId,
       result:
-        fallback ??
         {
           status: "failed",
           summary: `Codex agent failed for ${input.role}: ${detail || String(error)}`,
-          recommended_next_action: "Review the prompt, model, or workspace permissions and retry.",
+          recommended_next_action:
+            fallback?.recommended_next_action ??
+            "Review the prompt, model, or workspace permissions and retry.",
           artifact_refs: [],
           blocking_questions: [],
-          data: detail ? { command_error: detail } : {},
+          data: detail ? { ...(fallback?.data ?? {}), command_error: detail } : fallback?.data ?? {},
           raw_model_output: rawModelOutput
         }
     };
