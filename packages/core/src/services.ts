@@ -18,6 +18,7 @@ import type {
   IssueOwnershipRecord,
   LaneRecord,
   OrchestratorStatusRecord,
+  ProjectConfigStatusRecord,
   ProjectRecord,
   RunRecord,
   SetupCheck,
@@ -25,7 +26,8 @@ import type {
   SetupProblemCode,
   SetupProbeRepositoryInput,
   SetupRepositoryDraft,
-  SetupStatusResponse
+  SetupStatusResponse,
+  UpdateProjectSettingsInput
 } from "@director-os/shared";
 
 import {
@@ -670,6 +672,89 @@ async function getCurrentGitBranch(repoPath: string): Promise<string | null> {
   } catch {
     return null;
   }
+}
+
+async function getLocalRepoDefaultBranch(repoPath: string): Promise<string | null> {
+  try {
+    const symbolicRef = await runCommandOrThrow(
+      "git",
+      ["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+      {
+        cwd: repoPath
+      }
+    );
+    const trimmed = symbolicRef.trim();
+    const prefix = "refs/remotes/origin/";
+    return trimmed.startsWith(prefix) ? trimmed.slice(prefix.length) : null;
+  } catch {
+    return null;
+  }
+}
+
+export function synthesizeProjectConfigStatus(
+  projectConfig: StoredProjectConfig,
+  resolution: {
+    repoDefaultBranch?: string | null;
+    currentBranch?: string | null;
+  }
+): ProjectConfigStatusRecord {
+  const defaultBranchStrategy =
+    projectConfig.defaultBranchStrategy === "custom" ? "custom" : "repo_default";
+  const repoDefaultBranch = resolution.repoDefaultBranch?.trim() || null;
+  const currentBranch = resolution.currentBranch?.trim() || null;
+  const defaultBranch = projectConfig.defaultBranch.trim() || repoDefaultBranch || "main";
+  const canHealToRepoDefault =
+    defaultBranchStrategy === "repo_default" &&
+    Boolean(repoDefaultBranch) &&
+    defaultBranch !== repoDefaultBranch;
+
+  if (!repoDefaultBranch) {
+    return {
+      defaultBranchStrategy,
+      repoDefaultBranch: null,
+      currentBranch,
+      branchStatus: defaultBranchStrategy === "custom" ? "custom" : "unknown",
+      branchStatusSummary:
+        defaultBranchStrategy === "custom"
+          ? `Targeting custom base branch ${defaultBranch}. The local repo default branch could not be detected.`
+          : `Targeting base branch ${defaultBranch}, but the local repo default branch could not be detected yet.`,
+      canHealToRepoDefault: false
+    };
+  }
+
+  if (defaultBranchStrategy === "custom") {
+    return {
+      defaultBranchStrategy,
+      repoDefaultBranch,
+      currentBranch,
+      branchStatus: "custom",
+      branchStatusSummary:
+        defaultBranch === repoDefaultBranch
+          ? `Targeting ${defaultBranch} with a custom base-branch setting.`
+          : `Targeting custom base branch ${defaultBranch} instead of repo default ${repoDefaultBranch}.`,
+      canHealToRepoDefault: false
+    };
+  }
+
+  if (defaultBranch !== repoDefaultBranch) {
+    return {
+      defaultBranchStrategy,
+      repoDefaultBranch,
+      currentBranch,
+      branchStatus: "stale",
+      branchStatusSummary: `Stored repo-default target ${defaultBranch} is stale; the local repo default branch is ${repoDefaultBranch}.`,
+      canHealToRepoDefault: true
+    };
+  }
+
+  return {
+    defaultBranchStrategy,
+    repoDefaultBranch,
+    currentBranch,
+    branchStatus: "healthy",
+    branchStatusSummary: `Targeting repo default branch ${repoDefaultBranch}.`,
+    canHealToRepoDefault: false
+  };
 }
 
 async function resolveProjectRepositoryMetadata(
@@ -4963,12 +5048,74 @@ export async function syncProject(): Promise<DirectorOperationResponse> {
   return withProject(async (session) => syncProjectInternal(session));
 }
 
+export async function updateProjectSettings(
+  input: UpdateProjectSettingsInput
+): Promise<DirectorStatusResponse> {
+  return withProject(async (session) => {
+    const repoPathInput = input.repoPath.trim();
+    const repoSlug = input.repoSlug.trim();
+    const worktreeRootInput = input.worktreeRoot.trim();
+    const defaultBranchInput = input.defaultBranch.trim();
+    const model = input.model.trim();
+    const defaultBranchStrategy =
+      input.defaultBranchStrategy === "custom" ? "custom" : "repo_default";
+
+    if (!repoPathInput) {
+      throw new Error("Repo path is required.");
+    }
+    if (!repoSlug) {
+      throw new Error("Repo slug is required.");
+    }
+    if (!worktreeRootInput) {
+      throw new Error("Worktree root is required.");
+    }
+    if (!model) {
+      throw new Error("Model is required.");
+    }
+    if (defaultBranchStrategy === "custom" && !defaultBranchInput) {
+      throw new Error("A custom base branch is required when branch mode is custom.");
+    }
+
+    const nextProjectConfigBase: StoredProjectConfig = {
+      ...session.projectConfig,
+      repoPath: resolveRepoPath(repoPathInput),
+      repoSlug,
+      defaultBranch: defaultBranchInput || session.projectConfig.defaultBranch,
+      defaultBranchStrategy,
+      worktreeRoot: path.resolve(worktreeRootInput),
+      model,
+      updatedAt: nowIso()
+    };
+
+    const resolution = await resolveProjectRepositoryMetadata(nextProjectConfigBase);
+    const repoDefaultBranch = resolution.repoDefaultBranch?.trim() || null;
+    const nextProjectConfig: StoredProjectConfig = {
+      ...nextProjectConfigBase,
+      repoSlug: resolution.repoSlug?.trim() || nextProjectConfigBase.repoSlug,
+      defaultBranch:
+        defaultBranchStrategy === "repo_default"
+          ? repoDefaultBranch || nextProjectConfigBase.defaultBranch
+          : nextProjectConfigBase.defaultBranch,
+      updatedAt: nowIso()
+    };
+
+    const nextConfig = upsertProjectConfig(session.config, nextProjectConfig);
+    nextConfig.activeProjectSlug = session.config.activeProjectSlug;
+    await saveConfig(nextConfig, session.paths);
+    await initializeProjectRuntime(session.paths, nextProjectConfig);
+
+    return getDirectorStatus();
+  });
+}
+
 export async function getDirectorStatus(): Promise<DirectorStatusResponse> {
   return withProject(async (session) => {
-    const [router, cache, owner] = await Promise.all([
+    const [router, cache, owner, currentBranch, repoDefaultBranch] = await Promise.all([
       loadRouterState(session.paths, session.project.slug),
       loadGitHubCacheState(session.paths, session.project.slug),
-      readOrchestratorLock(session.paths)
+      readOrchestratorLock(session.paths),
+      getCurrentGitBranch(session.project.repoPath),
+      getLocalRepoDefaultBranch(session.project.repoPath)
     ]);
 
     const issues = cache.issues.map((issue) => mapRemoteIssue(session.project, issue));
@@ -4981,6 +5128,10 @@ export async function getDirectorStatus(): Promise<DirectorStatusResponse> {
 
     return {
       project: session.project,
+      projectConfigStatus: synthesizeProjectConfigStatus(session.projectConfig, {
+        currentBranch,
+        repoDefaultBranch
+      }),
       orchestrator: synthesizeOrchestratorStatus(session.project, router, owner),
       lastSuccessfulSyncAt: resolveLastSuccessfulSyncAt(router.lastSyncAt, cache.syncedAt),
       prSweep: synthesizePrSweepRecord(router),

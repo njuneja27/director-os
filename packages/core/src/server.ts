@@ -16,7 +16,8 @@ import {
   runWorkspaceSetupTest,
   startOrchestrator,
   sendConversationMessage,
-  syncProject
+  syncProject,
+  updateProjectSettings
 } from "./services.js";
 
 const currentDir = path.dirname(fileURLToPath(import.meta.url));
@@ -92,6 +93,16 @@ export async function createDirectorServer() {
     pauseOrchestrator(request.body?.reason)
   );
   app.post("/api/sync", async () => syncProject());
+  app.post<{
+    Body: {
+      repoPath: string;
+      repoSlug: string;
+      defaultBranch: string;
+      defaultBranchStrategy: "repo_default" | "custom";
+      worktreeRoot: string;
+      model: string;
+    };
+  }>("/api/project/settings", async (request) => updateProjectSettings(request.body));
   app.post("/api/reset-router-runtime", async () => resetRouterRuntime());
 
   app.setNotFoundHandler(async (request, reply) => {

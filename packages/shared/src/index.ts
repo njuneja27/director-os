@@ -313,6 +313,15 @@ export interface PrSweepRecord {
   updatedAt: string | null;
 }
 
+export interface ProjectConfigStatusRecord {
+  defaultBranchStrategy: "repo_default" | "custom";
+  repoDefaultBranch: string | null;
+  currentBranch: string | null;
+  branchStatus: "healthy" | "stale" | "custom" | "unknown";
+  branchStatusSummary: string;
+  canHealToRepoDefault: boolean;
+}
+
 export interface AgentResultEnvelope {
   status: "ok" | "needs_input" | "failed";
   summary: string;
@@ -361,6 +370,7 @@ export interface SetupStatusResponse {
 
 export interface DirectorStatusResponse {
   project: ProjectRecord | null;
+  projectConfigStatus: ProjectConfigStatusRecord | null;
   orchestrator: OrchestratorStatusRecord | null;
   lastSuccessfulSyncAt: string | null;
   prSweep: PrSweepRecord | null;
@@ -385,6 +395,15 @@ export interface DirectorOperationResponse {
   [key: string]: unknown;
 }
 
+export interface UpdateProjectSettingsInput {
+  repoPath: string;
+  repoSlug: string;
+  defaultBranch: string;
+  defaultBranchStrategy: "repo_default" | "custom";
+  worktreeRoot: string;
+  model: string;
+}
+
 export interface DirectorClient {
   getSetupStatus(): Promise<SetupStatusResponse>;
   probeRepository(input: SetupProbeRepositoryInput): Promise<SetupStatusResponse>;
@@ -396,6 +415,7 @@ export interface DirectorClient {
   start(): Promise<DirectorOperationResponse>;
   pause(reason?: string): Promise<DirectorOperationResponse>;
   sync(): Promise<DirectorOperationResponse>;
+  updateProjectSettings(input: UpdateProjectSettingsInput): Promise<DirectorStatusResponse>;
   resetRouterRuntime(): Promise<DirectorOperationResponse>;
 }
 
@@ -415,6 +435,7 @@ export interface DirectorDesktopBridge {
     start(): Promise<DirectorOperationResponse>;
     pause(reason?: string): Promise<DirectorOperationResponse>;
     sync(): Promise<DirectorOperationResponse>;
+    updateProjectSettings(input: UpdateProjectSettingsInput): Promise<DirectorStatusResponse>;
     resetRouterRuntime(): Promise<DirectorOperationResponse>;
   };
 }
