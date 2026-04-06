@@ -20,7 +20,9 @@ async function printLaneVisibility(): Promise<void> {
   console.log(JSON.stringify({
     orchestrator: status.orchestrator,
     lastSuccessfulSyncAt: status.lastSuccessfulSyncAt,
+    prSweep: status.prSweep,
     openQuestion: status.openQuestion,
+    recentActivity: status.recentActivity,
     lanes: status.lanes,
     issues: status.issues,
     openPullRequests: status.openPullRequests

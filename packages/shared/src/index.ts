@@ -36,6 +36,7 @@ export const PR_CYCLE_STATUSES = [
   "merged",
   "blocked"
 ] as const;
+export const PR_SWEEP_STATUSES = ["idle", "scheduled", "running"] as const;
 export const SETUP_CHECK_KINDS = ["repository", "github", "codex", "workspace"] as const;
 export const SETUP_CHECK_STATUSES = [
   "ready",
@@ -86,6 +87,7 @@ export type NoteStatus = (typeof NOTE_STATUSES)[number];
 export type ConversationMessageRole = (typeof CONVERSATION_MESSAGE_ROLES)[number];
 export type ConversationMessageKind = (typeof CONVERSATION_MESSAGE_KINDS)[number];
 export type PrCycleStatus = (typeof PR_CYCLE_STATUSES)[number];
+export type PrSweepStatus = (typeof PR_SWEEP_STATUSES)[number];
 export type SetupCheckKind = (typeof SETUP_CHECK_KINDS)[number];
 export type SetupCheckStatus = (typeof SETUP_CHECK_STATUSES)[number];
 export type SetupProblemCode = (typeof SETUP_PROBLEM_CODES)[number];
@@ -297,6 +299,20 @@ export interface ActivityRecord {
   createdAt: string;
 }
 
+export interface PrSweepRecord {
+  status: PrSweepStatus;
+  nextRunAt: string | null;
+  currentPullRequestNumber: number | null;
+  pendingPullRequestNumbers: number[];
+  blockerIssueNumbers: number[];
+  waitingOnIssueNumber: number | null;
+  startedAt: string | null;
+  completedAt: string | null;
+  lastSummary: string | null;
+  pausedIssueWork: boolean;
+  updatedAt: string | null;
+}
+
 export interface AgentResultEnvelope {
   status: "ok" | "needs_input" | "failed";
   summary: string;
@@ -347,6 +363,7 @@ export interface DirectorStatusResponse {
   project: ProjectRecord | null;
   orchestrator: OrchestratorStatusRecord | null;
   lastSuccessfulSyncAt: string | null;
+  prSweep: PrSweepRecord | null;
   lanes: LaneRecord[];
   issues: IssueOwnershipRecord[];
   openQuestion: HumanQuestionRecord | null;

@@ -5,6 +5,7 @@ import type {
   ConversationMessageRecord,
   ConversationThreadRecord,
   OrchestratorStatus,
+  PrSweepStatus,
   RunRecord
 } from "@director-os/shared";
 
@@ -59,6 +60,20 @@ export interface RouterHandoffState {
   updatedAt: string;
 }
 
+export interface RouterPrSweepState {
+  status: PrSweepStatus;
+  nextRunAt: string | null;
+  currentPullRequestNumber: number | null;
+  pendingPullRequestNumbers: number[];
+  blockerIssueNumbers: number[];
+  waitingOnIssueNumber: number | null;
+  startedAt: string | null;
+  completedAt: string | null;
+  lastSummary: string | null;
+  pausedIssueWork: boolean;
+  updatedAt: string | null;
+}
+
 export interface RouterState {
   version: number;
   projectSlug: string;
@@ -76,6 +91,7 @@ export interface RouterState {
   lanes: RouterLaneState[];
   issueOwnership: Record<string, string>;
   pendingHandoffs: RouterHandoffState[];
+  prSweep: RouterPrSweepState;
   openQuestion: RouterQuestionState | null;
   recentRuns: RunRecord[];
   lastSyncAt: string | null;
@@ -163,6 +179,19 @@ export function createDefaultRouterState(projectSlug: string): RouterState {
     lanes: [],
     issueOwnership: {},
     pendingHandoffs: [],
+    prSweep: {
+      status: "idle",
+      nextRunAt: null,
+      currentPullRequestNumber: null,
+      pendingPullRequestNumbers: [],
+      blockerIssueNumbers: [],
+      waitingOnIssueNumber: null,
+      startedAt: null,
+      completedAt: null,
+      lastSummary: "Chief of Staff will schedule PR sweeps as needed.",
+      pausedIssueWork: false,
+      updatedAt: timestamp
+    },
     openQuestion: null,
     recentRuns: [],
     lastSyncAt: null,
@@ -259,6 +288,16 @@ export async function loadRouterState(paths: RuntimePaths, projectSlug: string):
           details: handoff.details ?? null
         }))
       : [],
+    prSweep: {
+      ...fallback.prSweep,
+      ...(state as Partial<RouterState>).prSweep,
+      pendingPullRequestNumbers: Array.isArray(state.prSweep?.pendingPullRequestNumbers)
+        ? state.prSweep.pendingPullRequestNumbers
+        : [],
+      blockerIssueNumbers: Array.isArray(state.prSweep?.blockerIssueNumbers)
+        ? state.prSweep.blockerIssueNumbers
+        : []
+    },
     recentRuns: Array.isArray(state.recentRuns) ? state.recentRuns : []
   };
 }

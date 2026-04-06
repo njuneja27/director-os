@@ -73,6 +73,7 @@ const structuredDataSchema = {
     "new_issues",
     "decision",
     "feedback",
+    "pr_sweep_interval_hours",
     "kind",
     "reply",
     "command_error"
@@ -96,6 +97,7 @@ const structuredDataSchema = {
     },
     decision: { type: ["string", "null"] },
     feedback: { type: ["string", "null"] },
+    pr_sweep_interval_hours: { type: ["number", "null"] },
     kind: { type: ["string", "null"] },
     reply: { type: ["string", "null"] },
     command_error: { type: ["string", "null"] }

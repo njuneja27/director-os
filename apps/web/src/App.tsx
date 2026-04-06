@@ -478,6 +478,20 @@ export function App() {
                     : "No successful sync yet"}
                 </span>
               </div>
+              <div className="meta-pair">
+                <span className="meta-pair-label">PR sweep</span>
+                <span className="meta-pair-value">
+                  {status?.prSweep
+                    ? status.prSweep.status === "running"
+                      ? "Running"
+                      : status.prSweep.pausedIssueWork
+                        ? "Pausing issue work"
+                        : status.prSweep.nextRunAt
+                          ? `Scheduled for ${formatTimestamp(status.prSweep.nextRunAt)}`
+                          : "Unscheduled"
+                    : "Unavailable"}
+                </span>
+              </div>
             </div>
             <div className="list-note">
               The Chief of Staff loop stays local and routes work through persistent lane sessions.
@@ -526,6 +540,73 @@ export function App() {
                   : "Reset local router runtime"}
               </button>
             </div>
+          </section>
+
+          <section className="panel sidebar-card">
+            <div className="panel-header">
+              <div>
+                <div className="section-title">PR sweep</div>
+                <div className="section-meta">The Chief of Staff periodically pauses normal issue routing to clear the open PR queue, then resumes backlog work.</div>
+              </div>
+            </div>
+            <ItemList<NonNullable<DirectorStatusResponse["prSweep"]>>
+              empty="PR sweep state is not available yet."
+              items={status?.prSweep ? [status.prSweep] : []}
+              render={(prSweep) => (
+                <div className="compact-card">
+                  <div className="compact-card-head">
+                    <div className="list-title">
+                      {prSweep.status === "running"
+                        ? "Sweep in progress"
+                        : prSweep.nextRunAt
+                          ? `Next sweep ${formatTimestamp(prSweep.nextRunAt)}`
+                          : "Sweep not scheduled"}
+                    </div>
+                    <span className="check-pill check-pill-needs-action">
+                      {prSweep.pausedIssueWork ? "Issue work paused" : prSweep.status}
+                    </span>
+                  </div>
+                  <div className="compact-card-meta">
+                    {prSweep.currentPullRequestNumber ? <span>Reviewing PR #{prSweep.currentPullRequestNumber}</span> : null}
+                    {prSweep.pendingPullRequestNumbers.length > 0 ? (
+                      <span>{prSweep.pendingPullRequestNumbers.length} PRs remaining</span>
+                    ) : null}
+                    {prSweep.waitingOnIssueNumber ? <span>Waiting on issue #{prSweep.waitingOnIssueNumber}</span> : null}
+                    {prSweep.completedAt ? <span>Last completed {formatTimestamp(prSweep.completedAt)}</span> : null}
+                  </div>
+                  <div className="list-note">
+                    {prSweep.lastSummary ?? "Chief of Staff will schedule the next PR sweep when the router is ready."}
+                  </div>
+                </div>
+              )}
+            />
+          </section>
+
+          <section className="panel sidebar-card">
+            <div className="panel-header">
+              <div>
+                <div className="section-title">Recent activity</div>
+                <div className="section-meta">A compact timeline of recent CoS, lane, and PR sweep automation events.</div>
+              </div>
+            </div>
+            <ItemList<DirectorStatusResponse["recentActivity"][number]>
+              empty="No recent automation activity yet."
+              items={status?.recentActivity ?? []}
+              render={(activity) => (
+                <div className="list-row compact-list-row" key={activity.id}>
+                  <div>
+                    <div className="list-title">{activity.summary}</div>
+                    <div className="list-meta">
+                      <span>{activity.kind.replaceAll("_", " ")}</span>
+                      {activity.laneName ? <span>{activity.laneName}</span> : null}
+                      {activity.issueNumber ? <span>Issue #{activity.issueNumber}</span> : null}
+                      {activity.pullRequestNumber ? <span>PR #{activity.pullRequestNumber}</span> : null}
+                    </div>
+                  </div>
+                  <div className="list-note">{formatTimestamp(activity.createdAt)}</div>
+                </div>
+              )}
+            />
           </section>
 
           <section className="panel sidebar-card">
@@ -612,6 +693,7 @@ export function App() {
                     <div className="list-title">PR #{pullRequest.number} {pullRequest.title}</div>
                     <div className="list-meta">
                       <span>{pullRequest.reviewDecision ?? (pullRequest.isDraft ? "Draft" : "Open")}</span>
+                      {pullRequest.checksBucket ? <span>{pullRequest.checksBucket.replaceAll("_", " ")}</span> : null}
                       {pullRequest.linkedIssueNumbers[0] ? <span>Issue #{pullRequest.linkedIssueNumbers[0]}</span> : null}
                     </div>
                   </div>
