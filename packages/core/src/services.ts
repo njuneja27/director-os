@@ -73,6 +73,11 @@ import {
   shouldReuseCleanIssueWorktree
 } from "./git-worktrees.js";
 import {
+  extractLanePlanIssueTasks,
+  parseProposedIssueTasks,
+  type ProposedIssueTask
+} from "./lane-plan.js";
+import {
   createDefaultConversationState,
   initializeProjectRuntime,
   loadConversationState,
@@ -121,13 +126,6 @@ type CoSChatReply = {
   rationale: string | null;
   run: RunRecord;
 };
-
-interface ProposedIssueTask {
-  title: string;
-  body: string;
-  kind: string;
-  execution_mode: string;
-}
 
 function assertPresent<TValue>(value: TValue | null | undefined, message: string): TValue {
   if (value === null || value === undefined) {
@@ -213,36 +211,6 @@ function parseDataString(value: unknown): string | null {
 
 function parseDataNumber(value: unknown): number | null {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
-}
-
-function parseIssueTasks(value: unknown): ProposedIssueTask[] {
-  if (!Array.isArray(value)) {
-    return [];
-  }
-
-  return value.flatMap((entry) => {
-    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
-      return [];
-    }
-
-    const title = parseDataString((entry as Record<string, unknown>).title);
-    const body = parseDataString((entry as Record<string, unknown>).body);
-    const kind = parseDataString((entry as Record<string, unknown>).kind);
-    const executionMode = parseDataString((entry as Record<string, unknown>).execution_mode);
-
-    if (!title || !body || !kind || !executionMode) {
-      return [];
-    }
-
-    return [
-      {
-        title,
-        body,
-        kind,
-        execution_mode: executionMode
-      }
-    ];
-  });
 }
 
 function labelsForIssueTask(task: ProposedIssueTask): string[] {
@@ -2460,7 +2428,7 @@ async function reviewLanePlan(
     raw_model_output?: string | null;
   }
 ): Promise<RouterState> {
-  const proposedIssues = parseIssueTasks(laneResult.data?.child_tasks ?? laneResult.data?.new_issues);
+  const proposedIssues = extractLanePlanIssueTasks(laneResult.data);
   const prompt = buildChiefOfStaffPrompt(COS_TASK_APPENDICES.reviewLanePlan, [
     {
       title: "Lane",
@@ -2589,7 +2557,7 @@ async function reviewLanePlan(
     const tasks =
       decision === "decompose"
         ? (() => {
-            const explicitTasks = parseIssueTasks(turn.result.data?.new_issues);
+            const explicitTasks = parseProposedIssueTasks(turn.result.data?.new_issues);
             return explicitTasks.length > 0 ? explicitTasks : proposedIssues;
           })()
         : [];
