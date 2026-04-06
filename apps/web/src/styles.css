@@ -522,6 +522,11 @@ button {
   padding: 16px;
 }
 
+.recovery-card {
+  display: grid;
+  gap: 14px;
+}
+
 .sidebar-stats {
   margin-bottom: 12px;
 }
@@ -548,6 +553,24 @@ button {
 
 .compact-list-row {
   padding: 12px;
+}
+
+.recovery-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.recovery-block {
+  gap: 10px;
+}
+
+.recovery-list {
+  margin: 0;
+  padding-left: 18px;
+  color: var(--text-soft);
+  display: grid;
+  gap: 8px;
 }
 
 .section-title {
@@ -782,6 +805,7 @@ button {
 
 @media (max-width: 1080px) {
   .control-room-grid,
+  .recovery-grid,
   .setup-grid,
   .hero-row,
   .workspace-grid {

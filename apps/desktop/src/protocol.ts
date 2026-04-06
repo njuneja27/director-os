@@ -13,6 +13,7 @@ export const IPC_CHANNELS = {
     getStatus: "director:get-status",
     start: "director:start",
     pause: "director:pause",
-    sync: "director:sync"
+    sync: "director:sync",
+    resetRouterRuntime: "director:reset-router-runtime"
   }
 } as const;

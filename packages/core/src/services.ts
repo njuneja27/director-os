@@ -74,6 +74,7 @@ import {
   type ProposedIssueTask
 } from "./lane-plan.js";
 import {
+  createDefaultRouterState,
   createDefaultConversationState,
   initializeProjectRuntime,
   loadConversationState,
@@ -94,6 +95,19 @@ const execFileAsync = promisify(execFile);
 const LOOP_INTERVAL_MS = 30 * 1000;
 const ORCHESTRATOR_OWNER_TOKEN = `${process.pid}:${randomUUID()}`;
 const CHIEF_OF_STAFF_OWNER_ID = "chief_of_staff";
+const RESET_ROUTER_RUNTIME_SUMMARY =
+  "Local router runtime reset. Sync GitHub, then restart the Chief of Staff loop.";
+const RESET_ROUTER_RUNTIME_CLEARED = [
+  "lane ownership and Codex session routing",
+  "pending handoffs and review queues",
+  "open blocker and escalation runtime state",
+  "recent router run history and pause state"
+];
+const RESET_ROUTER_RUNTIME_PRESERVED = [
+  "repo path, repo slug, base branch, worktree root, and model settings",
+  "GitHub issues and pull requests mirrored into the local cache",
+  "repository contents and existing worktrees on disk"
+];
 
 let orchestratorTimer: NodeJS.Timeout | null = null;
 let orchestratorRunning = false;
@@ -455,6 +469,18 @@ export function resolveLastSuccessfulSyncAt(
   return Date.parse(routerTimestamp) >= Date.parse(cacheTimestamp)
     ? routerTimestamp
     : cacheTimestamp;
+}
+
+export function buildResetRouterState(router: RouterState): RouterState {
+  const resetState = createDefaultRouterState(router.projectSlug);
+  return {
+    ...resetState,
+    lastSyncAt: router.lastSyncAt,
+    orchestrator: {
+      ...resetState.orchestrator,
+      lastSummary: RESET_ROUTER_RUNTIME_SUMMARY
+    }
+  };
 }
 
 async function getCurrentGitBranch(repoPath: string): Promise<string | null> {
@@ -3459,6 +3485,15 @@ function scheduleOrchestratorLoop(delayMs = LOOP_INTERVAL_MS): void {
   }, delayMs);
 }
 
+function clearScheduledOrchestratorLoop(): void {
+  if (!orchestratorTimer) {
+    return;
+  }
+
+  clearTimeout(orchestratorTimer);
+  orchestratorTimer = null;
+}
+
 export async function getSetupStatus(): Promise<SetupStatusResponse> {
   return withRuntime(async (session) => {
     const activeProject = await getActiveProjectFromRuntime(session);
@@ -3841,10 +3876,79 @@ export async function pauseOrchestrator(reason?: string): Promise<DirectorOperat
     };
   });
 
-  if (orchestratorTimer) {
-    clearTimeout(orchestratorTimer);
-    orchestratorTimer = null;
-  }
+  clearScheduledOrchestratorLoop();
   await releaseOrchestratorLock(await ensureRuntimeDirectories());
   return response;
+}
+
+export async function resetRouterRuntime(): Promise<DirectorOperationResponse> {
+  return withProject(async (session) =>
+    runSerializedStateMutation(async () => {
+      const owner = await readOrchestratorLock(session.paths);
+      if (owner && owner.token !== ORCHESTRATOR_OWNER_TOKEN && isProcessAlive(owner.pid)) {
+        throw new Error(
+          "Another local Director OS process is still running this project. Pause or close it before resetting router runtime."
+        );
+      }
+
+      if (owner && owner.token !== ORCHESTRATOR_OWNER_TOKEN) {
+        try {
+          await fs.unlink(session.paths.orchestratorLockPath);
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+            throw error;
+          }
+        }
+      }
+
+      clearScheduledOrchestratorLoop();
+      activeLaneDispatches.clear();
+
+      const router = await loadRouterState(session.paths, session.project.slug);
+      const nextRouter = recordRun(session, buildResetRouterState(router), {
+        issueNumber: null,
+        prNumber: null,
+        role: "chief_of_staff",
+        status: "succeeded",
+        phase: "runtime_reset",
+        summary: "Local router runtime reset.",
+        recommendedNextAction:
+          "Sync GitHub to rehydrate issues and pull requests, then restart the Chief of Staff loop.",
+        artifacts: [],
+        blockingQuestions: [],
+        outputJson: {
+          cleared: RESET_ROUTER_RUNTIME_CLEARED,
+          preserved: RESET_ROUTER_RUNTIME_PRESERVED
+        },
+        rawModelOutput: null,
+        worktreePath: null
+      });
+
+      await saveRouterState(session.paths, nextRouter);
+      await appendConversationMessage(session, {
+        role: "chief_of_staff",
+        kind: "status_update",
+        content: [
+          "Local router runtime reset for this project.",
+          `Cleared: ${RESET_ROUTER_RUNTIME_CLEARED.join("; ")}.`,
+          `Preserved: ${RESET_ROUTER_RUNTIME_PRESERVED.join("; ")}.`,
+          "Next step: run Sync, then restart the Chief of Staff loop if orchestration should resume."
+        ].join("\n\n"),
+        summary: "Local router runtime reset.",
+        linkedIssueNumber: null,
+        linkedPrNumber: null,
+        linkedPullRequestNumber: null,
+        isOpenQuestion: false
+      });
+
+      await releaseOrchestratorLock(session.paths);
+
+      return {
+        ok: true,
+        message: RESET_ROUTER_RUNTIME_SUMMARY,
+        cleared: RESET_ROUTER_RUNTIME_CLEARED,
+        preserved: RESET_ROUTER_RUNTIME_PRESERVED
+      };
+    })
+  );
 }

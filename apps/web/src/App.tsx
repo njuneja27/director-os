@@ -16,6 +16,7 @@ import {
   fetchStatus,
   pauseDirector,
   probeRepository,
+  resetRouterRuntime,
   runWorkspaceTest,
   sendMessage,
   startDirector,
@@ -25,6 +26,19 @@ import { deriveSetupStateBadge, hasCompletedSetup } from "./setup-state";
 
 type SetupStep = "landing" | "repository" | "readiness" | "complete";
 type SetupIntent = "fresh" | "repair";
+
+const RESET_RUNTIME_CLEARS = [
+  "Lane ownership, pending handoffs, and lane review queues",
+  "Open blocker or escalation runtime state",
+  "Chief of Staff and lane Codex session routing",
+  "Recent router run history and pause state"
+];
+
+const RESET_RUNTIME_KEEPS = [
+  "Repo path, repo slug, base branch, worktree root, and model settings",
+  "GitHub issues and pull requests mirrored into the local cache",
+  "Repository contents and existing worktrees on disk"
+];
 
 export function App() {
   const [shellMode, setShellMode] = useState<"booting" | "setup" | "app">("booting");
@@ -268,6 +282,28 @@ export function App() {
     });
   }
 
+  async function handleResetRouterRuntime() {
+    const confirmation = window.confirm(
+      [
+        "Reset local router runtime for the active project?",
+        "",
+        "This clears:",
+        ...RESET_RUNTIME_CLEARS.map((item) => `- ${item}`),
+        "",
+        "This keeps:",
+        ...RESET_RUNTIME_KEEPS.map((item) => `- ${item}`),
+        "",
+        "After reset, run Sync and then restart the Chief of Staff loop when ready."
+      ].join("\n")
+    );
+
+    if (!confirmation) {
+      return;
+    }
+
+    await runDashboardAction("reset-router-runtime", async () => resetRouterRuntime());
+  }
+
   if (shellMode === "booting") {
     return (
       <div className="app-shell">
@@ -475,6 +511,50 @@ export function App() {
                   ? formatTimestamp(status.lastSuccessfulSyncAt)
                   : "No successful sync yet"}
               </span>
+            </div>
+          </section>
+
+          <section className="panel sidebar-card recovery-card">
+            <div className="panel-header">
+              <div>
+                <div className="section-title">Recovery</div>
+                <div className="section-meta">
+                  Reset only the local router runtime for this project when the control room is wedged.
+                </div>
+              </div>
+              <span className="check-pill check-pill-needs-action">Manual recovery</span>
+            </div>
+            <div className="recovery-grid">
+              <div className="compact-card recovery-block">
+                <div className="list-title">This clears</div>
+                <ul className="recovery-list">
+                  {RESET_RUNTIME_CLEARS.map((item) => (
+                    <li key={item}>{item}</li>
+                  ))}
+                </ul>
+              </div>
+              <div className="compact-card recovery-block">
+                <div className="list-title">This keeps</div>
+                <ul className="recovery-list">
+                  {RESET_RUNTIME_KEEPS.map((item) => (
+                    <li key={item}>{item}</li>
+                  ))}
+                </ul>
+              </div>
+            </div>
+            <div className="list-note">
+              GitHub issues, pull requests, and repo contents stay intact. After reset, run Sync and then Start when orchestration should resume.
+            </div>
+            <div className="inline-actions">
+              <button
+                className="action-button action-button-danger"
+                disabled={busyAction === "reset-router-runtime"}
+                onClick={() => void handleResetRouterRuntime()}
+              >
+                {busyAction === "reset-router-runtime"
+                  ? "Resetting runtime..."
+                  : "Reset local router runtime"}
+              </button>
             </div>
           </section>
 
