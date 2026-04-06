@@ -475,7 +475,7 @@ export function App() {
             <div className="panel-header">
               <div>
                 <div className="section-title">Lanes</div>
-                <div className="section-meta">Persistent Codex sessions owned by the Chief of Staff.</div>
+                <div className="section-meta">Persistent Codex sessions owned by the Chief of Staff. Independent lanes can run in parallel when they own different issues.</div>
               </div>
             </div>
             <ItemList<DirectorStatusResponse["lanes"][number]>

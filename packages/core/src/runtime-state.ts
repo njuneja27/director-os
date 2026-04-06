@@ -44,11 +44,14 @@ export interface RouterHandoffState {
   laneId: string;
   issueNumber: number;
   kind: "plan" | "implement" | "review";
-  status: "pending" | "completed" | "blocked";
+  status: "pending" | "in_progress" | "completed" | "blocked";
   summary: string | null;
   prNumber: number | null;
   branchName: string | null;
   worktreePath: string | null;
+  startedAt: string | null;
+  startedBy: string | null;
+  startedByPid: number | null;
   reviewWindowEndsAt: string | null;
   lastHandledCommentAt: string | null;
   details: Record<string, unknown> | null;
@@ -248,6 +251,9 @@ export async function loadRouterState(paths: RuntimePaths, projectSlug: string):
           prNumber: handoff.prNumber ?? null,
           branchName: handoff.branchName ?? null,
           worktreePath: handoff.worktreePath ?? null,
+          startedAt: handoff.startedAt ?? null,
+          startedBy: handoff.startedBy ?? null,
+          startedByPid: handoff.startedByPid ?? null,
           reviewWindowEndsAt: handoff.reviewWindowEndsAt ?? null,
           lastHandledCommentAt: handoff.lastHandledCommentAt ?? null,
           details: handoff.details ?? null
