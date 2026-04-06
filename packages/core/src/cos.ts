@@ -33,10 +33,20 @@ export const COS_TASK_APPENDICES = {
     "If you choose `ask_human`, return `data.question`, `data.why_it_matters`, and `data.recommendation`.",
     "Keep Director OS thin: return a concise summary, not a custom plan object."
   ].join("\n"),
+  planPrSweep: [
+    "Task: choose when the next automated PR sweep should run.",
+    "Return `data.pr_sweep_interval_hours` as a number between 0 and 24.",
+    "Use `0` only when the next sweep should run immediately.",
+    "Bias toward short intervals when open PRs or recent PR blockers exist, and longer intervals when the queue is quiet.",
+    "Use `data.transcript_reply` for the short operational summary."
+  ].join("\n"),
   reviewPr: [
     "Task: review a real pull request and decide whether it is merge-ready.",
-    "Return `data.decision` as `merge`, `changes`, or `escalate`.",
+    "Return `data.decision` as `merge`, `changes`, `close`, `blocker_issue`, or `escalate`.",
     "If you choose `changes`, return concise `data.feedback` the implementer can act on.",
+    "If you choose `close`, use `data.feedback` as the closure rationale the Chief of Staff should post.",
+    "If you choose `blocker_issue`, return one GitHub-ready issue in `data.new_issues[0]` and use `data.feedback` as the PR update comment.",
+    "Only choose `escalate` for a true product or taste judgment the human must make.",
     "If you choose `escalate`, return `data.question`, `data.why_it_matters`, and `data.recommendation`."
   ].join("\n"),
   replyInChat: [

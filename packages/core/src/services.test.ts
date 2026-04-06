@@ -6,14 +6,25 @@ import { promisify } from "node:util";
 
 import { describe, expect, it } from "vitest";
 
-import type { DecisionRecord, ProjectRecord, RunRecord } from "@director-os/shared";
+import type {
+  DecisionRecord,
+  GitHubIssueRecord,
+  ProjectRecord,
+  RunRecord
+} from "@director-os/shared";
 import type { StoredProjectConfig } from "./config.js";
 import { createDefaultRouterState, type RouterState } from "./runtime-state.js";
 import {
+  buildPrSweepBlockerLabels,
   buildResetRouterState,
   ensureIssueWorktree,
+  isPrSweepDue,
   reconcileProjectConfigWithRepository,
-  resolveLastSuccessfulSyncAt
+  resolveLastSuccessfulSyncAt,
+  schedulePrSweepState,
+  sortQueueableIssues,
+  startPrSweepState,
+  updateRunningPrSweepState
 } from "./services.js";
 
 const execFileAsync = promisify(execFile);
@@ -120,6 +131,26 @@ function makeDecisionRecord(overrides: Partial<DecisionRecord> = {}): DecisionRe
     resolution: null,
     createdAt: "2026-04-06T00:00:00.000Z",
     updatedAt: "2026-04-06T00:00:00.000Z",
+    ...overrides
+  };
+}
+
+function makeIssueRecord(
+  number: number,
+  overrides: Partial<GitHubIssueRecord> = {}
+): GitHubIssueRecord {
+  return {
+    id: number,
+    projectId: 1,
+    number,
+    title: `Issue #${number}`,
+    body: "",
+    state: "open",
+    workflowState: "ready",
+    labels: [],
+    url: `https://github.com/njuneja27/director-os/issues/${number}`,
+    updatedAt: "2026-04-06T00:00:00.000Z",
+    syncedAt: "2026-04-06T00:00:00.000Z",
     ...overrides
   };
 }
@@ -247,6 +278,115 @@ describe("ensureIssueWorktree", () => {
   });
 });
 
+describe("PR sweep helpers", () => {
+  it("prioritizes blocker issues ahead of the normal issue queue", () => {
+    const ordered = sortQueueableIssues([
+      makeIssueRecord(40, {
+        workflowState: "queued"
+      }),
+      makeIssueRecord(10, {
+        workflowState: "queued",
+        labels: ["director:priority"]
+      }),
+      makeIssueRecord(20),
+      makeIssueRecord(30, {
+        labels: ["director:priority"]
+      })
+    ]);
+
+    expect(ordered.map((issue) => issue.number)).toEqual([30, 10, 20, 40]);
+  });
+
+  it("schedules the next PR sweep and preserves blocker visibility", () => {
+    const nowMs = Date.parse("2026-04-06T14:00:00.000Z");
+    const state = schedulePrSweepState(
+      {
+        ...createDefaultRouterState("director-os").prSweep,
+        blockerIssueNumbers: [98]
+      },
+      2,
+      "Next PR sweep scheduled.",
+      nowMs
+    );
+
+    expect(state.status).toBe("scheduled");
+    expect(state.nextRunAt).toBe("2026-04-06T16:00:00.000Z");
+    expect(state.waitingOnIssueNumber).toBe(98);
+    expect(state.pausedIssueWork).toBe(false);
+    expect(state.pendingPullRequestNumbers).toEqual([]);
+    expect(state.lastSummary).toBe("Next PR sweep scheduled.");
+  });
+
+  it("marks sweep runs as active and steps pending PRs down as each review starts", () => {
+    const started = startPrSweepState(createDefaultRouterState("director-os").prSweep, [83, 84, 85], {
+      now: "2026-04-06T14:05:00.000Z"
+    });
+    const updated = updateRunningPrSweepState(started, {
+      currentPullRequestNumber: 83,
+      removePullRequestNumber: 83,
+      blockerIssueNumber: 112,
+      waitingOnIssueNumber: 112,
+      summary: "Opened blocker issue #112 while reviewing PR #83.",
+      now: "2026-04-06T14:06:00.000Z"
+    });
+
+    expect(started.status).toBe("running");
+    expect(started.pendingPullRequestNumbers).toEqual([83, 84, 85]);
+    expect(started.pausedIssueWork).toBe(true);
+    expect(updated.currentPullRequestNumber).toBe(83);
+    expect(updated.pendingPullRequestNumbers).toEqual([84, 85]);
+    expect(updated.blockerIssueNumbers).toEqual([112]);
+    expect(updated.waitingOnIssueNumber).toBe(112);
+    expect(updated.lastSummary).toBe("Opened blocker issue #112 while reviewing PR #83.");
+  });
+
+  it("treats running sweeps and overdue scheduled sweeps as immediately due", () => {
+    const nowMs = Date.parse("2026-04-06T14:00:00.000Z");
+
+    expect(
+      isPrSweepDue(
+        {
+          status: "running",
+          nextRunAt: null
+        },
+        nowMs
+      )
+    ).toBe(true);
+
+    expect(
+      isPrSweepDue(
+        {
+          status: "scheduled",
+          nextRunAt: "2026-04-06T13:59:00.000Z"
+        },
+        nowMs
+      )
+    ).toBe(true);
+
+    expect(
+      isPrSweepDue(
+        {
+          status: "scheduled",
+          nextRunAt: "2026-04-06T14:01:00.000Z"
+        },
+        nowMs
+      )
+    ).toBe(false);
+  });
+
+  it("labels PR sweep blocker issues for priority routing and lane ownership", () => {
+    expect(buildPrSweepBlockerLabels("experience")).toEqual([
+      "director:ready",
+      "director:priority",
+      "director:lane:experience"
+    ]);
+    expect(buildPrSweepBlockerLabels("")).toEqual([
+      "director:ready",
+      "director:priority"
+    ]);
+  });
+});
+
 describe("resolveLastSuccessfulSyncAt", () => {
   it("falls back to the GitHub cache timestamp when router state has not recorded one yet", () => {
     expect(
@@ -326,6 +466,19 @@ describe("buildResetRouterState", () => {
           updatedAt: "2026-04-06T12:27:00.000Z"
         }
       ],
+      prSweep: {
+        status: "running",
+        nextRunAt: "2026-04-06T12:35:00.000Z",
+        currentPullRequestNumber: 95,
+        pendingPullRequestNumbers: [96],
+        blockerIssueNumbers: [82],
+        waitingOnIssueNumber: 82,
+        startedAt: "2026-04-06T12:21:00.000Z",
+        completedAt: "2026-04-06T11:40:00.000Z",
+        lastSummary: "PR sweep is waiting on issue #82 before it resumes backlog work.",
+        pausedIssueWork: true,
+        updatedAt: "2026-04-06T12:29:30.000Z"
+      },
       openQuestion: {
         id: "question_1",
         title: "Need runtime recovery decision",
@@ -382,6 +535,13 @@ describe("buildResetRouterState", () => {
     expect(reset.lanes).toEqual([]);
     expect(reset.issueOwnership).toEqual({});
     expect(reset.pendingHandoffs).toEqual([]);
+    expect(reset.prSweep.status).toBe("idle");
+    expect(reset.prSweep.nextRunAt).toBeNull();
+    expect(reset.prSweep.currentPullRequestNumber).toBeNull();
+    expect(reset.prSweep.pendingPullRequestNumbers).toEqual([]);
+    expect(reset.prSweep.blockerIssueNumbers).toEqual([]);
+    expect(reset.prSweep.waitingOnIssueNumber).toBeNull();
+    expect(reset.prSweep.pausedIssueWork).toBe(false);
     expect(reset.openQuestion).toBeNull();
     expect(reset.recentRuns).toEqual([]);
   });

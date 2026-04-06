@@ -18,7 +18,6 @@ import type {
   IssueOwnershipRecord,
   LaneRecord,
   OrchestratorStatusRecord,
-  PrCycleRecord,
   ProjectRecord,
   RunRecord,
   SetupCheck,
@@ -49,6 +48,7 @@ import {
 } from "./config.js";
 import { COS_TASK_APPENDICES, buildChiefOfStaffPrompt } from "./cos.js";
 import {
+  closePullRequest,
   commentOnIssue,
   createIssue,
   createPullRequest,
@@ -58,8 +58,11 @@ import {
   listComments,
   listIssues,
   listPullRequests,
+  mergePullRequest,
   probeGhCli,
   probeRepositoryPath,
+  pullRequestChecks,
+  pullRequestDiff,
   resolveRepoPath,
   viewPullRequest
 } from "./github.js";
@@ -95,6 +98,11 @@ const execFileAsync = promisify(execFile);
 const LOOP_INTERVAL_MS = 30 * 1000;
 const ORCHESTRATOR_OWNER_TOKEN = `${process.pid}:${randomUUID()}`;
 const CHIEF_OF_STAFF_OWNER_ID = "chief_of_staff";
+const PR_SWEEP_PRIORITY_LABEL = "director:priority";
+const PR_SWEEP_DEFAULT_INTERVAL_HOURS = 4;
+const PR_SWEEP_IDLE_INTERVAL_HOURS = 24;
+const PR_SWEEP_MAX_DIFF_LENGTH = 12_000;
+const PR_SWEEP_MAX_COMMENTS = 12;
 const RESET_ROUTER_RUNTIME_SUMMARY =
   "Local router runtime reset. Sync GitHub, then restart the Chief of Staff loop.";
 const RESET_ROUTER_RUNTIME_CLEARED = [
@@ -264,6 +272,157 @@ function parseDataString(value: unknown): string | null {
 
 function parseDataNumber(value: unknown): number | null {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function parseIntervalHours(value: unknown): number | null {
+  const numeric = parseDataNumber(value);
+  if (numeric === null) {
+    return null;
+  }
+
+  return numeric >= 0 ? Math.min(Math.floor(numeric), 168) : null;
+}
+
+export function hasPriorityLabel(
+  issue: Pick<GitHubIssueRecord, "labels">
+): boolean {
+  return issue.labels.includes(PR_SWEEP_PRIORITY_LABEL);
+}
+
+export function sortQueueableIssues(
+  issues: GitHubIssueRecord[]
+): GitHubIssueRecord[] {
+  return [...issues].sort((left, right) => {
+    const leftPriority = hasPriorityLabel(left) ? 0 : 1;
+    const rightPriority = hasPriorityLabel(right) ? 0 : 1;
+    const leftWorkflow = left.workflowState === "ready" ? 0 : 1;
+    const rightWorkflow = right.workflowState === "ready" ? 0 : 1;
+
+    return leftPriority - rightPriority || leftWorkflow - rightWorkflow || left.number - right.number;
+  });
+}
+
+export function computePrSweepNextRunAt(
+  intervalHours: number,
+  nowMs = Date.now()
+): string {
+  return new Date(nowMs + Math.max(0, intervalHours) * 60 * 60 * 1000).toISOString();
+}
+
+export function schedulePrSweepState(
+  prSweep: RouterState["prSweep"],
+  intervalHours: number,
+  summary: string,
+  nowMs = Date.now()
+): RouterState["prSweep"] {
+  const timestamp = new Date(nowMs).toISOString();
+
+  return {
+    ...prSweep,
+    status: "scheduled",
+    nextRunAt: computePrSweepNextRunAt(intervalHours, nowMs),
+    currentPullRequestNumber: null,
+    pendingPullRequestNumbers: [],
+    waitingOnIssueNumber: prSweep.blockerIssueNumbers[0] ?? null,
+    completedAt: timestamp,
+    lastSummary: summary,
+    pausedIssueWork: false,
+    updatedAt: timestamp
+  };
+}
+
+export function startPrSweepState(
+  prSweep: RouterState["prSweep"],
+  pullRequestNumbers: number[],
+  options?: {
+    summary?: string | null;
+    now?: string;
+  }
+): RouterState["prSweep"] {
+  const timestamp = options?.now ?? nowIso();
+
+  return {
+    ...prSweep,
+    status: "running",
+    nextRunAt: null,
+    currentPullRequestNumber: null,
+    pendingPullRequestNumbers: [...pullRequestNumbers],
+    blockerIssueNumbers: [],
+    waitingOnIssueNumber: null,
+    startedAt: timestamp,
+    lastSummary:
+      options?.summary ??
+      (pullRequestNumbers.length > 0
+        ? `Chief of Staff started a PR sweep across ${pullRequestNumbers.length} open pull request${
+            pullRequestNumbers.length === 1 ? "" : "s"
+          }.`
+        : "Chief of Staff started a PR sweep with no open pull requests."),
+    pausedIssueWork: true,
+    updatedAt: timestamp
+  };
+}
+
+export function updateRunningPrSweepState(
+  prSweep: RouterState["prSweep"],
+  input: {
+    currentPullRequestNumber?: number | null;
+    removePullRequestNumber?: number | null;
+    blockerIssueNumber?: number | null;
+    waitingOnIssueNumber?: number | null;
+    summary?: string | null;
+    now?: string;
+  }
+): RouterState["prSweep"] {
+  const timestamp = input.now ?? nowIso();
+  const nextPending =
+    input.removePullRequestNumber === null || input.removePullRequestNumber === undefined
+      ? prSweep.pendingPullRequestNumbers
+      : prSweep.pendingPullRequestNumbers.filter((number) => number !== input.removePullRequestNumber);
+  const nextBlockers =
+    input.blockerIssueNumber === null || input.blockerIssueNumber === undefined
+      ? prSweep.blockerIssueNumbers
+      : [...prSweep.blockerIssueNumbers, input.blockerIssueNumber];
+
+  return {
+    ...prSweep,
+    status: "running",
+    currentPullRequestNumber:
+      input.currentPullRequestNumber === undefined
+        ? prSweep.currentPullRequestNumber
+        : input.currentPullRequestNumber,
+    pendingPullRequestNumbers: nextPending,
+    blockerIssueNumbers: nextBlockers,
+    waitingOnIssueNumber:
+      input.waitingOnIssueNumber === undefined
+        ? prSweep.waitingOnIssueNumber
+        : input.waitingOnIssueNumber,
+    lastSummary: input.summary ?? prSweep.lastSummary,
+    pausedIssueWork: true,
+    updatedAt: timestamp
+  };
+}
+
+export function isPrSweepDue(
+  prSweep: Pick<RouterState["prSweep"], "status" | "nextRunAt">,
+  nowMs = Date.now()
+): boolean {
+  if (prSweep.status === "running") {
+    return true;
+  }
+
+  return Boolean(prSweep.nextRunAt && Date.parse(prSweep.nextRunAt) <= nowMs);
+}
+
+export function buildPrSweepBlockerLabels(laneId?: string | null): string[] {
+  return [
+    "director:ready",
+    PR_SWEEP_PRIORITY_LABEL,
+    laneId?.trim() ? `director:lane:${laneId.trim()}` : null
+  ].filter((label): label is string => Boolean(label));
+}
+
+function prSweepIntervalHoursForOpenPrCount(openPullRequestCount: number): number {
+  return openPullRequestCount > 0 ? PR_SWEEP_DEFAULT_INTERVAL_HOURS : PR_SWEEP_IDLE_INTERVAL_HOURS;
 }
 
 function labelsForIssueTask(task: ProposedIssueTask): string[] {
@@ -1264,6 +1423,23 @@ async function resolveFreshIssueWorktreeTarget(
   }
 }
 
+async function resolveFreshDetachedWorktreePath(
+  entries: Awaited<ReturnType<typeof listGitWorktrees>>,
+  desiredWorktreePath: string
+): Promise<string> {
+  const livePaths = new Set(entries.filter((entry) => !entry.isPrunable).map((entry) => entry.path));
+
+  let attempt = 0;
+  while (true) {
+    const candidateWorktreePath = suffixedWorktreeTarget(desiredWorktreePath, attempt);
+    if (!livePaths.has(candidateWorktreePath)) {
+      return candidateWorktreePath;
+    }
+
+    attempt += 1;
+  }
+}
+
 async function ensureWorktreeNodeModules(
   project: ProjectRecord,
   worktreePath: string
@@ -1392,6 +1568,68 @@ export async function ensureIssueWorktree(
   return {
     branchName: target.branchName,
     worktreePath: target.worktreePath
+  };
+}
+
+async function ensurePullRequestWorktree(
+  project: ProjectRecord,
+  pullRequest: GitHubPullRequestRecord
+): Promise<{
+  branchName: string;
+  worktreePath: string;
+  pushBranchName: string;
+}> {
+  await fs.mkdir(project.worktreeRoot, { recursive: true });
+  await pruneGitWorktrees(project.repoPath);
+
+  const [worktreeRootComparablePath, rawEntries] = await Promise.all([
+    resolveComparablePath(project.worktreeRoot),
+    listGitWorktrees(project.repoPath)
+  ]);
+
+  const entries = (
+    await Promise.all(
+      rawEntries.map(async (entry) => ({
+        entry,
+        comparablePath: await resolveComparablePath(entry.path)
+      }))
+    )
+  )
+    .filter(({ comparablePath }) => comparablePath.startsWith(`${worktreeRootComparablePath}${path.sep}`))
+    .map(({ entry }) => entry);
+
+  const desiredWorktreePath = path.join(project.worktreeRoot, `pr-${pullRequest.number}`);
+  const worktreePath = await resolveFreshDetachedWorktreePath(entries, desiredWorktreePath);
+
+  if (await pathExists(worktreePath)) {
+    await fs.rm(worktreePath, { recursive: true, force: true });
+  }
+
+  await runCommandOrThrow(
+    "git",
+    ["-C", project.repoPath, "fetch", "origin", pullRequest.headRefName],
+    { cwd: project.repoPath }
+  );
+  await runCommandOrThrow(
+    "git",
+    [
+      "-C",
+      project.repoPath,
+      "worktree",
+      "add",
+      "--detach",
+      worktreePath,
+      `origin/${pullRequest.headRefName}`
+    ],
+    { cwd: project.repoPath }
+  );
+
+  await ensureWorktreeNodeModules(project, worktreePath);
+
+  return {
+    branchName: pullRequest.headRefName,
+    worktreePath,
+    pushBranchName: pullRequest.headRefName
   };
 }
 
@@ -1683,6 +1921,22 @@ function synthesizeActivity(router: RouterState): ActivityRecord[] {
   return [...questionActivity, ...runActivity]
     .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
     .slice(0, 12);
+}
+
+function synthesizePrSweepRecord(router: RouterState): DirectorStatusResponse["prSweep"] {
+  return {
+    status: router.prSweep.status,
+    nextRunAt: router.prSweep.nextRunAt,
+    currentPullRequestNumber: router.prSweep.currentPullRequestNumber,
+    pendingPullRequestNumbers: router.prSweep.pendingPullRequestNumbers,
+    blockerIssueNumbers: router.prSweep.blockerIssueNumbers,
+    waitingOnIssueNumber: router.prSweep.waitingOnIssueNumber,
+    startedAt: router.prSweep.startedAt,
+    completedAt: router.prSweep.completedAt,
+    lastSummary: router.prSweep.lastSummary,
+    pausedIssueWork: router.prSweep.pausedIssueWork,
+    updatedAt: router.prSweep.updatedAt
+  };
 }
 
 function synthesizeOrchestratorStatus(
@@ -2074,6 +2328,860 @@ async function createIssuesFromPlan(
   return created;
 }
 
+function openPullRequestsFromCache(
+  session: ProjectSession,
+  cache: GitHubCacheState
+): GitHubPullRequestRecord[] {
+  return cache.pullRequests
+    .map((pullRequest) => mapRemotePullRequest(session.project, pullRequest, cache.syncedAt))
+    .filter((pullRequest) => pullRequest.state.toLowerCase() === "open")
+    .sort((left, right) => left.number - right.number);
+}
+
+function linkedIssueForPullRequest(
+  session: ProjectSession,
+  cache: GitHubCacheState,
+  pullRequest: GitHubPullRequestRecord
+): GitHubIssueRecord | null {
+  const linkedIssueNumber = pullRequest.linkedIssueNumbers[0] ?? null;
+  if (!linkedIssueNumber) {
+    return null;
+  }
+
+  return (
+    cache.issues
+      .map((issue) => mapRemoteIssue(session.project, issue))
+      .find((issue) => issue.number === linkedIssueNumber) ?? null
+  );
+}
+
+function summarizePullRequestChecks(
+  checks: Awaited<ReturnType<typeof pullRequestChecks>>
+): string {
+  if (!checks.length) {
+    return "No GitHub check results were reported.";
+  }
+
+  return checks
+    .map((check) => {
+      const workflow = check.workflow?.trim() ? ` (${check.workflow.trim()})` : "";
+      return `- ${check.name}: ${check.state}${workflow}`;
+    })
+    .join("\n");
+}
+
+function summarizePullRequestComments(
+  comments: GitHubCacheState["comments"]
+): string {
+  if (!comments.length) {
+    return "No recent PR comments were synced.";
+  }
+
+  return comments
+    .slice(-PR_SWEEP_MAX_COMMENTS)
+    .map((comment) => {
+      const excerpt = summarizeText(comment.body, 400);
+      return `- [${comment.author}] ${excerpt}`;
+    })
+    .join("\n");
+}
+
+function buildPrSweepSchedulePrompt(
+  router: RouterState,
+  openPullRequests: GitHubPullRequestRecord[],
+  issues: GitHubIssueRecord[]
+): string {
+  return buildChiefOfStaffPrompt(COS_TASK_APPENDICES.planPrSweep, [
+    {
+      title: "Current open pull requests",
+      content:
+        openPullRequests.length > 0
+          ? openPullRequests
+              .map(
+                (pullRequest) =>
+                  `- PR #${pullRequest.number} ${pullRequest.title} (${pullRequest.reviewDecision ?? pullRequest.checksBucket ?? "open"})`
+              )
+              .join("\n")
+          : "No open pull requests are currently queued."
+    },
+    {
+      title: "Ready issue queue",
+      content:
+        issues.length > 0
+          ? sortQueueableIssues(issues)
+              .slice(0, 12)
+              .map((issue) => {
+                const priorityFlag = hasPriorityLabel(issue) ? " priority" : "";
+                return `- #${issue.number} [${issue.workflowState}${priorityFlag}] ${issue.title}`;
+              })
+              .join("\n")
+          : "No queueable issues are mirrored right now."
+    },
+    {
+      title: "Existing PR sweep state",
+      content: [
+        `Status: ${router.prSweep.status}`,
+        router.prSweep.nextRunAt ? `Next run at: ${router.prSweep.nextRunAt}` : "Next run at: unscheduled",
+        router.prSweep.completedAt ? `Last completed at: ${router.prSweep.completedAt}` : null,
+        router.prSweep.lastSummary ? `Last summary: ${router.prSweep.lastSummary}` : null
+      ]
+        .filter(Boolean)
+        .join("\n")
+    }
+  ]);
+}
+
+function buildPullRequestReviewPrompt(
+  pullRequest: GitHubPullRequestRecord,
+  linkedIssue: GitHubIssueRecord | null,
+  checks: Awaited<ReturnType<typeof pullRequestChecks>>,
+  comments: GitHubCacheState["comments"],
+  diff: string
+): string {
+  return buildChiefOfStaffPrompt(COS_TASK_APPENDICES.reviewPr, [
+    {
+      title: "Linked issue",
+      content: linkedIssue
+        ? `#${linkedIssue.number} ${linkedIssue.title}\n${linkedIssue.body.trim() || "No issue body provided."}`
+        : "No linked GitHub issue was detected from the PR closing references."
+    },
+    {
+      title: "Pull request",
+      content: [
+        `PR #${pullRequest.number} ${pullRequest.title}`,
+        `Head -> base: ${pullRequest.headRefName} -> ${pullRequest.baseRefName}`,
+        `Review decision: ${pullRequest.reviewDecision ?? "none"}`,
+        `Checks bucket: ${pullRequest.checksBucket ?? "unknown"}`,
+        "",
+        pullRequest.body.trim() || "No pull request body provided."
+      ].join("\n")
+    },
+    {
+      title: "GitHub checks",
+      content: summarizePullRequestChecks(checks)
+    },
+    {
+      title: "Recent PR comments",
+      content: summarizePullRequestComments(comments)
+    },
+    {
+      title: "Diff excerpt",
+      content: truncatePromptSection(diff, PR_SWEEP_MAX_DIFF_LENGTH) ?? "No diff was available."
+    }
+  ]);
+}
+
+function buildPullRequestRefinementPrompt(input: {
+  lane: RouterLaneState;
+  issue: GitHubIssueRecord;
+  pullRequest: GitHubPullRequestRecord;
+  worktreePath: string;
+  branchName: string;
+  feedback: string;
+  checks: Awaited<ReturnType<typeof pullRequestChecks>>;
+  comments: GitHubCacheState["comments"];
+  diff: string;
+}): string {
+  return [
+    "You are a persistent lane Codex session owned by the Chief of Staff in Director OS.",
+    "Stay within your lane context. Do not address the human directly.",
+    "Task: refine an existing pull request branch so it is ready to merge to main.",
+    "Return structured output only.",
+    "Work only inside the assigned worktree path.",
+    "If you are blocked on a true product or taste judgment, set `status` to `needs_input` and put the exact blocker in `blocking_questions`.",
+    "Otherwise make the required code changes, leave the branch ready for validation, and summarize what changed in `data.transcript_reply`.",
+    "",
+    `Lane: ${input.lane.name} (${input.lane.id})`,
+    `Issue: #${input.issue.number} ${input.issue.title}`,
+    `Pull request: #${input.pullRequest.number} ${input.pullRequest.title}`,
+    `Assigned branch: ${input.branchName}`,
+    `Assigned worktree: ${input.worktreePath}`,
+    "",
+    "Chief of Staff feedback to address:",
+    input.feedback,
+    "",
+    "GitHub checks:",
+    summarizePullRequestChecks(input.checks),
+    "",
+    "Recent PR comments:",
+    summarizePullRequestComments(input.comments),
+    "",
+    "Diff excerpt:",
+    truncatePromptSection(input.diff, PR_SWEEP_MAX_DIFF_LENGTH) ?? "No diff was available.",
+    "",
+    "Issue body:",
+    input.issue.body.trim() || "No issue body provided."
+  ]
+    .concat(
+      input.lane.lastPlanSummary ? ["", "Existing lane plan summary:", input.lane.lastPlanSummary] : [],
+      input.lane.lastSummary ? ["", "Latest lane summary:", input.lane.lastSummary] : []
+    )
+    .join("\n");
+}
+
+function summarizePrSweepRun(stats: {
+  reviewed: number;
+  merged: number;
+  fixedAndMerged: number;
+  closed: number;
+  blockerIssues: number;
+  escalations: number;
+}): string {
+  return [
+    `Reviewed ${stats.reviewed} PR${stats.reviewed === 1 ? "" : "s"}.`,
+    `Merged ${stats.merged}.`,
+    stats.fixedAndMerged > 0 ? `Fixed and merged ${stats.fixedAndMerged}.` : null,
+    stats.closed > 0 ? `Closed ${stats.closed}.` : null,
+    stats.blockerIssues > 0 ? `Opened ${stats.blockerIssues} blocker issue${stats.blockerIssues === 1 ? "" : "s"}.` : null,
+    stats.escalations > 0 ? `Waiting on ${stats.escalations} human decision${stats.escalations === 1 ? "" : "s"}.` : null
+  ]
+    .filter(Boolean)
+    .join(" ");
+}
+
+async function savePrSweepState(
+  session: ProjectSession,
+  updater: (router: RouterState) => RouterState
+): Promise<RouterState> {
+  const router = await loadRouterState(session.paths, session.project.slug);
+  const nextRouter = updater(router);
+  nextRouter.prSweep.updatedAt = nowIso();
+  return saveRouterState(session.paths, nextRouter);
+}
+
+async function scheduleNextPrSweep(
+  session: ProjectSession,
+  router: RouterState,
+  cache: GitHubCacheState,
+  options?: {
+    completedAt?: string | null;
+    lastSummary?: string | null;
+  }
+): Promise<RouterState> {
+  const openPullRequests = openPullRequestsFromCache(session, cache);
+  const queueableIssues = cache.issues
+    .map((issue) => mapRemoteIssue(session.project, issue))
+    .filter((issue) => issue.state.toLowerCase() === "open")
+    .filter((issue) => issue.workflowState === "ready" || issue.workflowState === "queued");
+  const prompt = buildPrSweepSchedulePrompt(router, openPullRequests, queueableIssues);
+  const defaultIntervalHours: number =
+    openPullRequests.length > 0 && !router.prSweep.completedAt
+      ? 0
+      : prSweepIntervalHoursForOpenPrCount(openPullRequests.length);
+
+  const turn = await runCodexSessionAgent(
+    {
+      role: "chief_of_staff",
+      cwd: session.project.repoPath,
+      model: session.project.model,
+      allowWrite: false,
+      prompt,
+      sessionId: router.chiefOfStaff.sessionId
+    },
+    {
+      status: "ok",
+      summary: "Scheduled the next PR sweep window.",
+      recommended_next_action: "Continue routing work until the next PR sweep window arrives.",
+      artifact_refs: [],
+      blocking_questions: [],
+      data: {
+        pr_sweep_interval_hours: defaultIntervalHours,
+        transcript_reply:
+          defaultIntervalHours === 0
+            ? "The next PR sweep should run immediately."
+            : `The next PR sweep should run in ${defaultIntervalHours} hour${defaultIntervalHours === 1 ? "" : "s"}.`
+      }
+    }
+  );
+
+  const intervalHours = parseIntervalHours(turn.result.data?.pr_sweep_interval_hours) ?? defaultIntervalHours;
+  const nextRunAt = computePrSweepNextRunAt(intervalHours);
+  const scheduleSummary =
+    parseDataString(turn.result.data?.transcript_reply) ??
+    (intervalHours === 0
+      ? "The next PR sweep should run immediately."
+      : `The next PR sweep should run in ${intervalHours} hour${intervalHours === 1 ? "" : "s"}.`);
+
+  const nextRouter = applyChiefOfStaffTurn(session, router, {
+    sessionId: turn.sessionId,
+    phase: "pr_sweep_schedule",
+    result: turn.result
+  });
+
+  nextRouter.prSweep = {
+    ...nextRouter.prSweep,
+    status: "scheduled",
+    nextRunAt,
+    currentPullRequestNumber: null,
+    completedAt: options?.completedAt ?? nextRouter.prSweep.completedAt,
+    lastSummary: [options?.lastSummary, `Next PR sweep at ${nextRunAt}.`, scheduleSummary]
+      .filter(Boolean)
+      .join(" "),
+    pausedIssueWork: false,
+    updatedAt: nowIso()
+  };
+
+  return saveRouterState(session.paths, nextRouter);
+}
+
+async function createPrSweepBlockerIssue(
+  session: ProjectSession,
+  router: RouterState,
+  pullRequest: GitHubPullRequestRecord,
+  linkedIssue: GitHubIssueRecord | null,
+  options: {
+    feedback: string;
+    task?: ProposedIssueTask | null;
+  }
+): Promise<{ number: number; title: string; url: string }> {
+  const laneId =
+    findIssueLane(router, linkedIssue?.number ?? -1)?.id ??
+    (linkedIssue ? defaultLaneForIssue(linkedIssue).id : null);
+  const task = options.task;
+  const title = task?.title ?? `Stabilize PR #${pullRequest.number} before merge`;
+  const body = [
+    task?.body ??
+      [
+        `PR #${pullRequest.number} (${pullRequest.title}) could not be safely merged in the automated PR sweep.`,
+        options.feedback
+      ].join("\n\n"),
+    "",
+    `Blocked pull request: #${pullRequest.number}`,
+    `PR URL: ${pullRequest.url}`,
+    linkedIssue ? `Linked issue: #${linkedIssue.number}` : null
+  ]
+    .filter(Boolean)
+    .join("\n");
+
+  const issue = await createIssue(session.project.repoSlug, {
+    title,
+    body,
+    labels: buildPrSweepBlockerLabels(laneId)
+  });
+
+  return {
+    number: issue.number,
+    title,
+    url: issue.url
+  };
+}
+
+async function reviewPullRequestInSweep(
+  session: ProjectSession,
+  router: RouterState,
+  cache: GitHubCacheState,
+  pullRequest: GitHubPullRequestRecord
+): Promise<{
+  router: RouterState;
+  decision: string;
+  feedback: string | null;
+  linkedIssue: GitHubIssueRecord | null;
+  issueTasks: ProposedIssueTask[];
+  transcriptReply: string | null;
+}> {
+  const linkedIssue = linkedIssueForPullRequest(session, cache, pullRequest);
+  const [checks, diff] = await Promise.all([
+    pullRequestChecks(session.project.repoPath, pullRequest.number).catch(() => []),
+    pullRequestDiff(session.project.repoPath, pullRequest.number).catch(
+      (error) => `Could not load PR diff: ${error instanceof Error ? error.message : String(error)}`
+    )
+  ]);
+  const comments = cache.comments.filter(
+    (comment) => comment.parentType === "pr" && comment.parentNumber === pullRequest.number
+  );
+  const prompt = buildPullRequestReviewPrompt(
+    pullRequest,
+    linkedIssue,
+    checks,
+    comments,
+    diff
+  );
+  const fallbackDecision = pullRequest.reviewDecision === "CHANGES_REQUESTED" ? "changes" : "merge";
+  const turn = await runCodexSessionAgent(
+    {
+      role: "chief_of_staff",
+      cwd: session.project.repoPath,
+      model: session.project.model,
+      allowWrite: false,
+      prompt,
+      sessionId: router.chiefOfStaff.sessionId
+    },
+    {
+      status: "ok",
+      summary: `Reviewed PR #${pullRequest.number}.`,
+      recommended_next_action:
+        fallbackDecision === "merge"
+          ? "Merge the pull request if no new blocker surfaced."
+          : "Refine the pull request branch before merging.",
+      artifact_refs: [],
+      blocking_questions: [],
+      data: {
+        decision: fallbackDecision,
+        feedback:
+          fallbackDecision === "changes"
+            ? "Address the current review or validation concerns before merging."
+            : null,
+        transcript_reply: `Reviewed PR #${pullRequest.number}.`
+      }
+    }
+  );
+
+  const nextRouter = applyChiefOfStaffTurn(session, router, {
+    sessionId: turn.sessionId,
+    phase: "pr_sweep_review",
+    result: turn.result,
+    issueNumber: linkedIssue?.number ?? null,
+    prNumber: pullRequest.number
+  });
+  await saveRouterState(session.paths, nextRouter);
+
+  return {
+    router: nextRouter,
+    decision: parseDataString(turn.result.data?.decision) ?? fallbackDecision,
+    feedback: parseDataString(turn.result.data?.feedback),
+    linkedIssue,
+    issueTasks: parseProposedIssueTasks(turn.result.data?.new_issues),
+    transcriptReply: parseDataString(turn.result.data?.transcript_reply)
+  };
+}
+
+async function refinePullRequestInSweep(
+  session: ProjectSession,
+  router: RouterState,
+  linkedIssue: GitHubIssueRecord,
+  pullRequest: GitHubPullRequestRecord,
+  feedback: string
+): Promise<"merged" | "blocker_issue"> {
+  const laneFallback = findIssueLane(router, linkedIssue.number) ?? null;
+  const laneDescriptor = laneFallback ?? {
+    id: defaultLaneForIssue(linkedIssue).id,
+    name: defaultLaneForIssue(linkedIssue).name,
+    sessionId: null,
+    issueNumbers: [],
+    status: "idle" as const,
+    currentIssueNumber: null,
+    activePullRequestNumber: null,
+    lastSummary: null,
+    lastPlanSummary: null,
+    updatedAt: nowIso()
+  };
+
+  await savePrSweepState(session, (nextRouter) => {
+    assignIssueToLane(nextRouter, linkedIssue.number, laneDescriptor.id, laneDescriptor.name);
+    return nextRouter;
+  });
+
+  const worktree = await ensureIssueWorktree(
+    session.project,
+    linkedIssue.number,
+    pullRequest.headRefName,
+    path.join(session.project.worktreeRoot, `issue-${linkedIssue.number}`),
+    {
+      preserveExistingBranch: true
+    }
+  );
+
+  const cache = await loadGitHubCacheState(session.paths, session.project.slug);
+  const liveLaneRouter = await loadRouterState(session.paths, session.project.slug);
+  const lane = ensureLane(liveLaneRouter, laneDescriptor.id, laneDescriptor.name);
+  const [checks, diff] = await Promise.all([
+    pullRequestChecks(session.project.repoPath, pullRequest.number).catch(() => []),
+    pullRequestDiff(session.project.repoPath, pullRequest.number).catch(
+      (error) => `Could not load PR diff: ${error instanceof Error ? error.message : String(error)}`
+    )
+  ]);
+  const comments = cache.comments.filter(
+    (comment) => comment.parentType === "pr" && comment.parentNumber === pullRequest.number
+  );
+
+  const turn = await runCodexSessionAgent(
+    {
+      role: "lane_owner",
+      cwd: worktree.worktreePath,
+      model: session.project.model,
+      allowWrite: true,
+      prompt: buildPullRequestRefinementPrompt({
+        lane,
+        issue: linkedIssue,
+        pullRequest,
+        worktreePath: worktree.worktreePath,
+        branchName: worktree.branchName,
+        feedback,
+        checks,
+        comments,
+        diff
+      }),
+      sessionId: lane.sessionId
+    },
+    {
+      status: "ok",
+      summary: `Refined PR #${pullRequest.number} for issue #${linkedIssue.number}.`,
+      recommended_next_action: "Validate the updated worktree, push the branch, and merge the pull request.",
+      artifact_refs: [worktree.worktreePath],
+      blocking_questions: [],
+      data: {
+        transcript_reply: `Updated PR #${pullRequest.number} for issue #${linkedIssue.number}.`
+      }
+    }
+  );
+
+  const afterTurnRouter = await savePrSweepState(session, (nextRouter) => {
+    const targetLane = ensureLane(nextRouter, lane.id, lane.name);
+    assignIssueToLane(nextRouter, linkedIssue.number, lane.id, lane.name);
+    return applyLaneTurn(session, nextRouter, targetLane, {
+      sessionId: turn.sessionId,
+      phase: "pr_refinement",
+      result: turn.result,
+      issueNumber: linkedIssue.number,
+      worktreePath: worktree.worktreePath
+    });
+  });
+
+  if (turn.result.status === "needs_input" || turn.result.blocking_questions.length > 0) {
+    const blockerIssue = await createPrSweepBlockerIssue(session, afterTurnRouter, pullRequest, linkedIssue, {
+      feedback:
+        turn.result.blocking_questions[0] ??
+        turn.result.summary ??
+        "PR refinement uncovered a blocker that needs a dedicated follow-up issue."
+    });
+    await savePrSweepState(session, (nextRouter) => ({
+      ...nextRouter,
+      prSweep: updateRunningPrSweepState(nextRouter.prSweep, {
+        blockerIssueNumber: blockerIssue.number,
+        waitingOnIssueNumber: blockerIssue.number,
+        summary: `Opened blocker issue #${blockerIssue.number} while refining PR #${pullRequest.number}.`
+      })
+    }));
+    await closePullRequest(session.project.repoPath, pullRequest.number, {
+      comment: `Closing this PR for now because the automated PR sweep opened blocker issue #${blockerIssue.number}: ${blockerIssue.url}`
+    });
+    return "blocker_issue";
+  }
+
+  try {
+    await resetWorktreeValidationState(worktree.worktreePath);
+    await maybeRunPackageScript(session.project, worktree.worktreePath, "typecheck");
+    await maybeRunPackageScript(session.project, worktree.worktreePath, "build");
+    await maybeRunPackageScript(session.project, worktree.worktreePath, "test");
+  } catch (error) {
+    const blockerIssue = await createPrSweepBlockerIssue(session, afterTurnRouter, pullRequest, linkedIssue, {
+      feedback: error instanceof Error ? error.message : String(error)
+    });
+    await savePrSweepState(session, (nextRouter) => ({
+      ...nextRouter,
+      prSweep: updateRunningPrSweepState(nextRouter.prSweep, {
+        blockerIssueNumber: blockerIssue.number,
+        waitingOnIssueNumber: blockerIssue.number,
+        summary: `Opened blocker issue #${blockerIssue.number} after validation failed for PR #${pullRequest.number}.`
+      })
+    }));
+    await closePullRequest(session.project.repoPath, pullRequest.number, {
+      comment: `Closing this PR for now because validation failed and blocker issue #${blockerIssue.number} was opened: ${blockerIssue.url}`
+    });
+    return "blocker_issue";
+  }
+
+  const gitStatus = await runCommandOrThrow("git", ["status", "--short"], {
+    cwd: worktree.worktreePath
+  });
+  if (!gitStatus.trim()) {
+    const blockerIssue = await createPrSweepBlockerIssue(session, afterTurnRouter, pullRequest, linkedIssue, {
+      feedback: "PR refinement completed without producing any file changes."
+    });
+    await savePrSweepState(session, (nextRouter) => ({
+      ...nextRouter,
+      prSweep: updateRunningPrSweepState(nextRouter.prSweep, {
+        blockerIssueNumber: blockerIssue.number,
+        waitingOnIssueNumber: blockerIssue.number,
+        summary: `Opened blocker issue #${blockerIssue.number} because PR #${pullRequest.number} refinement produced no changes.`
+      })
+    }));
+    await closePullRequest(session.project.repoPath, pullRequest.number, {
+      comment: `Closing this PR for now because refinement produced no changes and blocker issue #${blockerIssue.number} was opened: ${blockerIssue.url}`
+    });
+    return "blocker_issue";
+  }
+
+  await runCommandOrThrow("git", ["add", "-A"], { cwd: worktree.worktreePath });
+  await runCommandOrThrow(
+    "git",
+    ["commit", "-m", `Refine #${linkedIssue.number}: ${summarizeText(linkedIssue.title, 60)}`],
+    { cwd: worktree.worktreePath }
+  );
+  await runCommandOrThrow("git", ["push", "-u", "origin", worktree.branchName], {
+    cwd: worktree.worktreePath
+  });
+  await mergePullRequest(session.project.repoPath, pullRequest.number);
+  return "merged";
+}
+
+async function maybeHandlePrSweep(session: ProjectSession): Promise<boolean> {
+  let router = await loadRouterState(session.paths, session.project.slug);
+  const cache = await loadGitHubCacheState(session.paths, session.project.slug);
+  const openPullRequests = openPullRequestsFromCache(session, cache);
+
+  if (router.prSweep.status === "idle" && !router.prSweep.nextRunAt) {
+    router = await scheduleNextPrSweep(session, router, cache);
+  }
+
+  if (!isPrSweepDue(router.prSweep)) {
+    return false;
+  }
+
+  if (router.openQuestion) {
+    await savePrSweepState(session, (nextRouter) => ({
+      ...nextRouter,
+      prSweep: {
+        ...nextRouter.prSweep,
+        pausedIssueWork: true,
+        lastSummary: "PR sweep is waiting for the current Chief of Staff question to be resolved."
+      }
+    }));
+    return true;
+  }
+
+  const hasPendingLaneWork = router.pendingHandoffs.some(
+    (handoff) => handoff.status === "pending" || handoff.status === "in_progress"
+  );
+  if (activeLaneDispatches.size > 0 || hasPendingLaneWork) {
+    await savePrSweepState(session, (nextRouter) => ({
+      ...nextRouter,
+      prSweep: {
+        ...nextRouter.prSweep,
+        status: "scheduled",
+        pausedIssueWork: true,
+        lastSummary: "PR sweep is due and is waiting for current lane work to settle before it pauses normal issue routing."
+      }
+    }));
+    return true;
+  }
+
+  router = await savePrSweepState(session, (nextRouter) => ({
+    ...nextRouter,
+    prSweep: startPrSweepState(
+      nextRouter.prSweep,
+      openPullRequests.map((pullRequest) => pullRequest.number),
+      {
+        summary:
+          openPullRequests.length > 0
+            ? `Chief of Staff PR sweep is running across ${openPullRequests.length} open pull request${
+                openPullRequests.length === 1 ? "" : "s"
+              }.`
+            : "Chief of Staff PR sweep is running, but no open pull requests were found."
+      }
+    )
+  }));
+
+  const stats = {
+    reviewed: 0,
+    merged: 0,
+    fixedAndMerged: 0,
+    closed: 0,
+    blockerIssues: 0,
+    escalations: 0
+  };
+
+  for (const pullRequest of openPullRequests) {
+    router = await savePrSweepState(session, (nextRouter) => ({
+      ...nextRouter,
+      prSweep: updateRunningPrSweepState(nextRouter.prSweep, {
+        currentPullRequestNumber: pullRequest.number,
+        removePullRequestNumber: pullRequest.number,
+        summary: `Chief of Staff is reviewing PR #${pullRequest.number}.`
+      })
+    }));
+
+    const review = await reviewPullRequestInSweep(session, router, cache, pullRequest);
+    router = review.router;
+    stats.reviewed += 1;
+
+    if (review.decision === "merge") {
+      await mergePullRequest(session.project.repoPath, pullRequest.number);
+      stats.merged += 1;
+      await syncProjectInternal(session);
+      continue;
+    }
+
+    if (review.decision === "close") {
+      await closePullRequest(session.project.repoPath, pullRequest.number, {
+        comment: review.feedback ?? `Closing PR #${pullRequest.number} after the Chief of Staff PR sweep review.`
+      });
+      stats.closed += 1;
+      await syncProjectInternal(session);
+      continue;
+    }
+
+    if (review.decision === "blocker_issue") {
+      const blockerIssue = await createPrSweepBlockerIssue(session, router, pullRequest, review.linkedIssue, {
+        feedback:
+          review.feedback ??
+          `PR #${pullRequest.number} needs broader follow-up work before it can merge.`,
+        task: review.issueTasks[0] ?? null
+      });
+      router = await savePrSweepState(session, (nextRouter) => ({
+        ...nextRouter,
+        prSweep: updateRunningPrSweepState(nextRouter.prSweep, {
+          blockerIssueNumber: blockerIssue.number,
+          waitingOnIssueNumber: blockerIssue.number,
+          summary: `Opened blocker issue #${blockerIssue.number} while reviewing PR #${pullRequest.number}.`
+        })
+      }));
+      await closePullRequest(session.project.repoPath, pullRequest.number, {
+        comment: [
+          review.feedback ?? "Closing this PR for now because the PR sweep identified broader follow-up work.",
+          `Opened blocker issue #${blockerIssue.number}: ${blockerIssue.url}`
+        ].join("\n\n")
+      });
+      stats.blockerIssues += 1;
+      stats.closed += 1;
+      await syncProjectInternal(session);
+      continue;
+    }
+
+    if (review.decision === "changes") {
+      if (!review.linkedIssue) {
+        const blockerIssue = await createPrSweepBlockerIssue(session, router, pullRequest, null, {
+          feedback:
+            review.feedback ??
+            `PR #${pullRequest.number} needs refinement before merge, but no linked issue was found for safe ownership.`
+        });
+        router = await savePrSweepState(session, (nextRouter) => ({
+          ...nextRouter,
+          prSweep: updateRunningPrSweepState(nextRouter.prSweep, {
+            blockerIssueNumber: blockerIssue.number,
+            waitingOnIssueNumber: blockerIssue.number,
+            summary: `Opened blocker issue #${blockerIssue.number} because PR #${pullRequest.number} had no linked issue for safe refinement.`
+          })
+        }));
+        await closePullRequest(session.project.repoPath, pullRequest.number, {
+          comment: `Closing this PR for now because blocker issue #${blockerIssue.number} was opened to capture the required follow-up: ${blockerIssue.url}`
+        });
+        stats.blockerIssues += 1;
+        stats.closed += 1;
+        await syncProjectInternal(session);
+        continue;
+      }
+
+      const refinementOutcome = await refinePullRequestInSweep(
+        session,
+        router,
+        review.linkedIssue,
+        pullRequest,
+        review.feedback ?? "Refine this pull request branch so it is safe to merge."
+      );
+      if (refinementOutcome === "merged") {
+        stats.merged += 1;
+        stats.fixedAndMerged += 1;
+      } else {
+        const refreshedRouter = await loadRouterState(session.paths, session.project.slug);
+        const latestBlockerNumber = refreshedRouter.prSweep.blockerIssueNumbers.at(-1) ?? null;
+        router = await savePrSweepState(session, (nextRouter) => ({
+          ...nextRouter,
+          prSweep: updateRunningPrSweepState(nextRouter.prSweep, {
+            waitingOnIssueNumber: latestBlockerNumber,
+            summary: latestBlockerNumber
+              ? `Opened blocker issue #${latestBlockerNumber} while refining PR #${pullRequest.number}.`
+              : `PR #${pullRequest.number} could not be merged during automated refinement and was closed for follow-up.`
+          })
+        }));
+        stats.blockerIssues += 1;
+        stats.closed += 1;
+      }
+      await syncProjectInternal(session);
+      continue;
+    }
+
+    const questionText =
+      review.feedback ??
+      `PR #${pullRequest.number} needs a product or taste decision before it can merge safely.`;
+    const timestamp = nowIso();
+    const questionRouter = await loadRouterState(session.paths, session.project.slug);
+    await saveRouterState(session.paths, {
+      ...questionRouter,
+      openQuestion: {
+        id: `question_${Date.now()}`,
+        title: buildHumanQuestionTitle(questionText, {
+          prNumber: pullRequest.number
+        }),
+        summary: review.transcriptReply ?? questionText,
+        question: questionText,
+        whyItMatters:
+          parseDataString(questionRouter.recentRuns.at(-1)?.outputJson?.why_it_matters) ??
+          `The PR sweep reached PR #${pullRequest.number} and could not finish without a human product or taste decision.`,
+        recommendation:
+          parseDataString(questionRouter.recentRuns.at(-1)?.outputJson?.recommendation) ??
+          "Reply with the decision you want the Chief of Staff to apply, then the PR sweep will resume.",
+        issueNumber: review.linkedIssue?.number ?? null,
+        prNumber: pullRequest.number,
+        runId: questionRouter.recentRuns.at(-1)?.id ?? null,
+        requestedBy: "chief_of_staff",
+        createdAt: timestamp,
+        updatedAt: timestamp
+      },
+      orchestrator: {
+        ...questionRouter.orchestrator,
+        lastSummary: `PR sweep is waiting on a human decision for PR #${pullRequest.number}.`
+      },
+      prSweep: {
+        ...questionRouter.prSweep,
+        status: "running",
+        pausedIssueWork: true,
+        currentPullRequestNumber: pullRequest.number,
+        waitingOnIssueNumber: review.linkedIssue?.number ?? null,
+        lastSummary: `PR sweep is waiting on a human decision for PR #${pullRequest.number}.`,
+        updatedAt: timestamp
+      }
+    });
+    await appendConversationMessage(session, {
+      role: "chief_of_staff",
+      kind: "cos_question",
+      content: formatHumanQuestionContent(
+        questionText,
+        `The automated PR sweep could not safely finish PR #${pullRequest.number} without a human decision.`,
+        "Reply with the decision you want applied, then the PR sweep will continue."
+      ),
+      summary: summarizeText(questionText),
+      linkedIssueNumber: review.linkedIssue?.number ?? null,
+      linkedPrNumber: pullRequest.number,
+      linkedPullRequestNumber: pullRequest.number,
+      isOpenQuestion: true
+    });
+    stats.escalations += 1;
+    return true;
+  }
+
+  const refreshedCache = await loadGitHubCacheState(session.paths, session.project.slug);
+  const lastRunAt = nowIso();
+  const summary = summarizePrSweepRun(stats);
+  router = await savePrSweepState(session, (nextRouter) => ({
+    ...nextRouter,
+    prSweep: {
+      ...nextRouter.prSweep,
+      status: "idle",
+      nextRunAt: null,
+      currentPullRequestNumber: null,
+      completedAt: lastRunAt,
+      lastSummary: summary,
+      pausedIssueWork: false
+    }
+  }));
+  router = await scheduleNextPrSweep(session, router, refreshedCache, {
+    completedAt: lastRunAt,
+    lastSummary: summary
+  });
+  await appendConversationMessage(session, {
+    role: "chief_of_staff",
+    kind: "status_update",
+    content: `${summary} ${router.prSweep.lastSummary ?? ""}`.trim(),
+    summary: summary,
+    linkedIssueNumber: null,
+    linkedPrNumber: null,
+    linkedPullRequestNumber: null,
+    isOpenQuestion: false
+  });
+  return true;
+}
+
 async function syncProjectInternal(session: ProjectSession): Promise<DirectorOperationResponse> {
   const metadataChanges = await refreshProjectMetadata(session);
   const [issues, pullRequests, comments] = await Promise.all([
@@ -2275,13 +3383,11 @@ async function chooseNextIssue(session: ProjectSession): Promise<void> {
     .filter((issue) => issue.workflowState === "ready" || issue.workflowState === "queued")
     .filter((issue) => !hasPendingLaneWork(router, issue.number));
   const readyIssues = candidateIssues.filter((issue) => issue.workflowState === "ready");
-  const issues = (readyIssues.length > 0 ? readyIssues : candidateIssues)
-    .filter((issue) => issue.workflowState === "ready" || issue.workflowState === "queued")
-    .sort((left, right) => {
-      const leftPriority = left.workflowState === "ready" ? 0 : 1;
-      const rightPriority = right.workflowState === "ready" ? 0 : 1;
-      return leftPriority - rightPriority || left.number - right.number;
-    });
+  const issues = sortQueueableIssues(
+    (readyIssues.length > 0 ? readyIssues : candidateIssues).filter(
+      (issue) => issue.workflowState === "ready" || issue.workflowState === "queued"
+    )
+  );
 
   if (!issues.length) {
     await saveRouterState(session.paths, {
@@ -3484,6 +4590,9 @@ async function runOrchestratorLoop(): Promise<void> {
 
       shouldReschedule = true;
       await syncProjectInternal(session);
+      if (await maybeHandlePrSweep(session)) {
+        return;
+      }
       await dispatchPendingLaneHandoffs(session);
       await dispatchChiefOfStaffHandoff(session);
       await dispatchPendingLaneHandoffs(session);
@@ -3748,6 +4857,7 @@ export async function getDirectorStatus(): Promise<DirectorStatusResponse> {
       project: session.project,
       orchestrator: synthesizeOrchestratorStatus(session.project, router, owner),
       lastSuccessfulSyncAt: resolveLastSuccessfulSyncAt(router.lastSyncAt, cache.syncedAt),
+      prSweep: synthesizePrSweepRecord(router),
       lanes: router.lanes.map((lane) => synthesizeLaneRecord(lane, openPullRequests)),
       issues: issues.map((issue) => synthesizeIssueOwnership(issue, router, pullRequests)),
       openQuestion: router.openQuestion ? toHumanQuestionRecord(router.openQuestion) : null,

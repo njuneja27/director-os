@@ -578,6 +578,27 @@ export async function mergePullRequest(repoPath: string, prNumber: number): Prom
   ], { cwd: repoPath });
 }
 
+export async function closePullRequest(
+  repoPath: string,
+  prNumber: number,
+  options?: {
+    comment?: string | null;
+    deleteBranch?: boolean;
+  }
+): Promise<void> {
+  const args = ["pr", "close", String(prNumber)];
+
+  if (options?.comment?.trim()) {
+    args.push("--comment", options.comment.trim());
+  }
+
+  if (options?.deleteBranch) {
+    args.push("--delete-branch");
+  }
+
+  await runGh(args, { cwd: repoPath });
+}
+
 export function resolveRepoPath(repoPath: string): string {
   return path.resolve(repoPath);
 }
