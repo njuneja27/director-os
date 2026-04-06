@@ -11,7 +11,8 @@ import type {
   SetupCheck,
   SetupProbeRepositoryInput,
   SetupRepositoryDraft,
-  SetupStatusResponse
+  SetupStatusResponse,
+  UpdateProjectSettingsInput
 } from "@director-os/shared";
 
 export type {
@@ -24,7 +25,8 @@ export type {
   SetupCheck,
   SetupProbeRepositoryInput,
   SetupRepositoryDraft,
-  SetupStatusResponse
+  SetupStatusResponse,
+  UpdateProjectSettingsInput
 } from "@director-os/shared";
 
 declare global {
@@ -104,6 +106,11 @@ function createHttpDirectorClient(): WebDirectorClient {
       requestJson<DirectorOperationResponse>("/api/sync", {
         method: "POST"
       }),
+    updateProjectSettings: (input: UpdateProjectSettingsInput) =>
+      requestJson<DirectorStatusResponse>("/api/project/settings", {
+        method: "POST",
+        body: JSON.stringify(input)
+      }),
     resetRouterRuntime: () =>
       requestJson<DirectorOperationResponse>("/api/reset-router-runtime", {
         method: "POST"
@@ -124,6 +131,8 @@ function createIpcDirectorClient(bridge: DirectorDesktopBridge): WebDirectorClie
     start: () => bridge.director.start(),
     pause: (reason?: string) => bridge.director.pause(reason),
     sync: () => bridge.director.sync(),
+    updateProjectSettings: (input: UpdateProjectSettingsInput) =>
+      bridge.director.updateProjectSettings(input),
     resetRouterRuntime: () => bridge.director.resetRouterRuntime()
   };
 }
@@ -186,6 +195,12 @@ export async function pauseDirector(reason?: string): Promise<DirectorOperationR
 
 export async function syncNow(): Promise<DirectorOperationResponse> {
   return getDirectorClient().sync();
+}
+
+export async function updateProjectSettings(
+  input: UpdateProjectSettingsInput
+): Promise<DirectorStatusResponse> {
+  return getDirectorClient().updateProjectSettings(input);
 }
 
 export async function resetRouterRuntime(): Promise<DirectorOperationResponse> {

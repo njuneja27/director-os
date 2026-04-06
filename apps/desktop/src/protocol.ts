@@ -14,6 +14,7 @@ export const IPC_CHANNELS = {
     start: "director:start",
     pause: "director:pause",
     sync: "director:sync",
+    updateProjectSettings: "director:update-project-settings",
     resetRouterRuntime: "director:reset-router-runtime"
   }
 } as const;

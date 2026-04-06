@@ -7,7 +7,8 @@ import type {
   DirectorStatusResponse,
   SetupProbeRepositoryInput,
   SetupRepositoryDraft,
-  SetupStatusResponse
+  SetupStatusResponse,
+  UpdateProjectSettingsInput
 } from "@director-os/shared";
 
 import { IPC_CHANNELS } from "./protocol.js";
@@ -34,6 +35,8 @@ const api: DirectorDesktopBridge = {
     start: () => invoke(IPC_CHANNELS.director.start),
     pause: (reason?: string) => invoke(IPC_CHANNELS.director.pause, reason),
     sync: () => invoke(IPC_CHANNELS.director.sync),
+    updateProjectSettings: (input: UpdateProjectSettingsInput) =>
+      invoke(IPC_CHANNELS.director.updateProjectSettings, input),
     resetRouterRuntime: () => invoke(IPC_CHANNELS.director.resetRouterRuntime)
   }
 };

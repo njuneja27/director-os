@@ -27,6 +27,7 @@ import {
   schedulePrSweepState,
   sortQueueableIssues,
   startPrSweepState,
+  synthesizeProjectConfigStatus,
   updateRunningPrSweepState
 } from "./services.js";
 
@@ -224,6 +225,83 @@ describe("reconcileProjectConfigWithRepository", () => {
     expect(reconciled.changes).toContain(
       "Updated repo slug from old/director-os to njuneja27/director-os."
     );
+  });
+});
+
+describe("synthesizeProjectConfigStatus", () => {
+  it("reports a healthy repo-default target when the stored and detected defaults match", () => {
+    const status = synthesizeProjectConfigStatus(makeProjectConfig(), {
+      repoDefaultBranch: "main",
+      currentBranch: "main"
+    });
+
+    expect(status).toEqual({
+      defaultBranchStrategy: "repo_default",
+      repoDefaultBranch: "main",
+      currentBranch: "main",
+      branchStatus: "healthy",
+      branchStatusSummary: "Targeting repo default branch main.",
+      canHealToRepoDefault: false
+    });
+  });
+
+  it("flags stale repo-default targets and exposes a recovery action", () => {
+    const status = synthesizeProjectConfigStatus(
+      makeProjectConfig({
+        defaultBranch: "codex/issue-53-54-55-routing"
+      }),
+      {
+        repoDefaultBranch: "main",
+        currentBranch: "main"
+      }
+    );
+
+    expect(status.defaultBranchStrategy).toBe("repo_default");
+    expect(status.branchStatus).toBe("stale");
+    expect(status.repoDefaultBranch).toBe("main");
+    expect(status.currentBranch).toBe("main");
+    expect(status.canHealToRepoDefault).toBe(true);
+    expect(status.branchStatusSummary).toContain("stale");
+    expect(status.branchStatusSummary).toContain("main");
+  });
+
+  it("surfaces custom targets without offering repo-default healing", () => {
+    const status = synthesizeProjectConfigStatus(
+      makeProjectConfig({
+        defaultBranch: "release/preview",
+        defaultBranchStrategy: "custom"
+      }),
+      {
+        repoDefaultBranch: "main",
+        currentBranch: "release/preview"
+      }
+    );
+
+    expect(status).toEqual({
+      defaultBranchStrategy: "custom",
+      repoDefaultBranch: "main",
+      currentBranch: "release/preview",
+      branchStatus: "custom",
+      branchStatusSummary: "Targeting custom base branch release/preview instead of repo default main.",
+      canHealToRepoDefault: false
+    });
+  });
+
+  it("falls back to unknown when the local repo default cannot be detected", () => {
+    const status = synthesizeProjectConfigStatus(makeProjectConfig(), {
+      repoDefaultBranch: null,
+      currentBranch: "main"
+    });
+
+    expect(status).toEqual({
+      defaultBranchStrategy: "repo_default",
+      repoDefaultBranch: null,
+      currentBranch: "main",
+      branchStatus: "unknown",
+      branchStatusSummary:
+        "Targeting base branch main, but the local repo default branch could not be detected yet.",
+      canHealToRepoDefault: false
+    });
   });
 });
 

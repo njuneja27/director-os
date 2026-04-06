@@ -8,7 +8,8 @@ import type {
   RunRecord,
   SetupCheck,
   SetupRepositoryDraft,
-  SetupStatusResponse
+  SetupStatusResponse,
+  UpdateProjectSettingsInput
 } from "./api";
 import {
   completeSetup,
@@ -21,7 +22,8 @@ import {
   runWorkspaceTest,
   sendMessage,
   startDirector,
-  syncNow
+  syncNow,
+  updateProjectSettings as saveProjectSettings
 } from "./api";
 import { deriveSetupStateBadge, hasCompletedSetup } from "./setup-state";
 
@@ -48,6 +50,8 @@ export function App() {
   const [setupStatus, setSetupStatus] = useState<SetupStatusResponse | null>(null);
   const [status, setStatus] = useState<DirectorStatusResponse | null>(null);
   const [conversation, setConversation] = useState<ConversationResponse | null>(null);
+  const [projectSettingsDraft, setProjectSettingsDraft] = useState<UpdateProjectSettingsInput | null>(null);
+  const [editingProjectSettings, setEditingProjectSettings] = useState(false);
   const [repositoryPath, setRepositoryPath] = useState("");
   const [projectName, setProjectName] = useState("");
   const [worktreeRoot, setWorktreeRoot] = useState("");
@@ -136,6 +140,9 @@ export function App() {
 
     if (statusResult.status === "fulfilled") {
       setStatus(statusResult.value);
+      if (!editingProjectSettings || !projectSettingsDraft) {
+        hydrateProjectSettingsDraft(statusResult.value);
+      }
     } else {
       setError(statusResult.reason instanceof Error ? statusResult.reason.message : String(statusResult.reason));
     }
@@ -162,6 +169,21 @@ export function App() {
     setProjectName(draft.projectName ?? "");
     setWorktreeRoot(draft.worktreeRoot ?? "");
     setModelName(draft.model ?? "");
+  }
+
+  function hydrateProjectSettingsDraft(nextStatus: DirectorStatusResponse | null) {
+    if (!nextStatus?.project) {
+      return;
+    }
+
+    setProjectSettingsDraft({
+      repoPath: nextStatus.project.repoPath,
+      repoSlug: nextStatus.project.repoSlug,
+      defaultBranch: nextStatus.project.defaultBranch,
+      defaultBranchStrategy: nextStatus.projectConfigStatus?.defaultBranchStrategy ?? "repo_default",
+      worktreeRoot: nextStatus.project.worktreeRoot,
+      model: nextStatus.project.model
+    });
   }
 
   async function runSetupAction(actionKey: string, runner: () => Promise<SetupStatusResponse>) {
@@ -290,6 +312,45 @@ export function App() {
     }
 
     await runDashboardAction("reset-router-runtime", async () => resetRouterRuntime());
+  }
+
+  async function handleSaveProjectSettings() {
+    if (!projectSettingsDraft) {
+      setError("Project settings are not ready to save yet.");
+      return;
+    }
+
+    await runDashboardAction("save-project-settings", async () => {
+      const nextStatus = await saveProjectSettings(projectSettingsDraft);
+      setStatus(nextStatus);
+      hydrateProjectSettingsDraft(nextStatus);
+      setEditingProjectSettings(false);
+      await refreshWorkspace();
+    });
+  }
+
+  async function handleHealBaseBranch() {
+    if (!status?.project || !status.projectConfigStatus?.repoDefaultBranch) {
+      setError("The local repo default branch is not available to recover from.");
+      return;
+    }
+
+    const nextDraft: UpdateProjectSettingsInput = {
+      repoPath: status.project.repoPath,
+      repoSlug: status.project.repoSlug,
+      defaultBranch: status.projectConfigStatus.repoDefaultBranch,
+      defaultBranchStrategy: "repo_default",
+      worktreeRoot: status.project.worktreeRoot,
+      model: status.project.model
+    };
+
+    await runDashboardAction("heal-base-branch", async () => {
+      const nextStatus = await saveProjectSettings(nextDraft);
+      setStatus(nextStatus);
+      hydrateProjectSettingsDraft(nextStatus);
+      setEditingProjectSettings(false);
+      await refreshWorkspace();
+    });
   }
 
   if (shellMode === "booting") {
@@ -496,6 +557,236 @@ export function App() {
             <div className="list-note">
               The Chief of Staff loop stays local and routes work through persistent lane sessions.
             </div>
+          </section>
+
+          <section className="panel sidebar-card">
+            <div className="panel-header">
+              <div>
+                <div className="section-title">Project settings</div>
+                <div className="section-meta">
+                  Repo, base branch, worktree root, and model settings for the active project.
+                </div>
+              </div>
+              <span
+                className={`check-pill ${
+                  status?.projectConfigStatus?.branchStatus === "stale"
+                    ? "check-pill-needs-action"
+                    : "check-pill-ready"
+                }`}
+              >
+                {status?.projectConfigStatus
+                  ? status.projectConfigStatus.branchStatus === "stale"
+                    ? "Needs recovery"
+                    : status.projectConfigStatus.defaultBranchStrategy === "custom"
+                      ? "Custom base"
+                      : "Repo default"
+                  : "Unavailable"}
+              </span>
+            </div>
+            {editingProjectSettings && projectSettingsDraft ? (
+              <div className="setup-form">
+                <label className="field-group">
+                  <span className="field-label">Repo path</span>
+                  <input
+                    className="text-field"
+                    value={projectSettingsDraft.repoPath}
+                    onChange={(event) =>
+                      setProjectSettingsDraft((current) =>
+                        current
+                          ? {
+                              ...current,
+                              repoPath: event.target.value
+                            }
+                          : current
+                      )
+                    }
+                  />
+                </label>
+                <label className="field-group">
+                  <span className="field-label">Repo slug</span>
+                  <input
+                    className="text-field"
+                    value={projectSettingsDraft.repoSlug}
+                    onChange={(event) =>
+                      setProjectSettingsDraft((current) =>
+                        current
+                          ? {
+                              ...current,
+                              repoSlug: event.target.value
+                            }
+                          : current
+                      )
+                    }
+                  />
+                </label>
+                <label className="field-group">
+                  <span className="field-label">Base branch mode</span>
+                  <select
+                    className="text-field"
+                    value={projectSettingsDraft.defaultBranchStrategy}
+                    onChange={(event) =>
+                      setProjectSettingsDraft((current) =>
+                        current
+                          ? {
+                              ...current,
+                              defaultBranchStrategy:
+                                event.target.value === "custom" ? "custom" : "repo_default",
+                              defaultBranch:
+                                event.target.value === "custom"
+                                  ? current.defaultBranch
+                                  : status?.projectConfigStatus?.repoDefaultBranch ?? current.defaultBranch
+                            }
+                          : current
+                      )
+                    }
+                  >
+                    <option value="repo_default">Repo default</option>
+                    <option value="custom">Custom</option>
+                  </select>
+                </label>
+                <label className="field-group">
+                  <span className="field-label">PR target branch</span>
+                  <input
+                    className="text-field"
+                    disabled={projectSettingsDraft.defaultBranchStrategy === "repo_default"}
+                    value={
+                      projectSettingsDraft.defaultBranchStrategy === "repo_default"
+                        ? status?.projectConfigStatus?.repoDefaultBranch ?? projectSettingsDraft.defaultBranch
+                        : projectSettingsDraft.defaultBranch
+                    }
+                    onChange={(event) =>
+                      setProjectSettingsDraft((current) =>
+                        current
+                          ? {
+                              ...current,
+                              defaultBranch: event.target.value
+                            }
+                          : current
+                      )
+                    }
+                  />
+                </label>
+                <label className="field-group">
+                  <span className="field-label">Worktree root</span>
+                  <input
+                    className="text-field"
+                    value={projectSettingsDraft.worktreeRoot}
+                    onChange={(event) =>
+                      setProjectSettingsDraft((current) =>
+                        current
+                          ? {
+                              ...current,
+                              worktreeRoot: event.target.value
+                            }
+                          : current
+                      )
+                    }
+                  />
+                </label>
+                <label className="field-group">
+                  <span className="field-label">Model</span>
+                  <input
+                    className="text-field"
+                    value={projectSettingsDraft.model}
+                    onChange={(event) =>
+                      setProjectSettingsDraft((current) =>
+                        current
+                          ? {
+                              ...current,
+                              model: event.target.value
+                            }
+                          : current
+                      )
+                    }
+                  />
+                </label>
+                <div className="inline-actions">
+                  <button
+                    className="action-button action-button-primary"
+                    disabled={busyAction === "save-project-settings"}
+                    onClick={() => void handleSaveProjectSettings()}
+                  >
+                    {busyAction === "save-project-settings" ? "Saving..." : "Save settings"}
+                  </button>
+                  <button
+                    className="action-button action-button-secondary"
+                    onClick={() => {
+                      hydrateProjectSettingsDraft(status);
+                      setEditingProjectSettings(false);
+                    }}
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <>
+                <div className="meta-pairs">
+                  <div className="meta-pair">
+                    <span className="meta-pair-label">Repo path</span>
+                    <span className="meta-pair-value">{status?.project?.repoPath ?? "Unavailable"}</span>
+                  </div>
+                  <div className="meta-pair">
+                    <span className="meta-pair-label">Worktree root</span>
+                    <span className="meta-pair-value">{status?.project?.worktreeRoot ?? "Unavailable"}</span>
+                  </div>
+                  <div className="meta-pair">
+                    <span className="meta-pair-label">PR target branch</span>
+                    <span className="meta-pair-value">{status?.project?.defaultBranch ?? "Unavailable"}</span>
+                  </div>
+                  <div className="meta-pair">
+                    <span className="meta-pair-label">Branch mode</span>
+                    <span className="meta-pair-value">
+                      {status?.projectConfigStatus?.defaultBranchStrategy === "custom"
+                        ? "Custom"
+                        : "Repo default"}
+                    </span>
+                  </div>
+                  <div className="meta-pair">
+                    <span className="meta-pair-label">Repo default branch</span>
+                    <span className="meta-pair-value">
+                      {status?.projectConfigStatus?.repoDefaultBranch ?? "Unavailable"}
+                    </span>
+                  </div>
+                  <div className="meta-pair">
+                    <span className="meta-pair-label">Current local branch</span>
+                    <span className="meta-pair-value">
+                      {status?.projectConfigStatus?.currentBranch ?? "Unavailable"}
+                    </span>
+                  </div>
+                </div>
+                <div className="compact-card">
+                  <div className="compact-card-meta">
+                    <span>{status?.project?.repoSlug ?? "No repo slug"}</span>
+                    <span>{status?.project?.model ?? "No model"}</span>
+                  </div>
+                  <div className="list-note">
+                    {status?.projectConfigStatus?.branchStatusSummary ??
+                      "Project settings are not available yet."}
+                  </div>
+                </div>
+                <div className="inline-actions">
+                  <button
+                    className="action-button action-button-secondary"
+                    onClick={() => {
+                      hydrateProjectSettingsDraft(status);
+                      setEditingProjectSettings(true);
+                    }}
+                  >
+                    Edit settings
+                  </button>
+                  {status?.projectConfigStatus?.canHealToRepoDefault ? (
+                    <button
+                      className="action-button action-button-primary"
+                      disabled={busyAction === "heal-base-branch"}
+                      onClick={() => void handleHealBaseBranch()}
+                    >
+                      {busyAction === "heal-base-branch" ? "Recovering..." : "Use repo default"}
+                    </button>
+                  ) : null}
+                </div>
+              </>
+            )}
           </section>
 
           <section className="panel sidebar-card recovery-card">
