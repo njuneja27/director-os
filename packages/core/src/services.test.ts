@@ -10,7 +10,8 @@ import type { ProjectRecord } from "@director-os/shared";
 import type { StoredProjectConfig } from "./config.js";
 import {
   ensureIssueWorktree,
-  reconcileProjectConfigWithRepository
+  reconcileProjectConfigWithRepository,
+  resolveLastSuccessfulSyncAt
 } from "./services.js";
 
 const execFileAsync = promisify(execFile);
@@ -185,5 +186,29 @@ describe("ensureIssueWorktree", () => {
     } finally {
       await cleanup();
     }
+  });
+});
+
+describe("resolveLastSuccessfulSyncAt", () => {
+  it("falls back to the GitHub cache timestamp when router state has not recorded one yet", () => {
+    expect(
+      resolveLastSuccessfulSyncAt(null, "2026-04-05T12:00:00.000Z")
+    ).toBe("2026-04-05T12:00:00.000Z");
+  });
+
+  it("prefers the freshest successful sync timestamp when router and cache values differ", () => {
+    expect(
+      resolveLastSuccessfulSyncAt(
+        "2026-04-05T11:45:00.000Z",
+        "2026-04-05T12:00:00.000Z"
+      )
+    ).toBe("2026-04-05T12:00:00.000Z");
+  });
+
+  it("ignores malformed timestamps instead of surfacing an invalid sync time", () => {
+    expect(
+      resolveLastSuccessfulSyncAt("not-a-timestamp", "2026-04-05T12:00:00.000Z")
+    ).toBe("2026-04-05T12:00:00.000Z");
+    expect(resolveLastSuccessfulSyncAt("not-a-timestamp", "also-bad")).toBeNull();
   });
 });
