@@ -1,14 +1,3 @@
-export const WORK_ITEM_KINDS = ["workstream", "task"] as const;
-export const WORK_ITEM_STATUSES = [
-  "queued",
-  "planning",
-  "ready",
-  "running",
-  "waiting_review",
-  "waiting_decision",
-  "completed",
-  "blocked"
-] as const;
 export const EXECUTION_MODES = ["lane", "worker"] as const;
 export const RUN_ROLES = [
   "chief_of_staff",
@@ -87,8 +76,6 @@ export const ISSUE_ROUTING_STATUSES = [
   "completed"
 ] as const;
 
-export type WorkItemKind = (typeof WORK_ITEM_KINDS)[number];
-export type WorkItemStatus = (typeof WORK_ITEM_STATUSES)[number];
 export type ExecutionMode = (typeof EXECUTION_MODES)[number];
 export type RunRole = (typeof RUN_ROLES)[number];
 export type RunStatus = (typeof RUN_STATUSES)[number];
@@ -153,29 +140,9 @@ export interface GitHubPullRequestRecord {
   syncedAt: string;
 }
 
-export interface WorkItemRecord {
-  id: number;
-  projectId: number;
-  issueNumber: number;
-  parentIssueNumber: number | null;
-  title: string;
-  summary: string;
-  kind: WorkItemKind;
-  executionMode: ExecutionMode;
-  ownerRole: string;
-  status: WorkItemStatus;
-  priorityBucket: number;
-  activeRunId: number | null;
-  activePrNumber: number | null;
-  lastSummary: string | null;
-  createdAt: string;
-  updatedAt: string;
-}
-
 export interface RunRecord {
   id: number;
   projectId: number;
-  workItemId: number | null;
   issueNumber: number | null;
   prNumber: number | null;
   role: RunRole;
@@ -195,7 +162,6 @@ export interface RunRecord {
 export interface DecisionRecord {
   id: number;
   projectId: number;
-  workItemId: number | null;
   issueNumber: number | null;
   prNumber: number | null;
   requestedByRunId: number | null;

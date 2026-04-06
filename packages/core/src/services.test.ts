@@ -6,7 +6,7 @@ import { promisify } from "node:util";
 
 import { describe, expect, it } from "vitest";
 
-import type { ProjectRecord } from "@director-os/shared";
+import type { DecisionRecord, ProjectRecord, RunRecord } from "@director-os/shared";
 import type { StoredProjectConfig } from "./config.js";
 import {
   ensureIssueWorktree,
@@ -78,6 +78,50 @@ async function createTempProjectRecord(): Promise<{
   };
 }
 
+function makeRunRecord(overrides: Partial<RunRecord> = {}): RunRecord {
+  return {
+    id: 1,
+    projectId: 1,
+    issueNumber: 53,
+    prNumber: null,
+    role: "chief_of_staff",
+    status: "succeeded",
+    phase: "queue_review",
+    summary: "Routed issue #53.",
+    recommendedNextAction: "Continue with implementation.",
+    artifacts: [],
+    blockingQuestions: [],
+    outputJson: null,
+    rawModelOutput: null,
+    worktreePath: null,
+    createdAt: "2026-04-06T00:00:00.000Z",
+    updatedAt: "2026-04-06T00:00:00.000Z",
+    ...overrides
+  };
+}
+
+function makeDecisionRecord(overrides: Partial<DecisionRecord> = {}): DecisionRecord {
+  return {
+    id: 1,
+    projectId: 1,
+    issueNumber: 53,
+    prNumber: null,
+    requestedByRunId: 1,
+    questionMessageId: null,
+    resolutionMessageId: null,
+    target: "human_director",
+    title: "Chief of Staff question for #53",
+    summary: "Need a product decision.",
+    recommendation: "Reply with the preferred routing direction.",
+    rationale: "The Chief of Staff could not safely decide.",
+    status: "open",
+    resolution: null,
+    createdAt: "2026-04-06T00:00:00.000Z",
+    updatedAt: "2026-04-06T00:00:00.000Z",
+    ...overrides
+  };
+}
+
 describe("reconcileProjectConfigWithRepository", () => {
   it("heals a stale base branch when the repo is back on the GitHub default", () => {
     const projectConfig = makeProjectConfig({
@@ -127,6 +171,18 @@ describe("reconcileProjectConfigWithRepository", () => {
     expect(reconciled.changes).toContain(
       "Updated repo slug from old/director-os to njuneja27/director-os."
     );
+  });
+});
+
+describe("issue-centric shared contracts", () => {
+  it("allows run and decision records without work-item ids", () => {
+    const run = makeRunRecord();
+    const decision = makeDecisionRecord();
+
+    expect(run.issueNumber).toBe(53);
+    expect(decision.issueNumber).toBe(53);
+    expect("workItemId" in run).toBe(false);
+    expect("workItemId" in decision).toBe(false);
   });
 });
 

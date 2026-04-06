@@ -26,10 +26,7 @@ import type {
   SetupProblemCode,
   SetupProbeRepositoryInput,
   SetupRepositoryDraft,
-  SetupStatusResponse,
-  WorkItemKind,
-  WorkItemRecord,
-  WorkItemStatus
+  SetupStatusResponse
 } from "@director-os/shared";
 
 import {
@@ -1756,7 +1753,6 @@ function recordRun(
   const run: RunRecord = {
     id: nextNumericId(router.recentRuns),
     projectId: session.project.id,
-    workItemId: input.workItemId,
     issueNumber: input.issueNumber,
     prNumber: input.prNumber,
     role: input.role,
@@ -1806,7 +1802,6 @@ function applyChiefOfStaffTurn(
       updatedAt: nowIso()
     }
   }, {
-    workItemId: null,
     issueNumber: input.issueNumber ?? null,
     prNumber: input.prNumber ?? null,
     role: "chief_of_staff",
@@ -1850,7 +1845,6 @@ function applyLaneTurn(
   lane.updatedAt = nowIso();
 
   return recordRun(session, router, {
-    workItemId: null,
     issueNumber: input.issueNumber,
     prNumber: null,
     role: "lane_owner",
@@ -2175,7 +2169,6 @@ async function resolveOpenQuestion(
   }
 
   await saveRouterState(session.paths, recordRun(session, nextRouter, {
-      workItemId: null,
       issueNumber: question.issueNumber,
       prNumber: question.prNumber,
       role: "chief_of_staff",
