@@ -2288,8 +2288,144 @@ function blockedQuestionForLane(
     issueNumber: issue.number,
     prNumber: null,
     runId: null,
-    requestedBy: "lane"
+    requestedBy: "chief_of_staff"
   };
+}
+
+export function buildSyntheticIssueRecord(
+  project: Pick<ProjectRecord, "id" | "repoSlug">,
+  issueNumber: number,
+  options?: {
+    title?: string | null;
+    body?: string | null;
+  }
+): GitHubIssueRecord {
+  const timestamp = nowIso();
+  const repoSlug = project.repoSlug.trim();
+
+  return {
+    id: issueNumber,
+    projectId: project.id,
+    number: issueNumber,
+    title: options?.title?.trim() || `Issue #${issueNumber}`,
+    body: options?.body?.trim() || "No cached issue body is available for this blocked lane handoff.",
+    state: "open",
+    workflowState: "ready",
+    labels: [],
+    url: repoSlug ? `https://github.com/${repoSlug}/issues/${issueNumber}` : "",
+    updatedAt: timestamp,
+    syncedAt: timestamp
+  };
+}
+
+export function buildChiefOfStaffBlockerLaneResult(input: {
+  summary: string;
+  blockingQuestion: string;
+  transcriptReply?: string | null;
+  baseResult?: LaneAgentResult | null;
+  recommendedNextAction?: string | null;
+  artifactRefs?: string[];
+  commandError?: string | null;
+}): LaneAgentResult {
+  const transcriptReply =
+    input.transcriptReply?.trim() ||
+    parseDataString(input.baseResult?.data?.transcript_reply) ||
+    input.summary;
+
+  return {
+    status: "needs_input",
+    summary: input.summary,
+    recommended_next_action:
+      input.recommendedNextAction ??
+      "Chief of Staff should decide whether to answer internally, reroute the lane, or escalate to the human.",
+    artifact_refs: input.artifactRefs ?? input.baseResult?.artifact_refs ?? [],
+    blocking_questions: [input.blockingQuestion],
+    data: {
+      ...(input.baseResult?.data ?? {}),
+      transcript_reply: transcriptReply,
+      command_error: input.commandError ?? parseDataString(input.baseResult?.data?.command_error) ?? null
+    },
+    raw_model_output: input.baseResult?.raw_model_output ?? null
+  };
+}
+
+export function queueChiefOfStaffReviewFromLaneState(
+  session: ProjectSession,
+  router: RouterState,
+  handoffId: string,
+  input: {
+    issue: GitHubIssueRecord;
+    sessionId: string | null;
+    laneResult: LaneAgentResult;
+    reviewType: PendingChiefOfStaffReviewType;
+    branchName?: string | null;
+    worktreePath?: string | null;
+  }
+): RouterState | null {
+  const handoff = findHandoffById(router, handoffId);
+  if (!handoff || !isLaneOwnedHandoff(handoff) || handoff.status !== "in_progress") {
+    return null;
+  }
+
+  const lane = ensureLane(router, handoff.laneId, handoff.laneId);
+  const nextRouter = applyLaneTurn(session, router, lane, {
+    sessionId: input.sessionId,
+    phase: handoff.kind === "plan" ? "planning" : handoff.kind,
+    result: input.laneResult,
+    issueNumber: input.issue.number,
+    worktreePath: input.worktreePath ?? handoff.worktreePath
+  });
+  const nextHandoff = assertPresent(
+    findHandoffById(nextRouter, handoffId),
+    `Lane handoff ${handoffId} disappeared before CoS review was queued.`
+  );
+  const relay = parseDataString(input.laneResult.data?.transcript_reply) ?? input.laneResult.summary;
+
+  nextHandoff.status = "completed";
+  nextHandoff.summary = relay;
+  nextHandoff.branchName = input.branchName ?? nextHandoff.branchName;
+  nextHandoff.worktreePath = input.worktreePath ?? nextHandoff.worktreePath;
+  clearHandoffClaim(nextHandoff);
+  nextHandoff.updatedAt = nowIso();
+
+  lane.status = input.reviewType === "plan_review" ? "waiting_review" : "blocked";
+  lane.lastSummary = relay;
+  lane.updatedAt = nowIso();
+
+  enqueueHandoff(nextRouter, {
+    laneId: lane.id,
+    issueNumber: input.issue.number,
+    kind: "review",
+    status: "pending",
+    summary: relay,
+    prNumber: nextHandoff.prNumber,
+    branchName: input.branchName ?? nextHandoff.branchName,
+    worktreePath: input.worktreePath ?? nextHandoff.worktreePath,
+    startedAt: null,
+    startedBy: null,
+    startedByPid: null,
+    reviewWindowEndsAt: nextHandoff.reviewWindowEndsAt,
+    lastHandledCommentAt: nextHandoff.lastHandledCommentAt,
+    details: {
+      review_type: input.reviewType,
+      original_kind: handoff.kind,
+      lane_result: {
+        ...input.laneResult,
+        raw_model_output: null
+      }
+    }
+  });
+
+  nextRouter.orchestrator = {
+    ...nextRouter.orchestrator,
+    lastLoopAt: nowIso(),
+    lastSummary:
+      input.reviewType === "plan_review"
+        ? `Lane ${lane.name} finished planning issue #${input.issue.number} and queued CoS review.`
+        : `Lane ${lane.name} needs CoS mediation for issue #${input.issue.number}.`
+  };
+
+  return nextRouter;
 }
 
 async function createIssuesFromPlan(
@@ -3617,6 +3753,14 @@ async function mediateLaneBlocker(
       content: laneResult.blocking_questions.join("\n") || fallbackQuestion
     },
     {
+      title: "Recommended next action",
+      content: laneResult.recommended_next_action
+    },
+    {
+      title: "Blocker source",
+      content: parseDataString(laneResult.data?.blocker_source)
+    },
+    {
       title: "Lane relay",
       content: parseDataString(laneResult.data?.transcript_reply)
     }
@@ -3632,15 +3776,15 @@ async function mediateLaneBlocker(
       sessionId: router.chiefOfStaff.sessionId
     },
     {
-      status: "needs_input",
+      status: "ok",
       summary: `Lane ${lane.name} is blocked on issue #${issue.number}.`,
-      recommended_next_action: "Ask the director for the missing decision through the Chief of Staff chat.",
+      recommended_next_action:
+        "Keep the issue with the Chief of Staff or reroute it unless a true product decision requires the human.",
       artifact_refs: [],
-      blocking_questions: [fallbackQuestion],
+      blocking_questions: [],
       data: {
-        outcome: "ask_human",
-        question: fallbackQuestion,
-        recommendation: "Reply in the CoS chat with the decision you want me to take."
+        outcome: "hold",
+        transcript_reply: `I held issue #${issue.number} with the Chief of Staff while I decide the next step.`
       }
     }
   );
@@ -3660,6 +3804,51 @@ async function mediateLaneBlocker(
   const transcriptReply =
     parseDataString(turn.result.data?.transcript_reply) ?? turn.result.summary;
 
+  if (outcome === "hold") {
+    handoff.status = "completed";
+    clearHandoffClaim(handoff);
+    handoff.updatedAt = nowIso();
+
+    assignIssueToChiefOfStaff(nextRouter, issue.number);
+    lane.lastSummary = transcriptReply;
+    lane.updatedAt = nowIso();
+    if (!lane.issueNumbers.length) {
+      lane.status = "idle";
+    }
+
+    const followUpTasks = parseProposedIssueTasks(turn.result.data?.new_issues);
+    const createdIssues =
+      followUpTasks.length > 0 ? await createIssuesFromPlan(session, lane, issue, followUpTasks) : [];
+
+    nextRouter.orchestrator = {
+      ...nextRouter.orchestrator,
+      lastLoopAt: nowIso(),
+      lastSummary:
+        createdIssues.length > 0
+          ? `Chief of Staff held issue #${issue.number} and created ${createdIssues.length} follow-up issue${createdIssues.length === 1 ? "" : "s"}.`
+          : `Chief of Staff held issue #${issue.number} after mediating a blocker.`
+    };
+
+    await saveRouterState(session.paths, nextRouter);
+    await appendConversationMessage(session, {
+      role: "chief_of_staff",
+      kind: "status_update",
+      content:
+        createdIssues.length > 0
+          ? `I held issue #${issue.number} with the Chief of Staff and created ${createdIssues.length} follow-up GitHub issue${createdIssues.length === 1 ? "" : "s"}.`
+          : `I held issue #${issue.number} with the Chief of Staff after mediating the blocker.`,
+      summary:
+        createdIssues.length > 0
+          ? `Held #${issue.number} and created follow-up issues`
+          : `Held #${issue.number} with Chief of Staff`,
+      linkedIssueNumber: issue.number,
+      linkedPrNumber: null,
+      linkedPullRequestNumber: null,
+      isOpenQuestion: false
+    });
+    return nextRouter;
+  }
+
   if (outcome === "answer_worker" || outcome === "reroute") {
     handoff.status = "completed";
     clearHandoffClaim(handoff);
@@ -3668,6 +3857,13 @@ async function mediateLaneBlocker(
       outcome === "reroute"
         ? assignIssueToLane(nextRouter, issue.number, reroutedLaneId, reroutedLaneName)
         : lane;
+    if (outcome === "reroute" && lane.id !== targetLane.id) {
+      lane.lastSummary = transcriptReply;
+      lane.updatedAt = nowIso();
+      if (!lane.issueNumbers.length) {
+        lane.status = "idle";
+      }
+    }
     targetLane.status = resumedLaneKind === "plan" ? "planning" : "implementing";
     targetLane.lastSummary = transcriptReply;
     targetLane.updatedAt = nowIso();
@@ -4015,62 +4211,10 @@ async function queueChiefOfStaffReviewFromLane(
     }
 
     const lane = ensureLane(router, handoff.laneId, handoff.laneId);
-    const nextRouter = applyLaneTurn(session, router, lane, {
-      sessionId: input.sessionId,
-      phase: handoff.kind === "plan" ? "planning" : handoff.kind,
-      result: input.laneResult,
-      issueNumber: input.issue.number,
-      worktreePath: input.worktreePath ?? handoff.worktreePath
-    });
-    const nextHandoff = assertPresent(
-      findHandoffById(nextRouter, handoffId),
-      `Lane handoff ${handoffId} disappeared before CoS review was queued.`
-    );
-    const relay = parseDataString(input.laneResult.data?.transcript_reply) ?? input.laneResult.summary;
-
-    nextHandoff.status = "completed";
-    nextHandoff.summary = relay;
-    nextHandoff.branchName = input.branchName ?? nextHandoff.branchName;
-    nextHandoff.worktreePath = input.worktreePath ?? nextHandoff.worktreePath;
-    clearHandoffClaim(nextHandoff);
-    nextHandoff.updatedAt = nowIso();
-
-    lane.status = input.reviewType === "plan_review" ? "waiting_review" : "blocked";
-    lane.lastSummary = relay;
-    lane.updatedAt = nowIso();
-
-    enqueueHandoff(nextRouter, {
-      laneId: lane.id,
-      issueNumber: input.issue.number,
-      kind: "review",
-      status: "pending",
-      summary: relay,
-      prNumber: nextHandoff.prNumber,
-      branchName: input.branchName ?? nextHandoff.branchName,
-      worktreePath: input.worktreePath ?? nextHandoff.worktreePath,
-      startedAt: null,
-      startedBy: null,
-      startedByPid: null,
-      reviewWindowEndsAt: nextHandoff.reviewWindowEndsAt,
-      lastHandledCommentAt: nextHandoff.lastHandledCommentAt,
-      details: {
-        review_type: input.reviewType,
-        original_kind: handoff.kind,
-        lane_result: {
-          ...input.laneResult,
-          raw_model_output: null
-        }
-      }
-    });
-
-    nextRouter.orchestrator = {
-      ...nextRouter.orchestrator,
-      lastLoopAt: nowIso(),
-      lastSummary:
-        input.reviewType === "plan_review"
-          ? `Lane ${lane.name} finished planning issue #${input.issue.number} and queued CoS review.`
-          : `Lane ${lane.name} needs CoS mediation for issue #${input.issue.number}.`
-    };
+    const nextRouter = queueChiefOfStaffReviewFromLaneState(session, router, handoffId, input);
+    if (!nextRouter) {
+      return;
+    }
 
     await saveRouterState(session.paths, nextRouter);
     await appendConversationMessage(session, {
@@ -4092,70 +4236,58 @@ async function queueChiefOfStaffReviewFromLane(
   });
 }
 
-async function finalizeLaneHandoffBlocked(
+async function queueLaneBlockerForChiefOfStaff(
   session: ProjectSession,
   handoffId: string,
   input: {
     summary: string;
-    orchestratorSummary: string;
-    conversationSummary: string;
-    conversationContent: string;
+    blockingQuestion: string;
+    transcriptReply?: string | null;
+    recommendedNextAction?: string | null;
     sessionId?: string | null;
-    laneResult?: LaneAgentResult;
     worktreePath?: string | null;
     branchName?: string | null;
+    issueTitle?: string | null;
+    issueBody?: string | null;
+    artifactRefs?: string[];
+    commandError?: string | null;
   }
 ): Promise<void> {
-  await runSerializedStateMutation(async () => {
-    const router = await loadRouterState(session.paths, session.project.slug);
-    const handoff = findHandoffById(router, handoffId);
-    if (!handoff || !isLaneOwnedHandoff(handoff) || handoff.status !== "in_progress") {
-      return;
-    }
+  const [router, cache] = await Promise.all([
+    loadRouterState(session.paths, session.project.slug),
+    loadGitHubCacheState(session.paths, session.project.slug)
+  ]);
+  const handoff = findHandoffById(router, handoffId);
+  if (!handoff || !isLaneOwnedHandoff(handoff) || handoff.status !== "in_progress") {
+    return;
+  }
 
-    const lane = ensureLane(router, handoff.laneId, handoff.laneId);
-    const nextRouter = input.laneResult
-      ? applyLaneTurn(session, router, lane, {
-          sessionId: input.sessionId ?? lane.sessionId,
-          phase: handoff.kind === "plan" ? "planning" : handoff.kind,
-          result: input.laneResult,
-          issueNumber: handoff.issueNumber,
-          worktreePath: input.worktreePath ?? handoff.worktreePath
-        })
-      : router;
-    const nextHandoff = assertPresent(
-      findHandoffById(nextRouter, handoffId),
-      `Lane handoff ${handoffId} disappeared before it could be blocked.`
-    );
-
-    nextHandoff.status = "blocked";
-    nextHandoff.summary = input.summary;
-    nextHandoff.branchName = input.branchName ?? nextHandoff.branchName;
-    nextHandoff.worktreePath = input.worktreePath ?? nextHandoff.worktreePath;
-    clearHandoffClaim(nextHandoff);
-    nextHandoff.updatedAt = nowIso();
-
-    lane.status = "blocked";
-    lane.lastSummary = input.summary;
-    lane.updatedAt = nowIso();
-
-    nextRouter.orchestrator = {
-      ...nextRouter.orchestrator,
-      lastLoopAt: nowIso(),
-      lastSummary: input.orchestratorSummary
-    };
-
-    await saveRouterState(session.paths, nextRouter);
-    await appendConversationMessage(session, {
-      role: "chief_of_staff",
-      kind: "status_update",
-      content: input.conversationContent,
-      summary: input.conversationSummary,
-      linkedIssueNumber: handoff.issueNumber,
-      linkedPrNumber: null,
-      linkedPullRequestNumber: null,
-      isOpenQuestion: false
+  const lane = ensureLane(router, handoff.laneId, handoff.laneId);
+  const issue =
+    cache.issues
+      .map((candidate) => mapRemoteIssue(session.project, candidate))
+      .find((candidate) => candidate.number === handoff.issueNumber) ??
+    buildSyntheticIssueRecord(session.project, handoff.issueNumber, {
+      title: input.issueTitle,
+      body: input.issueBody
     });
+
+  await queueChiefOfStaffReviewFromLane(session, handoffId, {
+    issue,
+    sessionId: input.sessionId ?? lane.sessionId,
+    laneResult: buildChiefOfStaffBlockerLaneResult({
+      summary: input.summary,
+      blockingQuestion: input.blockingQuestion,
+      transcriptReply: input.transcriptReply ?? input.summary,
+      recommendedNextAction: input.recommendedNextAction,
+      artifactRefs:
+        input.artifactRefs ??
+        [input.worktreePath ?? handoff.worktreePath].filter((entry): entry is string => Boolean(entry)),
+      commandError: input.commandError
+    }),
+    reviewType: "blocker_mediation",
+    branchName: input.branchName ?? handoff.branchName,
+    worktreePath: input.worktreePath ?? handoff.worktreePath
   });
 }
 
@@ -4261,17 +4393,11 @@ async function executeLaneHandoff(
   const issue =
     cache.issues
       .map((candidate) => mapRemoteIssue(session.project, candidate))
-      .find((candidate) => candidate.number === handoff.issueNumber) ?? null;
-
-  if (!issue) {
-    await finalizeLaneHandoffBlocked(session, handoffId, {
-      summary: `Issue #${handoff.issueNumber} is missing from the GitHub cache.`,
-      orchestratorSummary: `Issue #${handoff.issueNumber} is missing from the local GitHub mirror.`,
-      conversationSummary: `Issue #${handoff.issueNumber} missing from cache`,
-      conversationContent: `Lane ${lane.name} could not continue because issue #${handoff.issueNumber} is missing from the local GitHub mirror.`
+      .find((candidate) => candidate.number === handoff.issueNumber) ??
+    buildSyntheticIssueRecord(session.project, handoff.issueNumber, {
+      title: `Issue #${handoff.issueNumber} (missing from local GitHub cache)`,
+      body: `Director OS could not find issue #${handoff.issueNumber} in the local GitHub mirror while lane ${lane.name} was executing this handoff.`
     });
-    return;
-  }
 
   if (handoff.kind === "plan") {
     const nativePlanTurn = await runCodexSessionTurn({
@@ -4375,15 +4501,15 @@ async function executeLaneHandoff(
     await maybeRunPackageScript(session.project, ensuredWorktree.worktreePath, "build");
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    await finalizeLaneHandoffBlocked(session, handoffId, {
+    await queueLaneBlockerForChiefOfStaff(session, handoffId, {
       summary: message,
-      orchestratorSummary: `Validation failed for issue #${issue.number}.`,
-      conversationSummary: `Validation failed for #${issue.number}`,
-      conversationContent: `Lane ${lane.name} hit a local validation failure on issue #${issue.number}: ${message}`,
+      blockingQuestion: `How should lane ${lane.name} recover from the validation failure on issue #${issue.number}?`,
+      transcriptReply: `Lane ${lane.name} hit a local validation failure on issue #${issue.number}.`,
+      recommendedNextAction: "Review the validation failure and decide whether to guide the lane, reroute the work, or escalate.",
       sessionId: turn.sessionId,
-      laneResult: turn.result,
       worktreePath: ensuredWorktree.worktreePath,
-      branchName: ensuredWorktree.branchName
+      branchName: ensuredWorktree.branchName,
+      commandError: message
     });
     return;
   }
@@ -4392,13 +4518,12 @@ async function executeLaneHandoff(
     cwd: ensuredWorktree.worktreePath
   });
   if (!gitStatus.trim()) {
-    await finalizeLaneHandoffBlocked(session, handoffId, {
+    await queueLaneBlockerForChiefOfStaff(session, handoffId, {
       summary: "Lane implementation completed without producing file changes.",
-      orchestratorSummary: `Lane ${lane.name} produced no file changes for issue #${issue.number}.`,
-      conversationSummary: `No file changes for #${issue.number}`,
-      conversationContent: `Lane ${lane.name} completed issue #${issue.number} without producing any file changes.`,
+      blockingQuestion: `Lane ${lane.name} produced no file changes for issue #${issue.number}. Should the Chief of Staff guide another pass, reroute it, or escalate?`,
+      transcriptReply: `Lane ${lane.name} completed issue #${issue.number} without producing any file changes.`,
+      recommendedNextAction: "Review the empty result and decide whether to guide another implementation pass, reroute, or escalate.",
       sessionId: turn.sessionId,
-      laneResult: turn.result,
       worktreePath: ensuredWorktree.worktreePath,
       branchName: ensuredWorktree.branchName
     });
@@ -4457,11 +4582,12 @@ function startLaneDispatch(session: ProjectSession, handoffId: string): void {
   const dispatch = executeLaneHandoff(session, handoffId)
     .catch(async (error) => {
       const message = error instanceof Error ? error.message : String(error);
-      await finalizeLaneHandoffBlocked(session, handoffId, {
+      await queueLaneBlockerForChiefOfStaff(session, handoffId, {
         summary: message,
-        orchestratorSummary: "A lane execution crashed before it could finish.",
-        conversationSummary: `Lane execution crashed for ${handoffId}`,
-        conversationContent: `A lane execution crashed before it could finish: ${message}`
+        blockingQuestion: "How should the Chief of Staff recover from this lane execution crash?",
+        transcriptReply: "A lane execution crashed before it could finish.",
+        recommendedNextAction: "Review the crash and decide whether to retry with guidance, reroute, or escalate.",
+        commandError: message
       });
     })
     .finally(() => {
@@ -4524,23 +4650,11 @@ async function dispatchChiefOfStaffHandoff(session: ProjectSession): Promise<boo
   const issue =
     cache.issues
       .map((candidate) => mapRemoteIssue(session.project, candidate))
-      .find((candidate) => candidate.number === handoff.issueNumber) ?? null;
-
-  if (!issue) {
-    handoff.status = "blocked";
-    handoff.summary = `Issue #${handoff.issueNumber} is missing from the GitHub cache.`;
-    clearHandoffClaim(handoff);
-    handoff.updatedAt = nowIso();
-    await saveRouterState(session.paths, {
-      ...router,
-      orchestrator: {
-        ...router.orchestrator,
-        lastLoopAt: nowIso(),
-        lastSummary: `Issue #${handoff.issueNumber} is missing from the local GitHub mirror.`
-      }
+      .find((candidate) => candidate.number === handoff.issueNumber) ??
+    buildSyntheticIssueRecord(session.project, handoff.issueNumber, {
+      title: `Issue #${handoff.issueNumber} (missing from local GitHub cache)`,
+      body: `Director OS could not find issue #${handoff.issueNumber} in the local GitHub mirror while Chief of Staff review was about to run.`
     });
-    return true;
-  }
 
   const laneResult = parseStoredLaneResult(handoff.details?.lane_result);
   if (!laneResult) {
